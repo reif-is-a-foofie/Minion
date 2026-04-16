@@ -1,12 +1,25 @@
-# Minion
+# What the heck is this thing and why should I care about it?
 
-Minion is a local-first “memory + assistant” setup.
+Well, like me you are probably realizing by now that you have wasted a lot of your life reading slop from ChatGPT when you could have been making progress with Claude. 
+I made my move to Claude recently and I realized, well, I have my whole life on GPT. That thing knows more about me than my doctor, my shrink and Siri combined times 6. 
+And Claude doesn't know me from Adam other than it knows I'm not Adam, at least... most likely not Adam. 
 
-It helps you turn your ChatGPT export into:
-- a small, stable profile you can paste into an assistant
-- an on-demand memory search you can query when you need real past context
+In any case, OpenAI allows you to export all of yoru chats. It takes a few days. 
+Then I needed to push that (context) back into Claude. 
+But how?? I cant just load 30 million messages into Claude (real message count BTW, wild)
+And given Claude spends more tokens than an kid at nickle-mania who just drank his first redbull....
 
-Nothing needs to be uploaded. The point is to keep your data on your machine and still get leverage from it.
+I needed a solution. 
+
+Naturally we go the encoding and semantic search route. Hook it up to an MCP that runs locally - so at run time, Claude can query my personal data and ONLY take in the context that matters. 
+
+Its alpha, if you stretch alpha hard enough - lets be honest, bad things could happen. But at least I am committed to using my own software on my own personal set up. 
+
+Ping me with questions - 
+
+Reif
+
+-reif@thegoodproject.net
 
 ## What you do with it
 
