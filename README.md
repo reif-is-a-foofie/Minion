@@ -24,20 +24,28 @@ Reif
 ## What you do with it
 
 - Rebuild a usable “you” profile from your own writing (not hand-authored personality)
-- Look up how you previously described something (projects, priorities, preferences) when you’re writing or deciding
 - Keep an assistant consistent over time without stuffing long history into every chat
+- Pull up real “how you said it” evidence when writing, deciding, or delegating (projects, priorities, preferences)
+- Make the profile auditable: it’s generated from quotes + emits a build manifest so you can see how it was produced
 
 ## Privacy
 
-This repo is set up to avoid committing raw exports, derived embeddings, or personal quote banks.
-You generate those locally when you need them.
+- This repo is meant to stay clean-by-default (code + docs only).
+- Your raw export, derived embeddings, and quote banks are generated locally and kept out of git.
+- Recommended: keep private artifacts outside the repo entirely (e.g. a sibling `minion_private/` folder).
 
 ## Quick start (high level)
 
 1) Download your ChatGPT data export
-2) Run the local tools to ingest + build memory
-3) Generate the core profile from evidence
-4) Use the profile + memory search in your assistant
+2) Ingest/unzip it locally (nothing uploaded)
+3) Build two things from it:
+   - a semantic memory index (fast lookup later)
+   - persona evidence (sourcebook + quote bank)
+4) Generate `core_profile.md` from that evidence using a local LLM (Ollama)
+   - this also writes a build marker + manifest in `data/derived/`
+5) Use:
+   - `core_profile.md` as stable context
+   - memory search when you need grounded past details
 
 Technical instructions live in `chatgpt_mcp_memory/README.md`.
 
