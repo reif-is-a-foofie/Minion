@@ -21,6 +21,17 @@ Reif
 
 -reif@thegoodproject.net
 
+
+## Easiest way (guided)
+
+1. Install Minion (Homebrew or from this repo).
+2. In Terminal, run **`minion`** with nothing after it (or `minion start`).
+3. When asked, paste the path to your **ChatGPT export `.zip`** from OpenAI (or drag the file into the window).
+4. Wait while it unpacks, builds search, and writes your profile.
+5. Follow the on-screen steps to paste the profile into Claude and connect Claude Desktop.
+
+Technical details and manual steps: `chatgpt_mcp_memory/README.md`.
+
 ## Install (internal teammates)
 
 If you’re on a Mac and have Homebrew:
@@ -62,6 +73,9 @@ minion setup --export-zip "/path/to/chatgpt-export.zip"
 5) Use:
    - `core_profile.md` as stable context
    - memory search when you need grounded past details
+6) Optional — chunk-native strategic profile (local Ollama): `minion ask_minion --derived-dir …` or see `chatgpt_mcp_memory/README.md` (`ask_minion` writes `identity_profile.md` from `chunks.jsonl`).
+
+In Claude, combine `core_profile.md` with `chatgpt_mcp_memory/retrieval_policy.md` (it tells the model to call `search_memory` **proactively**, not only on explicit recall requests).
 
 Technical instructions live in `chatgpt_mcp_memory/README.md`.
 

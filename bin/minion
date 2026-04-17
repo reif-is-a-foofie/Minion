@@ -84,8 +84,34 @@ def _ensure_python_env(workspace_dir: Path) -> Path:
     return vpy
 
 
-def cmd_doctor(_: argparse.Namespace) -> int:
-    print("minion doctor")
+def cmd_doctor(args: argparse.Namespace) -> int:
+    verbose = getattr(args, "verbose", False)
+
+    if not verbose:
+        print("Minion — quick check")
+        print("")
+        ollama = _which("ollama")
+        if ollama:
+            try:
+                _run(["ollama", "list"])
+                print("Ollama: OK (local AI for your written profile)")
+            except Exception:
+                print("Ollama: installed but not responding — open the Ollama app or run: ollama serve")
+        else:
+            print("Ollama: not found — install from https://ollama.com for the profile step")
+
+        uv = _which("uv")
+        if uv:
+            print("Optional speed-up (uv): OK")
+        else:
+            print("Optional speed-up (uv): not installed — we’ll use Python’s venv instead (fine)")
+
+        print("")
+        print("You’re good to run:  minion   or   minion start")
+        print("Need details? Run:  minion doctor --verbose")
+        return 0
+
+    print("minion doctor (verbose)")
     print("")
     print(f"- repo_root: {_repo_root()}")
     print(f"- chatgpt_mcp_memory: {_chatgpt_mcp_dir()}")
@@ -99,7 +125,6 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         try:
             out = _run(["ollama", "list"])
             print("- ollama list: ok")
-            # keep output short
             lines = [ln for ln in out.splitlines() if ln.strip()]
             for ln in lines[:8]:
                 print(f"  {ln}")
@@ -118,7 +143,49 @@ def _parse_ingest_output(out: str) -> Tuple[str, str]:
     return lines[0], lines[1]
 
 
+def cmd_wizard() -> int:
+    print()
+    print("  Minion — set up your ChatGPT memory for Claude")
+    print("  " + "—" * 42)
+    print()
+    print("  I’ll do the technical steps.")
+    print("  You only need one thing: the ChatGPT export file (.zip) from OpenAI.")
+    print()
+    raw = input("  Paste the full path to that .zip (or drag the file into this window):\n  > ").strip()
+    raw = raw.strip("'\"")
+    if not raw:
+        print("  No path given. Stopping.")
+        return 1
+    zip_path = Path(raw).expanduser().resolve()
+    if not zip_path.exists():
+        print(f"  I can’t find that file: {zip_path}")
+        return 1
+    if zip_path.suffix.lower() != ".zip":
+        print("  That doesn’t look like a .zip — try again with the export OpenAI sent you.")
+        return 1
+
+    default_ws = _default_workspace_dir()
+    ws_in = input(f"  Where should I save your private data? [{default_ws}]\n  > ").strip()
+    workspace = Path(ws_in).expanduser().resolve() if ws_in else default_ws
+
+    print()
+    print("  For the written profile I use a small local model via Ollama (default: mistral:7b).")
+    print("  If you don’t have it yet:  ollama pull mistral:7b")
+    mod_in = input("  Model name, or press Enter for mistral:7b:\n  > ").strip()
+    model = mod_in or "mistral:7b"
+
+    ns = argparse.Namespace(
+        export_zip=str(zip_path),
+        workspace=str(workspace),
+        model=model,
+        with_ask_minion=False,
+        plain=True,
+    )
+    return cmd_setup(ns)
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
+    plain = getattr(args, "plain", False)
     workspace_dir = Path(args.workspace).expanduser().resolve()
     _ensure_dir(workspace_dir)
 
@@ -135,32 +202,51 @@ def cmd_setup(args: argparse.Namespace) -> int:
     if not zip_path.exists():
         raise SystemExit(f"Missing export zip: {zip_path}")
 
-    print(f"Workspace: {workspace_dir}")
-    print(f"Run dir:   {run_dir}")
-    print("")
+    if plain:
+        print("Working folder (your data stays on this Mac):", workspace_dir)
+        print("")
+    else:
+        print(f"Workspace: {workspace_dir}")
+        print(f"Run dir:   {run_dir}")
+        print("")
 
     # 1) Ingest zip (unzip into run_dir/raw/*)
-    print("1) Ingesting export zip…")
+    if plain:
+        print("Step 1/4 — Opening your ChatGPT export…")
+    else:
+        print("1) Ingesting export zip…")
     ingest_out = _run([str(vpy), str(_src("ingest_chatgpt_export.py")), str(zip_path), "--out", str(raw_out_dir)])
     export_root, manifest_path = _parse_ingest_output(ingest_out)
     export_root_path = Path(export_root).expanduser().resolve()
-    print(f"   export_root: {export_root_path}")
-    print(f"   manifest:    {manifest_path}")
-    print("")
+    if not plain:
+        print(f"   export_root: {export_root_path}")
+        print(f"   manifest:    {manifest_path}")
+        print("")
 
     # 2) Build semantic index into run_dir/derived
-    print("2) Building semantic index…")
+    if plain:
+        print("Step 2/4 — Building a search index (this may take a while)…")
+    else:
+        print("2) Building semantic index…")
     _run([str(vpy), str(_src("build_index.py")), "--export", str(export_root_path), "--derived-dir", str(derived_dir)])
-    print(f"   derived_dir: {derived_dir}")
-    print("")
+    if not plain:
+        print(f"   derived_dir: {derived_dir}")
+        print("")
 
     # 3) Persona artifacts (sourcebook + quote bank)
-    print("3) Extracting persona evidence…")
+    if plain:
+        print("Step 3/4 — Gathering short quotes from your messages…")
+    else:
+        print("3) Extracting persona evidence…")
     _run([str(vpy), str(_src("persona_extract.py")), "--export", str(export_root_path), "--derived-dir", str(derived_dir)])
-    print("")
+    if not plain:
+        print("")
 
     # 4) Generate core_profile.md from evidence (local Ollama)
-    print("4) Generating core profile (local Ollama)…")
+    if plain:
+        print("Step 4/4 — Writing your pasteable profile with the local AI (Ollama)…")
+    else:
+        print("4) Generating core profile (local Ollama)…")
     core_profile_path = run_dir / "core_profile.md"
     agent_profile_path = run_dir / "agent_core_profile.md"
     gen_out = _run(
@@ -181,13 +267,49 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print(f"   {ln}")
     print("")
 
-    print("Done.")
-    print("")
-    print(f"- Pasteable profile: {core_profile_path}")
-    print(f"- Derived data dir (set CHATGPT_MCP_DATA_DIR to this): {derived_dir}")
-    print("")
-    print("Next:")
-    print(f'  minion mcp --derived-dir "{derived_dir}"')
+    if plain:
+        print("All set.")
+        print("")
+        print("What you do next (in Claude):")
+        print("")
+        print("  1) Open this file and copy everything:")
+        print(f"     {core_profile_path}")
+        print("     Paste it into Claude as custom instructions or project notes.")
+        print("")
+        print("  2) Add memory search in Claude Desktop:")
+        print("     • Open:  ~/Library/Application Support/Claude/claude_desktop_config.json")
+        print("     • Use the example in:  chatgpt_mcp_memory/claude_desktop_config.example.json")
+        print("     • Set CHATGPT_MCP_DATA_DIR to this folder:")
+        print(f"       {derived_dir}")
+        print("     • Restart Claude Desktop.")
+        print("")
+    else:
+        print("Done.")
+        print("")
+        print(f"- Pasteable profile: {core_profile_path}")
+        print(f"- Derived data dir (set CHATGPT_MCP_DATA_DIR to this): {derived_dir}")
+        print("")
+
+        if getattr(args, "with_ask_minion", False):
+            print("5) ask_minion (chunk-native identity_profile.md, many Ollama calls)…")
+            ask_out = _run(
+                [
+                    str(vpy),
+                    str(_src("ask_minion.py")),
+                    "--derived-dir",
+                    str(derived_dir),
+                    "--model",
+                    str(args.model),
+                ]
+            )
+            for ln in [ln.strip() for ln in ask_out.splitlines() if ln.strip()][-4:]:
+                print(f"   {ln}")
+            print("")
+
+        print("Next:")
+        print(f'  minion mcp --derived-dir "{derived_dir}"')
+        if not getattr(args, "with_ask_minion", False):
+            print(f'  minion ask_minion --derived-dir "{derived_dir}" --model {args.model}')
     return 0
 
 
@@ -210,23 +332,92 @@ def cmd_mcp(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ask_minion(args: argparse.Namespace) -> int:
+    workspace_dir = Path(args.workspace).expanduser().resolve()
+    vpy = _ensure_python_env(workspace_dir)
+    derived_dir = Path(args.derived_dir).expanduser().resolve()
+    cmd: List[str] = [
+        str(vpy),
+        str(_src("ask_minion.py")),
+        "--derived-dir",
+        str(derived_dir),
+        "--model",
+        str(args.model),
+    ]
+    if args.dry_run:
+        cmd.append("--dry-run")
+    if args.max_conversations is not None:
+        cmd.extend(["--max-conversations", str(args.max_conversations)])
+    if args.sample_every_n != 1:
+        cmd.extend(["--sample-every-n", str(args.sample_every_n)])
+    if args.since_unix is not None:
+        cmd.extend(["--since-unix", str(args.since_unix)])
+    if args.timeout_seconds is not None:
+        cmd.extend(["--timeout-seconds", str(args.timeout_seconds)])
+    if args.chunks:
+        cmd.extend(["--chunks", str(Path(args.chunks).expanduser().resolve())])
+    if args.out:
+        cmd.extend(["--out", str(Path(args.out).expanduser().resolve())])
+    if args.save_extractions:
+        cmd.extend(["--save-extractions", str(Path(args.save_extractions).expanduser().resolve())])
+    if args.max_window_chars != 14000:
+        cmd.extend(["--max-window-chars", str(args.max_window_chars)])
+
+    out = _run(cmd)
+    print(out, end="")
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(prog="minion", description="Local-first memory + persona toolkit.")
+    argv = argv if argv is not None else sys.argv[1:]
+    if not argv or argv[0] in ("start", "wizard", "go", "help-me"):
+        return cmd_wizard()
+
+    parser = argparse.ArgumentParser(
+        prog="minion",
+        description="Local-first memory + persona for Claude. Run with no subcommand for a guided setup.",
+        epilog="Examples:  minion   |   minion start   |   minion doctor   |   minion setup --export-zip PATH.zip",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_doctor = sub.add_parser("doctor", help="Check local prerequisites.")
+    p_doctor.add_argument("--verbose", action="store_true", help="Show technical paths and full Ollama list")
     p_doctor.set_defaults(func=cmd_doctor)
 
     p_setup = sub.add_parser("setup", help="Ingest export.zip and build everything into a private workspace.")
     p_setup.add_argument("--export-zip", required=True, help="Path to ChatGPT export ZIP")
     p_setup.add_argument("--workspace", default=str(_default_workspace_dir()), help="Private workspace directory")
     p_setup.add_argument("--model", default="mistral:7b", help="Ollama model for profile generation")
+    p_setup.add_argument(
+        "--with-ask-minion",
+        action="store_true",
+        help="After setup, run ask_minion (chunk→identity_profile.md; can take a long time)",
+    )
+    p_setup.add_argument("--plain", action="store_true", help=argparse.SUPPRESS)
     p_setup.set_defaults(func=cmd_setup)
 
     p_mcp = sub.add_parser("mcp", help="Run the MCP server pointing at a derived directory.")
     p_mcp.add_argument("--derived-dir", required=True, help="Directory containing chunks/embeddings/manifest")
     p_mcp.add_argument("--workspace", default=str(_default_workspace_dir()), help="Workspace to host the venv")
     p_mcp.set_defaults(func=cmd_mcp)
+
+    p_ask = sub.add_parser(
+        "ask_minion",
+        help="Synthesize identity_profile.md from chunks.jsonl (map→reduce via local Ollama).",
+    )
+    p_ask.add_argument("--derived-dir", required=True, help="Directory containing chunks.jsonl (and outputs)")
+    p_ask.add_argument("--workspace", default=str(_default_workspace_dir()), help="Workspace with .venv for dependencies")
+    p_ask.add_argument("--model", default="mistral:7b", help="Ollama model")
+    p_ask.add_argument("--dry-run", action="store_true", help="Load chunks and print stats only")
+    p_ask.add_argument("--max-conversations", type=int, default=None)
+    p_ask.add_argument("--sample-every-n", type=int, default=1)
+    p_ask.add_argument("--since-unix", type=float, default=None)
+    p_ask.add_argument("--timeout-seconds", type=float, default=None)
+    p_ask.add_argument("--chunks", default=None, help="Override path to chunks.jsonl")
+    p_ask.add_argument("--out", default=None, help="Output markdown path")
+    p_ask.add_argument("--save-extractions", default=None, help="JSONL path for per-conversation extractions")
+    p_ask.add_argument("--max-window-chars", type=int, default=14000)
+    p_ask.set_defaults(func=cmd_ask_minion)
 
     args = parser.parse_args(argv)
     return int(args.func(args))
