@@ -66,8 +66,13 @@ def build_export_manifest(export_root: Path) -> Dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Ingest a ChatGPT export ZIP into data/raw/")
-    parser.add_argument("zip_path", help="Path to ChatGPT export ZIP")
+    parser = argparse.ArgumentParser(
+        description="Ingest a ChatGPT export (ZIP or unzipped folder) into data/raw/"
+    )
+    parser.add_argument(
+        "zip_path",
+        help="ChatGPT export .zip from OpenAI, or a folder that contains it (including nested)",
+    )
     parser.add_argument(
         "--out",
         default=str(Path(__file__).resolve().parents[1] / "data" / "raw"),
@@ -87,7 +92,16 @@ def main() -> None:
     if dest.exists():
         raise FileExistsError(str(dest))
 
-    unzip_to(zip_path, dest)
+    if zip_path.is_dir():
+        src_root = find_export_root(zip_path)
+        shutil.copytree(src_root, dest)
+    elif zip_path.is_file() and zip_path.suffix.lower() == ".zip":
+        unzip_to(zip_path, dest)
+    else:
+        raise ValueError(
+            "Expected a .zip file or a directory containing conversations-*.json (ChatGPT export)."
+        )
+
     export_root = find_export_root(dest)
 
     manifest = build_export_manifest(export_root)

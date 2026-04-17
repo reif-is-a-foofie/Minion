@@ -2,13 +2,86 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def _default_claude_desktop_config_path() -> Path:
+    env = os.environ.get("CLAUDE_DESKTOP_CONFIG")
+    if env:
+        return Path(env).expanduser().resolve()
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Application Support/Claude/claude_desktop_config.json"
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", "")
+        if not appdata:
+            raise RuntimeError("APPDATA is not set (needed for Claude Desktop config path on Windows)")
+        return Path(appdata) / "Claude" / "claude_desktop_config.json"
+    return Path.home() / ".config/Claude/claude_desktop_config.json"
+
+
+def install_claude_desktop_mcp(
+    *,
+    workspace_dir: Path,
+    derived_dir: Path,
+    server_name: str = "chatgpt-memory-local",
+    config_path: Optional[Path] = None,
+) -> Tuple[Path, Optional[Path]]:
+    """
+    Merge this MCP server into Claude Desktop's claude_desktop_config.json.
+    Backs up the previous file to *.minion.bak when it existed.
+    Returns (written_config_path, backup_path_or_None).
+    """
+    vpy = _ensure_python_env(workspace_dir)
+    mcp_script = _src("mcp_server.py")
+    entry: Dict[str, Any] = {
+        "command": str(vpy.resolve()),
+        "args": [str(mcp_script.resolve())],
+        "env": {"CHATGPT_MCP_DATA_DIR": str(derived_dir.resolve())},
+    }
+    path = config_path or _default_claude_desktop_config_path()
+    path = path.expanduser().resolve()
+    backup: Optional[Path] = None
+
+    if path.exists():
+        backup = path.with_suffix(path.suffix + ".minion.bak")
+        shutil.copy2(path, backup)
+        raw = path.read_text(encoding="utf-8")
+        if raw.strip():
+            try:
+                config = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise SystemExit(
+                    f"{path} is not valid JSON ({e}). Fix or remove it, or set CLAUDE_DESKTOP_CONFIG."
+                ) from e
+        else:
+            config = {}
+    else:
+        config = {}
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not isinstance(config, dict):
+        raise SystemExit(f"Top-level JSON in {path} must be an object.")
+
+    mcp_servers = config.get("mcpServers")
+    if mcp_servers is None:
+        config["mcpServers"] = {}
+    elif not isinstance(mcp_servers, dict):
+        raise SystemExit(f'"mcpServers" in {path} must be an object.')
+    config["mcpServers"][server_name] = entry
+
+    text = json.dumps(config, indent=2, ensure_ascii=False) + "\n"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+    return path, backup
 
 
 def _repo_root() -> Path:
@@ -43,6 +116,22 @@ def _which(name: str) -> Optional[str]:
 
 def _default_workspace_dir() -> Path:
     return Path.home() / "minion_private"
+
+
+def _workspace_beside_export(export_path: Path) -> Path:
+    """
+    Place workspace next to the export: parent/minion_private, or minion_private_2, … if taken.
+    """
+    parent = export_path.resolve().parent
+    candidate = parent / "minion_private"
+    if not candidate.exists():
+        return candidate
+    n = 2
+    while True:
+        alt = parent / f"minion_private_{n}"
+        if not alt.exists():
+            return alt
+        n += 1
 
 
 def _ensure_dir(path: Path) -> None:
@@ -143,30 +232,43 @@ def _parse_ingest_output(out: str) -> Tuple[str, str]:
     return lines[0], lines[1]
 
 
+def _is_valid_export_path(p: Path) -> bool:
+    return p.is_dir() or (p.is_file() and p.suffix.lower() == ".zip")
+
+
 def cmd_wizard() -> int:
     print()
     print("  Minion — set up your ChatGPT memory for Claude")
     print("  " + "—" * 42)
     print()
     print("  I’ll do the technical steps.")
-    print("  You only need one thing: the ChatGPT export file (.zip) from OpenAI.")
+    print("  You only need one thing: your ChatGPT export — either the .zip from OpenAI,")
+    print("  or the folder after you unzip it.")
     print()
-    raw = input("  Paste the full path to that .zip (or drag the file into this window):\n  > ").strip()
+    print("  Drag the .zip or folder from Finder into this terminal window, or paste the full path:")
+    raw = input("  > ").strip()
     raw = raw.strip("'\"")
     if not raw:
         print("  No path given. Stopping.")
         return 1
-    zip_path = Path(raw).expanduser().resolve()
-    if not zip_path.exists():
-        print(f"  I can’t find that file: {zip_path}")
+    export_path = Path(raw).expanduser().resolve()
+    if not export_path.exists():
+        print(f"  I can’t find that path: {export_path}")
         return 1
-    if zip_path.suffix.lower() != ".zip":
-        print("  That doesn’t look like a .zip — try again with the export OpenAI sent you.")
+    if not _is_valid_export_path(export_path):
+        print("  That doesn’t look like a .zip or a folder — use the export OpenAI sent you.")
         return 1
 
-    default_ws = _default_workspace_dir()
-    ws_in = input(f"  Where should I save your private data? [{default_ws}]\n  > ").strip()
-    workspace = Path(ws_in).expanduser().resolve() if ws_in else default_ws
+    workspace = _workspace_beside_export(export_path)
+    print()
+    print(f"  Output will be saved under:  {workspace}")
+    yn = input("  Are you in the directory where the output will be? (y/n)\n  > ").strip().lower()
+    if yn in ("n", "no"):
+        print(f"  cd {workspace}")
+        print()
+    elif yn not in ("y", "yes", ""):
+        print("  Please answer y or n. Stopping.")
+        return 1
 
     print()
     print("  For the written profile I use a small local model via Ollama (default: mistral:7b).")
@@ -175,7 +277,7 @@ def cmd_wizard() -> int:
     model = mod_in or "mistral:7b"
 
     ns = argparse.Namespace(
-        export_zip=str(zip_path),
+        export_zip=str(export_path),
         workspace=str(workspace),
         model=model,
         with_ask_minion=False,
@@ -186,7 +288,19 @@ def cmd_wizard() -> int:
 
 def cmd_setup(args: argparse.Namespace) -> int:
     plain = getattr(args, "plain", False)
-    workspace_dir = Path(args.workspace).expanduser().resolve()
+    export_path = Path(args.export_zip).expanduser().resolve()
+    if not export_path.exists():
+        raise SystemExit(f"Missing export path: {export_path}")
+    if not _is_valid_export_path(export_path):
+        raise SystemExit(
+            f"Not a ChatGPT export (.zip or folder): {export_path}"
+        )
+
+    ws_arg = getattr(args, "workspace", None)
+    if ws_arg is None:
+        workspace_dir = _workspace_beside_export(export_path)
+    else:
+        workspace_dir = Path(ws_arg).expanduser().resolve()
     _ensure_dir(workspace_dir)
 
     stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
@@ -197,10 +311,6 @@ def cmd_setup(args: argparse.Namespace) -> int:
     _ensure_dir(derived_dir)
 
     vpy = _ensure_python_env(workspace_dir)
-
-    zip_path = Path(args.export_zip).expanduser().resolve()
-    if not zip_path.exists():
-        raise SystemExit(f"Missing export zip: {zip_path}")
 
     if plain:
         print("Working folder (your data stays on this Mac):", workspace_dir)
@@ -215,7 +325,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print("Step 1/4 — Opening your ChatGPT export…")
     else:
         print("1) Ingesting export zip…")
-    ingest_out = _run([str(vpy), str(_src("ingest_chatgpt_export.py")), str(zip_path), "--out", str(raw_out_dir)])
+    ingest_out = _run(
+        [str(vpy), str(_src("ingest_chatgpt_export.py")), str(export_path), "--out", str(raw_out_dir)]
+    )
     export_root, manifest_path = _parse_ingest_output(ingest_out)
     export_root_path = Path(export_root).expanduser().resolve()
     if not plain:
@@ -277,10 +389,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print("     Paste it into Claude as custom instructions or project notes.")
         print("")
         print("  2) Add memory search in Claude Desktop:")
-        print("     • Open:  ~/Library/Application Support/Claude/claude_desktop_config.json")
-        print("     • Use the example in:  chatgpt_mcp_memory/claude_desktop_config.example.json")
-        print("     • Set CHATGPT_MCP_DATA_DIR to this folder:")
-        print(f"       {derived_dir}")
+        print("     Run this and paste the JSON into your config (see stderr for the path):")
+        print(f'       minion mcp-config --derived-dir "{derived_dir}"')
+        print("     Or hand-edit:  chatgpt_mcp_memory/claude_desktop_config.example.json")
+        print(f"     • CHATGPT_MCP_DATA_DIR must be:  {derived_dir}")
         print("     • Restart Claude Desktop.")
         print("")
     else:
@@ -307,9 +419,53 @@ def cmd_setup(args: argparse.Namespace) -> int:
             print("")
 
         print("Next:")
+        print(f'  minion mcp-config --derived-dir "{derived_dir}"   # paste into Claude Desktop JSON')
         print(f'  minion mcp --derived-dir "{derived_dir}"')
         if not getattr(args, "with_ask_minion", False):
             print(f'  minion ask_minion --derived-dir "{derived_dir}" --model {args.model}')
+    return 0
+
+
+def cmd_mcp_config(args: argparse.Namespace) -> int:
+    """Merge Minion MCP into Claude Desktop's claude_desktop_config.json (default), or --print-only JSON."""
+    workspace_dir = Path(args.workspace).expanduser().resolve()
+    derived_dir = Path(args.derived_dir).expanduser().resolve()
+    server_name = str(args.server_name or "chatgpt-memory-local")
+    quiet = getattr(args, "quiet", False)
+    print_only = getattr(args, "print_only", False)
+
+    if print_only:
+        vpy = _ensure_python_env(workspace_dir)
+        mcp_script = _src("mcp_server.py")
+        payload = {
+            "mcpServers": {
+                server_name: {
+                    "command": str(vpy.resolve()),
+                    "args": [str(mcp_script.resolve())],
+                    "env": {"CHATGPT_MCP_DATA_DIR": str(derived_dir)},
+                }
+            }
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        if not quiet:
+            print("", file=sys.stderr)
+            print("(print-only: nothing written to Claude Desktop config)", file=sys.stderr)
+        return 0
+
+    cfg_path_arg = getattr(args, "config_path", None)
+    cfg_override = Path(cfg_path_arg).expanduser().resolve() if cfg_path_arg else None
+    written, backup = install_claude_desktop_mcp(
+        workspace_dir=workspace_dir,
+        derived_dir=derived_dir,
+        server_name=server_name,
+        config_path=cfg_override,
+    )
+    if not quiet:
+        print(f'Wrote MCP server "{server_name}" into Claude Desktop config:', file=sys.stderr)
+        print(f"  {written}", file=sys.stderr)
+        if backup is not None:
+            print(f"Backup of previous file: {backup}", file=sys.stderr)
+        print("Restart Claude Desktop to load the server.", file=sys.stderr)
     return 0
 
 
@@ -376,7 +532,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="minion",
         description="Local-first memory + persona for Claude. Run with no subcommand for a guided setup.",
-        epilog="Examples:  minion   |   minion start   |   minion doctor   |   minion setup --export-zip PATH.zip",
+        epilog="Examples:  minion   |   minion start   |   minion doctor   |   minion setup --export PATH.zip",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -384,9 +540,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_doctor.add_argument("--verbose", action="store_true", help="Show technical paths and full Ollama list")
     p_doctor.set_defaults(func=cmd_doctor)
 
-    p_setup = sub.add_parser("setup", help="Ingest export.zip and build everything into a private workspace.")
-    p_setup.add_argument("--export-zip", required=True, help="Path to ChatGPT export ZIP")
-    p_setup.add_argument("--workspace", default=str(_default_workspace_dir()), help="Private workspace directory")
+    p_setup = sub.add_parser(
+        "setup",
+        help="Ingest ChatGPT export (.zip or folder) and build everything into a private workspace.",
+    )
+    p_setup.add_argument(
+        "--export-zip",
+        "--export",
+        required=True,
+        dest="export_zip",
+        metavar="PATH",
+        help="ChatGPT export: .zip from OpenAI or an unzipped folder (conversations-*.json)",
+    )
+    p_setup.add_argument(
+        "--workspace",
+        default=None,
+        help="Private workspace directory (default: minion_private next to the export)",
+    )
     p_setup.add_argument("--model", default="mistral:7b", help="Ollama model for profile generation")
     p_setup.add_argument(
         "--with-ask-minion",
@@ -395,6 +565,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p_setup.add_argument("--plain", action="store_true", help=argparse.SUPPRESS)
     p_setup.set_defaults(func=cmd_setup)
+
+    p_mcpcfg = sub.add_parser(
+        "mcp-config",
+        help="Print Claude Desktop mcpServers JSON (absolute paths; merge into claude_desktop_config.json).",
+    )
+    p_mcpcfg.add_argument(
+        "--derived-dir",
+        required=True,
+        help="Directory with chunks.jsonl / embeddings (same as CHATGPT_MCP_DATA_DIR)",
+    )
+    p_mcpcfg.add_argument("--workspace", default=str(_default_workspace_dir()), help="Workspace whose .venv runs the MCP")
+    p_mcpcfg.add_argument(
+        "--server-name",
+        default="chatgpt-memory-local",
+        help="Key name under mcpServers (default: chatgpt-memory-local)",
+    )
+    p_mcpcfg.add_argument(
+        "--quiet",
+        action="store_true",
+        help="JSON only to stdout (no stderr hints); useful for scripts",
+    )
+    p_mcpcfg.set_defaults(func=cmd_mcp_config)
 
     p_mcp = sub.add_parser("mcp", help="Run the MCP server pointing at a derived directory.")
     p_mcp.add_argument("--derived-dir", required=True, help="Directory containing chunks/embeddings/manifest")
