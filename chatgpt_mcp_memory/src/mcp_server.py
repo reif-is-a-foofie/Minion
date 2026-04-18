@@ -28,6 +28,54 @@ DEFAULT_MAX_CHARS = 900
 DEFAULT_MAX_CHARS_FULL = 2000
 PROTOCOL_VERSION = "2025-11-25"
 
+# Shown to Claude when the MCP session starts (if no policy file is found nearby).
+_INSTRUCTIONS_FALLBACK = (
+    "Use tools/search_memory for small, per-hit retrieval; use get_chunk to expand a hit. "
+    "Call search_memory early when prior context might matter. Avoid pulling huge context."
+)
+
+
+def _instructions_max_chars() -> int:
+    raw = os.environ.get("CHATGPT_MCP_INSTRUCTIONS_MAX_CHARS", "20000")
+    try:
+        return max(500, int(raw))
+    except ValueError:
+        return 20000
+
+
+def _load_retrieval_instructions() -> str:
+    """
+    Prefer file-based policy so Claude receives full retrieval discipline via MCP initialize.instructions.
+    Search order:
+    1) CHATGPT_MCP_RETRIEVAL_POLICY path
+    2) <CHATGPT_MCP_DATA_DIR>/retrieval_policy.md
+    3) parent of data dir / retrieval_policy.md (run folder next to derived/)
+    """
+    explicit = os.environ.get("CHATGPT_MCP_RETRIEVAL_POLICY")
+    candidates: List[Path] = []
+    if explicit:
+        candidates.append(Path(explicit).expanduser().resolve())
+    data_dir = _data_dir()
+    candidates.append(data_dir / "retrieval_policy.md")
+    candidates.append(data_dir.parent / "retrieval_policy.md")
+
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if text:
+            cap = _instructions_max_chars()
+            if len(text) > cap:
+                text = text[: cap - 30].rstrip() + "\n\n… [truncated for MCP instructions size cap]"
+            return (
+                "Minion memory MCP — follow this retrieval policy when using search_memory / get_chunk:\n\n"
+                + text
+            )
+    return _INSTRUCTIONS_FALLBACK
+
 
 @dataclass
 class MemoryIndex:
@@ -253,7 +301,7 @@ def _handle_initialize(req: Dict[str, Any]) -> Dict[str, Any]:
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": "chatgpt-memory-local", "title": APP_NAME, "version": "0.1.0"},
-            "instructions": "Use tools/search_memory for small, per-hit retrieval. Avoid pulling large context.",
+            "instructions": _load_retrieval_instructions(),
         },
     )
 

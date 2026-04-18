@@ -24,13 +24,18 @@ Reif
 
 ## Easiest way (guided)
 
-1. Install Minion (Homebrew or from this repo).
-2. In Terminal, run **`minion`** with nothing after it (or `minion start`).
-3. When asked, paste the path to your **ChatGPT export `.zip`** from OpenAI (or drag the file into the window).
-4. Wait while it unpacks, builds search, and writes your profile.
-5. Follow the on-screen steps to paste the profile into Claude and connect Claude Desktop.
+**One run does the whole pipeline** — you are not supposed to chase five separate scripts. After you point Minion at your export, it unpacks, builds the search index, pulls persona quotes, calls your **local** Ollama model to write `core_profile.md`, and **merges the MCP entry into Claude Desktop’s config** for you (with a backup of the old file).
 
-Technical details and manual steps: `chatgpt_mcp_memory/README.md`.
+1. Install Minion (Homebrew or from this repo). Have **Ollama** installed with the model you use for the profile (default `mistral:7b`).
+2. In Terminal, run **`minion`** with nothing after it (or `minion start` / `minion setup --export …`).
+3. When asked, paste the path to your **ChatGPT export `.zip`** from OpenAI (or drag the file into the window).
+4. Wait until it finishes (this can take a while on a big export).
+5. **You:** put text **into Claude itself** so the model knows how to behave — not just “connecting wires.” Minion copies **`retrieval_policy.md`** next to your profile in each run folder; paste **both** that file and **`core_profile.md`** into **Claude → Custom Instructions** (and/or project instructions). That tells Claude **when to call** `search_memory` (MCP), not only that the tool exists.
+6. **Quit and reopen Claude Desktop** so it loads the MCP server from the config Minion already wrote.
+
+**Two different mechanisms:** (1) **`claude_desktop_config.json`** — Minion merges this so Claude Desktop **starts** the Minion MCP and exposes **tools**. (2) **Directions to the model** — the MCP server **injects `retrieval_policy.md`** via the MCP handshake (`initialize.instructions`), so Claude gets retrieval discipline automatically when the server connects; you should still paste **`core_profile.md`** into Custom Instructions (and optionally the policy again if you want it duplicated there).
+
+Strategic **`identity_profile.md`** (`minion ask_minion`) is the chunk-synthesized layer you add to that same Claude-side workflow when you want it — see `chatgpt_mcp_memory/README.md`.
 
 ## Install (internal teammates)
 
@@ -42,11 +47,13 @@ brew install minion
 minion doctor
 ```
 
-To run the full setup from an export ZIP (creates a private workspace in `~/minion_private`):
+To run the **same full pipeline** non-interactively (creates a workspace; default is `~/minion_private` unless you pass `--workspace`):
 
 ```bash
-minion setup --export-zip "/path/to/chatgpt-export.zip"
+minion setup --export "/path/to/chatgpt-export.zip"
 ```
+
+(Older docs may say `--export-zip`; both mean the same export path.)
 
 ## What you do with it
 
@@ -61,21 +68,15 @@ minion setup --export-zip "/path/to/chatgpt-export.zip"
 - Your raw export, derived embeddings, and quote banks are generated locally and kept out of git.
 - Recommended: keep private artifacts outside the repo entirely (e.g. a sibling `minion_private/` folder).
 
-## Quick start (high level)
+## What actually runs (so you know it’s one pipeline)
 
-1) Download your ChatGPT data export
-2) Ingest/unzip it locally (nothing uploaded)
-3) Build two things from it:
-   - a semantic memory index (fast lookup later)
-   - persona evidence (sourcebook + quote bank)
-4) Generate `core_profile.md` from that evidence using a local LLM (Ollama)
-   - this also writes a build marker + manifest in `data/derived/`
-5) Use:
-   - `core_profile.md` as stable context
-   - memory search when you need grounded past details
-6) Optional — chunk-native strategic profile (local Ollama): `minion ask_minion --derived-dir …` or see `chatgpt_mcp_memory/README.md` (`ask_minion` writes `identity_profile.md` from `chunks.jsonl`).
+If you use **`minion`** (wizard) or **`minion setup --export …`**, Minion runs this in order:
 
-In Claude, combine `core_profile.md` with `chatgpt_mcp_memory/retrieval_policy.md` (it tells the model to call `search_memory` **proactively**, not only on explicit recall requests).
+1. Ingest / unzip the export (nothing uploaded)
+2. Build the semantic index (`chunks.jsonl` + embeddings)
+3. Extract persona evidence (sourcebook + quote bank)
+4. Generate **`core_profile.md`** with local Ollama + write build marker / manifest under that run’s `derived/`, and **copy `retrieval_policy.md`** into that run folder (for you to paste into Claude)
+5. **Merge** the memory MCP into **Claude Desktop’s** `claude_desktop_config.json` (backup saved as `*.minion.bak` when needed)
 
-Technical instructions live in `chatgpt_mcp_memory/README.md`.
+After that: **restart Claude Desktop** (MCP config), then paste **`core_profile.md`** + **`retrieval_policy.md`** (copied into your run folder by setup) into **Custom Instructions**. Add **`identity_profile.md`** from `ask_minion` to the same workflow when generated — see `chatgpt_mcp_memory/README.md`.
 

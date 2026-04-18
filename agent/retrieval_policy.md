@@ -16,6 +16,8 @@ Do not override the core profile with one-off retrieved fragments unless there i
 
 ## 2. Use Semantic Memory For Task-Relevant Context
 
+**Proactive use:** At the **start** of substantive work, call `search_memory` for short queries on likely themes—even if Reif did not ask for history. Do this whenever prior context **might** matter (including subtle or mid-thread cases).
+
 Query the semantic index when you need:
 
 - examples of how Reif talks about a topic
@@ -23,6 +25,8 @@ Query the semantic index when you need:
 - evidence of preferences in his own words
 - prior decisions, plans, or patterns
 - context on active business relationships, ideas, or recurring themes
+
+Prefer **small** `top_k` first; use `get_chunk` only to expand a useful hit.
 
 ## 3. Prefer Repeated Patterns Over Isolated Fragments
 

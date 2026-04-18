@@ -107,12 +107,45 @@ Outputs:
 - `core_profile.md` (generated)
 - `data/derived/core_profile_manifest.json` + `data/derived/core_profile.built` (build marker + metadata)
 
+## 5b) `ask_minion` — chunk-native strategic profile (Claude agent workflow)
+
+After `chunks.jsonl` exists (from step 3), you can synthesize a longer **strategic / identity** document from the **same chunks** the MCP searches—decisions, frameworks, beliefs, projects—via map→reduce and local Ollama:
+
+```bash
+source .venv/bin/activate
+python src/ask_minion.py --derived-dir data/derived --model mistral:7b
+```
+
+Or from the repo / Homebrew CLI:
+
+```bash
+minion ask_minion --derived-dir "/path/to/derived" --model mistral:7b
+```
+
+Pilot on a subset (recommended before a full corpus):
+
+```bash
+python src/ask_minion.py --derived-dir data/derived --max-conversations 20 --dry-run
+python src/ask_minion.py --derived-dir data/derived --max-conversations 50
+```
+
+Outputs:
+
+- `data/derived/identity_profile.md` — ~800–1200 words, structured sections
+- `data/derived/identity_profile_manifest.json` — model, filters, counts
+- Copy also written to `agent/identity_profile.md` when the repo layout is present
+
+This complements `core_profile.md` (persona from the quote bank / sourcebook). Paste either or both into Claude’s system context.
+
 ## 6) Pasteable persona for Claude
+
+**MCP vs instructions:** `claude_desktop_config.json` (updated by `minion mcp-config` / setup) only **registers** the Minion server so **tools exist**. To get good **invocation** of `search_memory`, paste the files below into **Claude → Custom Instructions** (and/or project instructions).
 
 In Claude, paste content from:
 
 - `core_profile.md`
-- `retrieval_policy.md`
+- `retrieval_policy.md` (includes **proactive** `search_memory` guidance)
+- `identity_profile.md` (from `ask_minion` — same workflow, strategic layer over the chunk corpus)
 
 Optionally also attach / paste selected sections from:
 
@@ -121,17 +154,30 @@ Optionally also attach / paste selected sections from:
 
 ## 7) Wire it into Claude Desktop (MCP)
 
-Claude Desktop reads:
+Claude Desktop reads (macOS):
 
 - `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-Copy `claude_desktop_config.example.json` to that location (or merge it) and replace paths:
+**Default:** `minion setup` **writes this file for you** (merges the `chatgpt-memory-local` entry; backs up the previous file to `claude_desktop_config.json.minion.bak` when it existed).
 
-- `command`: point to this project’s venv python: `.../chatgpt_mcp_memory/.venv/bin/python`
-- `args[0]`: path to `.../chatgpt_mcp_memory/src/mcp_server.py`
-- `CHATGPT_MCP_DATA_DIR`: path to `.../chatgpt_mcp_memory/data/derived`
+To point at an existing index later (same paths as `minion setup` would use):
 
-Restart Claude Desktop after editing the config.
+```bash
+minion mcp-config --derived-dir "/path/to/derived"
+```
+
+That **merges** into `claude_desktop_config.json`—no copy-paste. Restart Claude Desktop after it runs.
+
+- `--print-only` — print a JSON fragment only; **does not** write (for debugging).
+- `--config-path` / env **`CLAUDE_DESKTOP_CONFIG`** — non-default config file location.
+- `--server-name` — if `chatgpt-memory-local` collides with another server.
+- `--quiet` — less output when writing; with `--print-only`, JSON only on stdout.
+
+**Manual:** see `claude_desktop_config.example.json` (`command`, `args`, `CHATGPT_MCP_DATA_DIR`).
+
+**Injected directions (no paste required for retrieval policy):** On MCP connect, the Minion server sends **`retrieval_policy.md`** in the protocol’s `initialize.instructions` field (so Claude sees *when* to call `search_memory`, not only that tools exist). The file must live next to your index: **`CHATGPT_MCP_DATA_DIR/retrieval_policy.md`**. `minion setup` and `minion mcp-config` copy it from this package into that folder. Override path with env **`CHATGPT_MCP_RETRIEVAL_POLICY`**; cap length with **`CHATGPT_MCP_INSTRUCTIONS_MAX_CHARS`** (default `20000`). You can still paste the same policy into Custom Instructions for emphasis, or paste only **`core_profile.md`** there to avoid duplication.
+
+Restart Claude Desktop after any config change.
 
 ## 8) Verify inside Claude
 

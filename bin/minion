@@ -322,7 +322,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     # 1) Ingest zip (unzip into run_dir/raw/*)
     if plain:
-        print("Step 1/4 — Opening your ChatGPT export…")
+        print("Step 1/5 — Opening your ChatGPT export…")
     else:
         print("1) Ingesting export zip…")
     ingest_out = _run(
@@ -337,7 +337,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     # 2) Build semantic index into run_dir/derived
     if plain:
-        print("Step 2/4 — Building a search index (this may take a while)…")
+        print("Step 2/5 — Building a search index (this may take a while)…")
     else:
         print("2) Building semantic index…")
     _run([str(vpy), str(_src("build_index.py")), "--export", str(export_root_path), "--derived-dir", str(derived_dir)])
@@ -347,7 +347,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     # 3) Persona artifacts (sourcebook + quote bank)
     if plain:
-        print("Step 3/4 — Gathering short quotes from your messages…")
+        print("Step 3/5 — Gathering short quotes from your messages…")
     else:
         print("3) Extracting persona evidence…")
     _run([str(vpy), str(_src("persona_extract.py")), "--export", str(export_root_path), "--derived-dir", str(derived_dir)])
@@ -356,7 +356,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     # 4) Generate core_profile.md from evidence (local Ollama)
     if plain:
-        print("Step 4/4 — Writing your pasteable profile with the local AI (Ollama)…")
+        print("Step 4/5 — Writing your pasteable profile with the local AI (Ollama)…")
     else:
         print("4) Generating core profile (local Ollama)…")
     core_profile_path = run_dir / "core_profile.md"
@@ -379,27 +379,69 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print(f"   {ln}")
     print("")
 
+    retrieval_policy_src = _chatgpt_mcp_dir() / "retrieval_policy.md"
+    retrieval_policy_run = run_dir / "retrieval_policy.md"
+    retrieval_policy_derived = derived_dir / "retrieval_policy.md"
+    if retrieval_policy_src.exists():
+        shutil.copy2(retrieval_policy_src, retrieval_policy_run)
+        shutil.copy2(retrieval_policy_src, retrieval_policy_derived)
+
+    if plain:
+        print("Step 5/5 — Connecting memory search to Claude Desktop…")
+    else:
+        print("5) Updating Claude Desktop MCP config…")
+    try:
+        cfg_written, cfg_backup = install_claude_desktop_mcp(
+            workspace_dir=workspace_dir,
+            derived_dir=derived_dir,
+            server_name="chatgpt-memory-local",
+            config_path=None,
+        )
+        if plain:
+            print(f"  Updated: {cfg_written}")
+            if cfg_backup is not None:
+                print(f"  Backup:  {cfg_backup}")
+        else:
+            print(f"   {cfg_written}")
+            if cfg_backup is not None:
+                print(f"   backup: {cfg_backup}")
+    except Exception as e:
+        if plain:
+            print(f"  Could not update automatically: {e}")
+            print(f'  Run:  minion mcp-config --derived-dir "{derived_dir}"')
+        else:
+            print(f"   Warning: {e}")
+            print(f'   Run:  minion mcp-config --derived-dir "{derived_dir}"')
+    print("")
+
     if plain:
         print("All set.")
         print("")
-        print("What you do next (in Claude):")
+        print("What you do next (in Claude) — two different things:")
         print("")
-        print("  1) Open this file and copy everything:")
-        print(f"     {core_profile_path}")
-        print("     Paste it into Claude as custom instructions or project notes.")
+        print("  A) Tools wired (already done): step 5 wrote the Minion MCP into Claude Desktop’s")
+        print("     config file so Claude can *see* search_memory / get_chunk. Quit and reopen")
+        print("     Claude Desktop so that takes effect.")
         print("")
-        print("  2) Add memory search in Claude Desktop:")
-        print("     Run this and paste the JSON into your config (see stderr for the path):")
-        print(f'       minion mcp-config --derived-dir "{derived_dir}"')
-        print("     Or hand-edit:  chatgpt_mcp_memory/claude_desktop_config.example.json")
-        print(f"     • CHATGPT_MCP_DATA_DIR must be:  {derived_dir}")
-        print("     • Restart Claude Desktop.")
+        print("  B) Paste into Claude — profile only (required):")
+        print("")
+        print("     • Retrieval rules: Minion already put retrieval_policy.md next to your index;")
+        print("       the MCP server injects that text when Claude connects (no paste needed")
+        print("       for that part). Optional: paste the same file into Custom Instructions too.")
+        print("")
+        print("     • Your voice / facts — paste this into Custom Instructions (or project):")
+        print(f"        {core_profile_path}")
         print("")
     else:
         print("Done.")
         print("")
         print(f"- Pasteable profile: {core_profile_path}")
-        print(f"- Derived data dir (set CHATGPT_MCP_DATA_DIR to this): {derived_dir}")
+        if retrieval_policy_run.exists():
+            print(f"- retrieval_policy.md (injected via MCP initialize; also at): {retrieval_policy_run}")
+        print(f"- Derived data dir: {derived_dir}")
+        print("")
+        print("Claude: restart Desktop (MCP). Paste core_profile into Custom Instructions; retrieval")
+        print("policy is injected from derived/retrieval_policy.md when the MCP session starts.")
         print("")
 
         if getattr(args, "with_ask_minion", False):
@@ -419,7 +461,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
             print("")
 
         print("Next:")
-        print(f'  minion mcp-config --derived-dir "{derived_dir}"   # paste into Claude Desktop JSON')
+        print(f'  minion mcp-config --derived-dir "{derived_dir}"   # re-apply Claude Desktop config if needed')
         print(f'  minion mcp --derived-dir "{derived_dir}"')
         if not getattr(args, "with_ask_minion", False):
             print(f'  minion ask_minion --derived-dir "{derived_dir}" --model {args.model}')
@@ -460,6 +502,13 @@ def cmd_mcp_config(args: argparse.Namespace) -> int:
         server_name=server_name,
         config_path=cfg_override,
     )
+    policy_src = _chatgpt_mcp_dir() / "retrieval_policy.md"
+    policy_dst = derived_dir / "retrieval_policy.md"
+    if policy_src.exists():
+        shutil.copy2(policy_src, policy_dst)
+        if not quiet:
+            print("Copied retrieval_policy.md into derived dir (MCP injects this via initialize.instructions):", file=sys.stderr)
+            print(f"  {policy_dst}", file=sys.stderr)
     if not quiet:
         print(f'Wrote MCP server "{server_name}" into Claude Desktop config:', file=sys.stderr)
         print(f"  {written}", file=sys.stderr)
@@ -568,7 +617,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p_mcpcfg = sub.add_parser(
         "mcp-config",
-        help="Print Claude Desktop mcpServers JSON (absolute paths; merge into claude_desktop_config.json).",
+        help="Merge Minion into Claude Desktop claude_desktop_config.json (default). Use --print-only for JSON only.",
     )
     p_mcpcfg.add_argument(
         "--derived-dir",
@@ -582,9 +631,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Key name under mcpServers (default: chatgpt-memory-local)",
     )
     p_mcpcfg.add_argument(
+        "--config-path",
+        default=None,
+        help="Override Claude config path (default: macOS/Windows path, or CLAUDE_DESKTOP_CONFIG)",
+    )
+    p_mcpcfg.add_argument(
+        "--print-only",
+        action="store_true",
+        help="Print mcpServers JSON only; do not write the config file",
+    )
+    p_mcpcfg.add_argument(
         "--quiet",
         action="store_true",
-        help="JSON only to stdout (no stderr hints); useful for scripts",
+        help="With --print-only: JSON only. When writing: no stderr messages.",
     )
     p_mcpcfg.set_defaults(func=cmd_mcp_config)
 
