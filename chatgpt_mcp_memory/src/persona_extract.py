@@ -208,8 +208,13 @@ def main() -> None:
     raw_messages: List[Dict] = []
     if args.chunks:
         chunks_path = Path(args.chunks).expanduser().resolve()
+        print(f"Reading user chunks from {chunks_path.name}…", flush=True)
+        n_lines = 0
         with open(chunks_path, "r", encoding="utf-8") as fh:
             for line in fh:
+                n_lines += 1
+                if n_lines % 200_000 == 0:
+                    print(f"  … read {n_lines} lines from chunks file", flush=True)
                 line = line.strip()
                 if not line:
                     continue
@@ -227,9 +232,15 @@ def main() -> None:
                         "text": text,
                     }
                 )
+        print(f"Finished reading chunks file: {n_lines} lines.", flush=True)
     elif args.export:
         export_dir = str(Path(args.export).expanduser().resolve())
+        print("Scanning export for user messages (this can take a few minutes on large exports)…", flush=True)
+        n = 0
         for msg in iter_messages(export_dir, include_roles=("user",)):
+            n += 1
+            if n % 100_000 == 0:
+                print(f"  … scanned {n} user messages", flush=True)
             if msg.content_type != "text" or not msg.text:
                 continue
             raw_messages.append(
@@ -240,6 +251,7 @@ def main() -> None:
                     "text": msg.text,
                 }
             )
+        print(f"Finished scan: {n} user messages read.", flush=True)
     else:
         raise SystemExit("Provide --export or --chunks")
 

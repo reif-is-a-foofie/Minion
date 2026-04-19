@@ -29,7 +29,7 @@ Reif
 **One run does the whole pipeline** — you are not supposed to chase five separate scripts. After you point Minion at your export, it unpacks, builds the search index, pulls persona quotes, calls your **local** Ollama model to write `core_profile.md`, and **merges the MCP entry into Claude Desktop’s config** for you (with a backup of the old file).
 
 1. Install Minion (Homebrew or from this repo). Have **Ollama** installed with the model you use for the profile (default `mistral:7b`).
-2. Run **`minion`** (interactive, as above). **Or** for scripts/CI: `minion setup --export /path/to/export.zip`.
+2. Run **`minion`** (interactive, as above). **Or** for scripts/CI: `minion /path/to/export.zip` when that path exists (same as `minion setup …`), or `minion setup /path/to/export.zip` / `minion setup --export …`.
 3. When asked, paste the path to your **ChatGPT export `.zip`** from OpenAI (or drag the file into the window).
 4. Wait until it finishes (this can take a while on a big export).
 5. **You:** put text **into Claude itself** so the model knows how to behave — not just “connecting wires.” Minion copies **`retrieval_policy.md`** next to your profile in each run folder; paste **both** that file and **`core_profile.md`** into **Claude → Custom Instructions** (and/or project instructions). That tells Claude **when to call** `search_memory` (MCP), not only that the tool exists.
@@ -54,10 +54,12 @@ Maintainers: bumping the tap after a release is documented in [docs/homebrew.md]
 To run the **same full pipeline** non-interactively (creates a workspace; default is `~/minion_private` unless you pass `--workspace`):
 
 ```bash
+minion setup "/path/to/chatgpt-export.zip"
+# equivalent:
 minion setup --export "/path/to/chatgpt-export.zip"
 ```
 
-(Older docs may say `--export-zip`; both mean the same export path.)
+(`--export` and `--export-zip` are the same flag.)
 
 ## What you do with it
 

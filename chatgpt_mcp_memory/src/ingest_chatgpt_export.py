@@ -43,9 +43,12 @@ def unzip_to(zip_path: Path, dest_dir: Path) -> None:
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "r") as zf:
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
+        members = [i for i in zf.infolist() if not i.is_dir()]
+        total = len(members)
+        print(f"Unzipping {total} files (large exports take several minutes)…", flush=True)
+        for idx, info in enumerate(members, start=1):
+            if idx % 2500 == 0 or idx == total:
+                print(f"  … {idx}/{total} files extracted", flush=True)
             parts = info.filename.replace("\\", "/").split("/")
             safe_parts = [_shorten_component(p) for p in parts if p]
             rel = "/".join(safe_parts)

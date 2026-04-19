@@ -40,6 +40,8 @@ def build_chunks(
             continue
         for sub in chunk_text(msg.text, max_chars=max_chars):
             n += 1
+            if n % 50_000 == 0:
+                print(f"  … built {n} text chunks so far", flush=True)
             chunks.append(
                 Chunk(
                     chunk_id=f"chunk-{n:06d}",
@@ -76,14 +78,18 @@ def main() -> None:
 
     include_roles = ["user", "assistant"] if args.include_assistant else ["user"]
 
+    print("Reading conversations and splitting into chunks (no embeddings yet)…", flush=True)
+
     chunks_path = derived_dir / "chunks.jsonl"
     embeddings_path = derived_dir / "embeddings.npy"
     manifest_path = derived_dir / "manifest.json"
 
     chunks = build_chunks(export_dir, include_roles=include_roles, max_chars=args.max_chars)
+    print(f"Done chunking: {len(chunks)} chunks. Loading embedding model {args.model!r}…", flush=True)
     texts = [c.text for c in chunks]
 
     model = SentenceTransformer(args.model)
+    print("Encoding chunks (progress bar)…", flush=True)
     embeddings = model.encode(
         texts,
         batch_size=64,

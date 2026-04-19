@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -110,12 +111,153 @@ def _run(cmd: List[str], *, cwd: Optional[Path] = None, env: Optional[Dict[str, 
     return p.stdout
 
 
+def _run_explain(cmd: List[str], *, cwd: Optional[Path] = None, env: Optional[Dict[str, str]] = None) -> str:
+    """Run a subprocess; print stdout/stderr on failure and exit (for venv/pip UX)."""
+    p = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    out = p.stdout or ""
+    if p.returncode != 0:
+        if out.strip():
+            print(out, end="" if out.endswith("\n") else "\n")
+        raise SystemExit(
+            f"\nThat step failed (exit {p.returncode}). Output is above.\n"
+            f"Command: {' '.join(cmd)}"
+        )
+    return out
+
+
+def _py_exe_ok(path: str) -> bool:
+    try:
+        p = subprocess.run(
+            [path, "-c", "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 10) else 1)"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return p.returncode == 0
+    except OSError:
+        return False
+
+
+def _python_for_venv() -> str:
+    """
+    Prefer Homebrew python@3.11+ (minion formula already depends on it).
+    Avoid Apple CLT python3 (often 3.9) — sentence-transformers wheels expect newer runtimes.
+    """
+    brew = _which("brew")
+    if brew:
+        for formula in ("python@3.12", "python@3.11", "python@3.10"):
+            try:
+                pref = subprocess.run(
+                    [brew, "--prefix", formula],
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                )
+                if pref.returncode != 0:
+                    continue
+                base = Path(pref.stdout.strip())
+                for sub in ("bin/python3.12", "bin/python3.11", "bin/python3.10", "bin/python3"):
+                    exe = base / sub
+                    if exe.is_file() and os.access(exe, os.X_OK) and _py_exe_ok(str(exe)):
+                        return str(exe)
+            except OSError:
+                continue
+    for name in ("python3.12", "python3.11", "python3.10"):
+        w = _which(name)
+        if w and _py_exe_ok(w):
+            return w
+    py = _which("python3") or _which("python")
+    if py and _py_exe_ok(py):
+        return py
+    raise SystemExit(
+        "Minion needs Python 3.10+ to install dependencies (numpy, sentence-transformers).\n"
+        "Install with:  brew install python@3.11\n"
+        "Or install https://docs.astral.sh/uv/ and re-run minion (uv will use Python 3.11)."
+    )
+
+
+def _requirements_fingerprint(req: Path) -> str:
+    return hashlib.sha256(req.read_bytes()).hexdigest()
+
+
+def _venv_stamp_path(workspace_dir: Path) -> Path:
+    return workspace_dir / ".venv" / ".minion_requirements_fp"
+
+
+def _venv_py_usable(vpy: Path) -> bool:
+    if not vpy.is_file():
+        return False
+    try:
+        p = subprocess.run(
+            [str(vpy), "-c", "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 10) else 1)"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return p.returncode == 0
+    except OSError:
+        return False
+
+
+def _python_u(vpy: Path, script: Path, args: List[str]) -> List[str]:
+    """Unbuffered Python so progress logs and tqdm appear immediately."""
+    return [str(vpy), "-u", str(script)] + args
+
+
+def _run_tee(cmd: List[str], *, cwd: Optional[Path] = None, env: Optional[Dict[str, str]] = None) -> str:
+    """
+    Run a subprocess and stream its stdout to the terminal line-by-line while capturing it.
+    Use for long steps (ingest, index, persona) so users see progress instead of a silent hang.
+    """
+    p = subprocess.Popen(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    out_parts: List[str] = []
+    assert p.stdout is not None
+    for line in iter(p.stdout.readline, ""):
+        out_parts.append(line)
+        print(line, end="", flush=True)
+    p.wait()
+    captured = "".join(out_parts)
+    if p.returncode != 0:
+        raise subprocess.CalledProcessError(p.returncode, cmd, output=captured)
+    return captured
+
+
 def _which(name: str) -> Optional[str]:
     return shutil.which(name)
 
 
 def _default_workspace_dir() -> Path:
     return Path.home() / "minion_private"
+
+def _workspace_in_cwd() -> Path:
+    """
+    Default interactive workspace: ./minion_private, or ./minion_private_2, … if taken.
+    """
+    parent = Path.cwd().resolve()
+    candidate = parent / "minion_private"
+    if not candidate.exists():
+        return candidate
+    n = 2
+    while True:
+        alt = parent / f"minion_private_{n}"
+        if not alt.exists():
+            return alt
+        n += 1
 
 
 def _workspace_beside_export(export_path: Path) -> Path:
@@ -148,28 +290,36 @@ def _ensure_python_env(workspace_dir: Path) -> Path:
     Prefer uv (fast, less system-python drama). Fall back to venv.
     Returns the python executable path to use for subsequent steps.
     """
+    req = _chatgpt_mcp_dir() / "requirements.txt"
+    fp = _requirements_fingerprint(req)
+    stamp = _venv_stamp_path(workspace_dir)
+    _ensure_dir(workspace_dir)
+
     vpy = _venv_python(workspace_dir)
-    if vpy.exists():
+    if vpy.exists() and not _venv_py_usable(vpy):
+        shutil.rmtree(workspace_dir / ".venv")
+
+    vpy = _venv_python(workspace_dir)
+    if vpy.exists() and stamp.exists() and stamp.read_text(encoding="utf-8").strip() == fp:
         return vpy
 
     uv = _which("uv")
-    req = _chatgpt_mcp_dir() / "requirements.txt"
-    _ensure_dir(workspace_dir)
+    if not vpy.exists():
+        if uv:
+            _run_explain([uv, "python", "install", "3.11"])
+            _run_explain([uv, "venv", "--python", "3.11", str(workspace_dir / ".venv")])
+            _run_explain([uv, "pip", "install", "-r", str(req)])
+        else:
+            py = _python_for_venv()
+            _run_explain([py, "-m", "venv", str(workspace_dir / ".venv")])
+        vpy = _venv_python(workspace_dir)
+        if not vpy.exists():
+            raise SystemExit("Failed to create a Python virtualenv under .venv — see errors above.")
 
-    if uv:
-        _run([uv, "python", "install", "3.11"])
-        _run([uv, "venv", "--python", "3.11", str(workspace_dir / ".venv")])
-        _run([uv, "pip", "install", "-r", str(req)])
-        if vpy.exists():
-            return vpy
-
-    # Fallback: system python venv
-    py = _which("python3") or _which("python")
-    if not py:
-        raise SystemExit("Missing python. Install Python 3 or install `uv`.")
-    _run([py, "-m", "venv", str(workspace_dir / ".venv")])
-    _run([str(vpy), "-m", "pip", "install", "--upgrade", "pip"])
-    _run([str(vpy), "-m", "pip", "install", "-r", str(req)])
+    _run_explain([str(vpy), "-m", "pip", "install", "--upgrade", "pip"])
+    _run_explain([str(vpy), "-m", "pip", "install", "-r", str(req)])
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(fp, encoding="utf-8")
     return vpy
 
 
@@ -236,6 +386,81 @@ def _is_valid_export_path(p: Path) -> bool:
     return p.is_dir() or (p.is_file() and p.suffix.lower() == ".zip")
 
 
+def _resolve_setup_export(args: argparse.Namespace) -> str:
+    """
+    Wizard passes export_zip; CLI may pass --export-zip and/or a positional path.
+    """
+    direct = getattr(args, "export_zip", None)
+    opt = getattr(args, "export_zip_opt", None)
+    pos = getattr(args, "export_zip_pos", None)
+    if direct and (opt or pos):
+        raise SystemExit(
+            "minion setup: conflicting export paths (internal). "
+            "If you see this, file an issue with how you invoked minion."
+        )
+    if direct:
+        return str(direct)
+    if opt and pos:
+        if Path(opt).expanduser().resolve() != Path(pos).expanduser().resolve():
+            raise SystemExit(
+                "minion setup: you gave two different export paths. "
+                "Use either the positional path or --export-zip, not both with different values."
+            )
+        return str(opt or pos)
+    chosen = opt or pos
+    if not chosen:
+        raise SystemExit(
+            "minion setup needs your ChatGPT export (the .zip from OpenAI, or an unzipped folder).\n"
+            "\n"
+            "  minion setup /path/to/export.zip\n"
+            "  minion setup --export-zip /path/to/export.zip\n"
+            "\n"
+            "Or run  minion  with no arguments for the interactive wizard."
+        )
+    return str(chosen)
+
+
+def _try_setup_shortcut(argv: List[str]) -> Optional[int]:
+    """
+    If argv is a single path to an existing export (.zip or folder), run setup without 'setup'.
+    Example:  minion ./export.zip
+    """
+    if len(argv) != 1:
+        return None
+    raw = argv[0]
+    if raw.startswith("-"):
+        return None
+    reserved = {
+        "doctor",
+        "setup",
+        "mcp",
+        "mcp-config",
+        "ask_minion",
+        "start",
+        "wizard",
+        "go",
+        "help-me",
+    }
+    if raw in reserved:
+        return None
+    try:
+        p = Path(raw).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+    if not p.exists() or not _is_valid_export_path(p):
+        return None
+    ns = argparse.Namespace(
+        export_zip=None,
+        export_zip_opt=None,
+        export_zip_pos=str(p),
+        workspace=None,
+        model="mistral:7b",
+        with_ask_minion=False,
+        plain=False,
+    )
+    return cmd_setup(ns)
+
+
 def cmd_wizard() -> int:
     print()
     print("  Minion — set up your ChatGPT memory for Claude")
@@ -259,22 +484,14 @@ def cmd_wizard() -> int:
         print("  That doesn’t look like a .zip or a folder — use the export OpenAI sent you.")
         return 1
 
-    workspace = _workspace_beside_export(export_path)
+    workspace = _workspace_in_cwd()
     print()
-    print(f"  Output will be saved under:  {workspace}")
-    yn = input("  Are you in the directory where the output will be? (y/n)\n  > ").strip().lower()
-    if yn in ("n", "no"):
-        print(f"  cd {workspace}")
-        print()
-    elif yn not in ("y", "yes", ""):
-        print("  Please answer y or n. Stopping.")
-        return 1
+    print(f"  Saving private data under:  {workspace}")
 
     print()
-    print("  For the written profile I use a small local model via Ollama (default: mistral:7b).")
-    print("  If you don’t have it yet:  ollama pull mistral:7b")
-    mod_in = input("  Model name, or press Enter for mistral:7b:\n  > ").strip()
-    model = mod_in or "mistral:7b"
+    model = "mistral:7b"
+    print(f"  For the written profile I use a small local model via Ollama (default: {model}).")
+    print(f"  If you don’t have it yet:  ollama pull {model}")
 
     ns = argparse.Namespace(
         export_zip=str(export_path),
@@ -288,7 +505,7 @@ def cmd_wizard() -> int:
 
 def cmd_setup(args: argparse.Namespace) -> int:
     plain = getattr(args, "plain", False)
-    export_path = Path(args.export_zip).expanduser().resolve()
+    export_path = Path(_resolve_setup_export(args)).expanduser().resolve()
     if not export_path.exists():
         raise SystemExit(f"Missing export path: {export_path}")
     if not _is_valid_export_path(export_path):
@@ -323,10 +540,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # 1) Ingest zip (unzip into run_dir/raw/*)
     if plain:
         print("Step 1/5 — Opening your ChatGPT export…")
+        print("  (Unzipping can take many minutes on a large export — progress lines below.)")
     else:
         print("1) Ingesting export zip…")
-    ingest_out = _run(
-        [str(vpy), str(_src("ingest_chatgpt_export.py")), str(export_path), "--out", str(raw_out_dir)]
+        print("   Unzipping; large exports take a while. You should see file counts stream below.")
+    ingest_out = _run_tee(
+        _python_u(vpy, _src("ingest_chatgpt_export.py"), [str(export_path), "--out", str(raw_out_dir)])
     )
     export_root, manifest_path = _parse_ingest_output(ingest_out)
     export_root_path = Path(export_root).expanduser().resolve()
@@ -338,9 +557,17 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # 2) Build semantic index into run_dir/derived
     if plain:
         print("Step 2/5 — Building a search index (this may take a while)…")
+        print("  (Scanning messages → chunks → neural embeddings. Progress below.)")
     else:
         print("2) Building semantic index…")
-    _run([str(vpy), str(_src("build_index.py")), "--export", str(export_root_path), "--derived-dir", str(derived_dir)])
+        print("   Chunking messages, then embedding (tqdm progress bar may appear below).")
+    _run_tee(
+        _python_u(
+            vpy,
+            _src("build_index.py"),
+            ["--export", str(export_root_path), "--derived-dir", str(derived_dir)],
+        )
+    )
     if not plain:
         print(f"   derived_dir: {derived_dir}")
         print("")
@@ -348,32 +575,44 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # 3) Persona artifacts (sourcebook + quote bank)
     if plain:
         print("Step 3/5 — Gathering short quotes from your messages…")
+        print("  (Re-reading the export to build persona_sourcebook + quote_bank.)")
     else:
         print("3) Extracting persona evidence…")
-    _run([str(vpy), str(_src("persona_extract.py")), "--export", str(export_root_path), "--derived-dir", str(derived_dir)])
+        print("   Scanning user messages for first-person lines (progress messages below).")
+    _run_tee(
+        _python_u(
+            vpy,
+            _src("persona_extract.py"),
+            ["--export", str(export_root_path), "--derived-dir", str(derived_dir)],
+        )
+    )
     if not plain:
         print("")
 
     # 4) Generate core_profile.md from evidence (local Ollama)
     if plain:
         print("Step 4/5 — Writing your pasteable profile with the local AI (Ollama)…")
+        print(f"  (Model: {args.model} — ensure Ollama is running.)")
     else:
         print("4) Generating core profile (local Ollama)…")
+        print(f"   Calling model {args.model} (one request; may take several minutes).")
     core_profile_path = run_dir / "core_profile.md"
     agent_profile_path = run_dir / "agent_core_profile.md"
-    gen_out = _run(
-        [
-            str(vpy),
-            str(_src("generate_core_profile.py")),
-            "--derived-dir",
-            str(derived_dir),
-            "--model",
-            str(args.model),
-            "--out-chatgpt-mcp",
-            str(core_profile_path),
-            "--out-agent",
-            str(agent_profile_path),
-        ]
+    gen_out = _run_tee(
+        _python_u(
+            vpy,
+            _src("generate_core_profile.py"),
+            [
+                "--derived-dir",
+                str(derived_dir),
+                "--model",
+                str(args.model),
+                "--out-chatgpt-mcp",
+                str(core_profile_path),
+                "--out-agent",
+                str(agent_profile_path),
+            ],
+        )
     )
     for ln in [ln.strip() for ln in gen_out.splitlines() if ln.strip()][-3:]:
         print(f"   {ln}")
@@ -445,16 +684,19 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print("")
 
         if getattr(args, "with_ask_minion", False):
-            print("5) ask_minion (chunk-native identity_profile.md, many Ollama calls)…")
-            ask_out = _run(
-                [
-                    str(vpy),
-                    str(_src("ask_minion.py")),
-                    "--derived-dir",
-                    str(derived_dir),
-                    "--model",
-                    str(args.model),
-                ]
+            print("Optional — ask_minion (chunk-native identity_profile.md, many Ollama calls)…")
+            print("   This step runs one extract pass per conversation — can take hours on a huge corpus.")
+            ask_out = _run_tee(
+                _python_u(
+                    vpy,
+                    _src("ask_minion.py"),
+                    [
+                        "--derived-dir",
+                        str(derived_dir),
+                        "--model",
+                        str(args.model),
+                    ],
+                )
             )
             for ln in [ln.strip() for ln in ask_out.splitlines() if ln.strip()][-4:]:
                 print(f"   {ln}")
@@ -578,12 +820,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not argv or argv[0] in ("start", "wizard", "go", "help-me"):
         return cmd_wizard()
 
+    short = _try_setup_shortcut(argv)
+    if short is not None:
+        return short
+
     parser = argparse.ArgumentParser(
         prog="minion",
-        description="Local-first memory + persona for Claude. Run with no subcommand for a guided setup.",
-        epilog="Examples:  minion   |   minion start   |   minion doctor   |   minion setup --export PATH.zip",
+        description="Local-first memory + persona for Claude. Run with no arguments for a guided setup.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n"
+        "  minion\n"
+        "  minion ./chatgpt-export.zip\n"
+        "  minion setup ~/Downloads/chatgpt-export.zip\n"
+        "  minion doctor\n",
     )
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub = parser.add_subparsers(dest="cmd", required=True, metavar="cmd")
 
     p_doctor = sub.add_parser("doctor", help="Check local prerequisites.")
     p_doctor.add_argument("--verbose", action="store_true", help="Show technical paths and full Ollama list")
@@ -592,14 +843,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_setup = sub.add_parser(
         "setup",
         help="Ingest ChatGPT export (.zip or folder) and build everything into a private workspace.",
+        description="Pass your export as the first argument, or use --export-zip. "
+        "Large exports take a while; you will see progress in the terminal.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Example:  minion setup ~/Downloads/export.zip",
     )
     p_setup.add_argument(
         "--export-zip",
         "--export",
-        required=True,
-        dest="export_zip",
+        required=False,
+        default=None,
+        dest="export_zip_opt",
         metavar="PATH",
-        help="ChatGPT export: .zip from OpenAI or an unzipped folder (conversations-*.json)",
+        help="ChatGPT export: .zip from OpenAI or an unzipped folder (same as the positional argument)",
     )
     p_setup.add_argument(
         "--workspace",
@@ -613,6 +869,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="After setup, run ask_minion (chunk→identity_profile.md; can take a long time)",
     )
     p_setup.add_argument("--plain", action="store_true", help=argparse.SUPPRESS)
+    p_setup.add_argument(
+        "export_zip_pos",
+        nargs="?",
+        default=None,
+        metavar="EXPORT",
+        help="ChatGPT export (.zip or folder). You can use this instead of --export-zip.",
+    )
     p_setup.set_defaults(func=cmd_setup)
 
     p_mcpcfg = sub.add_parser(

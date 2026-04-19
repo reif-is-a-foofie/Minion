@@ -157,6 +157,11 @@ def main() -> None:
     )
     prompt = _build_prompt(inputs)
 
+    print(
+        f"Calling Ollama ({args.model}) to write core_profile.md — one request, may take a few minutes…",
+        flush=True,
+    )
+
     llm_resp = chat(
         model=str(args.model),
         system="You follow instructions exactly and only use supplied evidence.",
