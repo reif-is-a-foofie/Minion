@@ -379,7 +379,14 @@ def _parse_ingest_output(out: str) -> Tuple[str, str]:
     lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
     if len(lines) < 2:
         raise RuntimeError(f"Unexpected ingest output:\n{out}")
-    return lines[0], lines[1]
+    # ingest_chatgpt_export.py prints unzip progress first; export_root + manifest are always last.
+    export_root, manifest_path = lines[-2], lines[-1]
+    if not Path(export_root).exists():
+        raise RuntimeError(
+            "Could not parse ingest paths (last lines were not export paths). Tail of output:\n"
+            + "\n".join(lines[-12:])
+        )
+    return export_root, manifest_path
 
 
 def _is_valid_export_path(p: Path) -> bool:
