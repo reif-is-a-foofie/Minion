@@ -52,7 +52,8 @@ export type EventMsg =
   | { type: "ingest_started"; path: string }
   | { type: "ingest_skipped"; result: Record<string, unknown> }
   | { type: "source_updated"; result: Record<string, unknown>; counts: any }
-  | { type: "source_removed"; key: string; counts: any };
+  | { type: "source_removed"; key: string; counts: any }
+  | { type: "tree_done"; root: string; added: number; skipped: number; counts: any };
 
 let cachedConfig: AppConfig | null = null;
 

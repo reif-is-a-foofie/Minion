@@ -222,6 +222,37 @@ class SearchBody(BaseModel):
 class IngestBody(BaseModel):
     path: str
     move: bool = False  # if True, move into inbox; else copy
+    recursive: bool = True  # used when `path` is a directory
+
+
+SKIP_DIR_NAMES = {
+    ".git", ".hg", ".svn", ".venv", "venv", "env",
+    "node_modules", "target", "build", "dist",
+    "__pycache__", ".svelte-kit", ".next", ".nuxt",
+    ".cache", ".DS_Store",
+}
+
+
+def _iter_files_in_tree(root: Path) -> List[Path]:
+    """Walk a directory, skipping common build/cache dirs and dotfiles."""
+    out: List[Path] = []
+    stack: List[Path] = [root]
+    while stack:
+        cur = stack.pop()
+        try:
+            entries = list(cur.iterdir())
+        except OSError:
+            continue
+        for p in entries:
+            if p.name.startswith("."):
+                continue
+            if p.is_dir():
+                if p.name in SKIP_DIR_NAMES:
+                    continue
+                stack.append(p)
+            elif p.is_file():
+                out.append(p)
+    return out
 
 
 class DeleteBody(BaseModel):
@@ -359,30 +390,145 @@ def _get_query_model():
         return _query_model
 
 
+def _resolve_file_dest(src_path: Path) -> Path:
+    """Single-file destination under the inbox with collision-dedupe."""
+    dest = State.inbox / src_path.name
+    if not dest.exists() or dest.resolve() == src_path:
+        return dest
+    stem, suf = dest.stem, dest.suffix
+    i = 1
+    while True:
+        candidate = State.inbox / f"{stem} ({i}){suf}"
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
+def _resolve_dir_dest(src_dir: Path) -> Path:
+    """Directory destination under the inbox with collision-dedupe."""
+    dest = State.inbox / src_dir.name
+    if not dest.exists():
+        return dest
+    i = 1
+    while True:
+        candidate = State.inbox / f"{src_dir.name} ({i})"
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
+def _copy_tree_into_inbox(src_dir: Path, dest_root: Path) -> List[Path]:
+    """Mirror src_dir into dest_root under the inbox, skipping junk dirs."""
+    dest_root.mkdir(parents=True, exist_ok=True)
+    copied: List[Path] = []
+    stack: List[Path] = [src_dir]
+    while stack:
+        cur = stack.pop()
+        try:
+            entries = list(cur.iterdir())
+        except OSError:
+            continue
+        for p in entries:
+            if p.name.startswith("."):
+                continue
+            rel = p.relative_to(src_dir)
+            target = dest_root / rel
+            if p.is_dir():
+                if p.name in SKIP_DIR_NAMES:
+                    continue
+                target.mkdir(parents=True, exist_ok=True)
+                stack.append(p)
+            elif p.is_file():
+                try:
+                    shutil.copy2(str(p), str(target))
+                    copied.append(target)
+                except OSError:
+                    log.exception("copy failed: %s", p)
+    return copied
+
+
 @app.post("/ingest")
 async def ingest_endpoint(body: IngestBody) -> Dict[str, Any]:
-    """Bring a file into the inbox and ingest it. Runs the ingest on a thread
-    so the HTTP call isn't blocked by embedding."""
+    """Bring a file or directory into the inbox and ingest it. The HTTP call
+    returns as soon as the copy is done; ingestion runs in the background and
+    streams progress over the /events WebSocket."""
     src_path = Path(body.path).expanduser().resolve()
-    if not src_path.exists() or not src_path.is_file():
-        raise HTTPException(status_code=404, detail=f"not a file: {src_path}")
+    if not src_path.exists():
+        raise HTTPException(status_code=404, detail=f"path not found: {src_path}")
 
-    # Resolve destination under the inbox. If the file is already inside, skip copy.
+    # -------- Directory path: recurse, then ingest every file in the tree ----
+    if src_path.is_dir():
+        if not body.recursive:
+            raise HTTPException(status_code=400, detail="path is a directory; set recursive=true")
+        # Preserve tree structure under inbox/<dirname>/ so dropping two
+        # 'notes' folders doesn't collapse their contents together.
+        try:
+            src_path.relative_to(State.inbox)
+            # Already inside the inbox -- the watcher is already seeing it.
+            inbox_root = src_path
+        except ValueError:
+            inbox_root = _resolve_dir_dest(src_path)
+            if body.move:
+                shutil.move(str(src_path), str(inbox_root))
+            else:
+                _copy_tree_into_inbox(src_path, inbox_root)
+
+        files = _iter_files_in_tree(inbox_root)
+
+        async def _run_tree() -> None:
+            await _broadcast({"type": "ingest_started", "path": str(inbox_root), "count": len(files)})
+            loop = asyncio.get_running_loop()
+
+            def _work_one(p: Path) -> Dict[str, Any]:
+                conn = connect(State.db_path)
+                try:
+                    res = ingest_file(conn, p)
+                    return {
+                        "path": res.path,
+                        "source_id": res.source_id,
+                        "kind": res.kind,
+                        "parser": res.parser,
+                        "chunk_count": res.chunk_count,
+                        "skipped": res.skipped,
+                        "reason": res.reason,
+                    }
+                finally:
+                    conn.close()
+
+            added = 0
+            skipped = 0
+            for p in files:
+                res = await loop.run_in_executor(None, _work_one, p)
+                if res.get("source_id"):
+                    added += 1
+                    await _broadcast({
+                        "type": "source_updated",
+                        "result": res,
+                        "counts": _counts(),
+                    })
+                else:
+                    skipped += 1
+                    await _broadcast({"type": "ingest_skipped", "result": res})
+            await _broadcast({
+                "type": "tree_done",
+                "root": str(inbox_root),
+                "added": added,
+                "skipped": skipped,
+                "counts": _counts(),
+            })
+
+        asyncio.create_task(_run_tree())
+        return {"queued": str(inbox_root), "kind": "directory", "file_count": len(files)}
+
+    # -------- Single file path ---------------------------------------------
+    if not src_path.is_file():
+        raise HTTPException(status_code=400, detail=f"unsupported path type: {src_path}")
+
     try:
         src_path.relative_to(State.inbox)
         dest = src_path
     except ValueError:
-        dest = State.inbox / src_path.name
-        if dest.exists() and dest.resolve() != src_path:
-            # Dedupe by extension + stem + counter.
-            stem, suf = dest.stem, dest.suffix
-            i = 1
-            while True:
-                candidate = State.inbox / f"{stem} ({i}){suf}"
-                if not candidate.exists():
-                    dest = candidate
-                    break
-                i += 1
+        dest = _resolve_file_dest(src_path)
         if body.move:
             shutil.move(str(src_path), str(dest))
         else:
@@ -418,9 +564,8 @@ async def ingest_endpoint(body: IngestBody) -> Dict[str, Any]:
         )
         return res
 
-    # Fire-and-forget so the HTTP caller can move on; the UI watches /events.
     asyncio.create_task(_run_ingest())
-    return {"queued": str(dest)}
+    return {"queued": str(dest), "kind": "file"}
 
 
 @app.post("/connect/claude-desktop")

@@ -16,6 +16,32 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use tauri::{Manager, WindowEvent};
 
+// Folders that are almost never what the user meant to index. Skipped while
+// walking dropped directories. Keep small and conservative -- the Python
+// parser registry already drops unsupported extensions.
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "env",
+    "node_modules",
+    "target",
+    "build",
+    "dist",
+    "__pycache__",
+    ".svelte-kit",
+    ".next",
+    ".nuxt",
+    ".cache",
+    ".DS_Store",
+];
+
+fn should_skip_dir(name: &str) -> bool {
+    SKIP_DIRS.iter().any(|s| *s == name)
+}
+
 struct AppState {
     sidecar: Mutex<Option<Child>>,
     data_dir: PathBuf,
@@ -96,6 +122,108 @@ fn app_config(state: tauri::State<AppState>) -> serde_json::Value {
     })
 }
 
+/// Resolve a non-clashing destination for a single file landing at the top
+/// of the inbox (dedupe by `stem (N).ext`).
+fn unique_file_dest(inbox: &Path, src: &Path) -> PathBuf {
+    let name = src
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| "unnamed".into());
+    let mut dest = inbox.join(&name);
+    if !dest.exists() {
+        return dest;
+    }
+    let stem = src
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into());
+    let ext = src
+        .extension()
+        .map(|s| format!(".{}", s.to_string_lossy()))
+        .unwrap_or_default();
+    let mut n = 1;
+    loop {
+        let candidate = inbox.join(format!("{stem} ({n}){ext}"));
+        if !candidate.exists() {
+            dest = candidate;
+            return dest;
+        }
+        n += 1;
+    }
+}
+
+/// Resolve a non-clashing destination for a dropped *directory* tree (dedupe
+/// by `dirname (N)`). We namespace every nested file under this root so two
+/// folders of the same name can coexist in the inbox.
+fn unique_dir_dest(inbox: &Path, src: &Path) -> PathBuf {
+    let name = src
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "folder".into());
+    let mut dest = inbox.join(&name);
+    if !dest.exists() {
+        return dest;
+    }
+    let mut n = 1;
+    loop {
+        let candidate = inbox.join(format!("{name} ({n})"));
+        if !candidate.exists() {
+            dest = candidate;
+            return dest;
+        }
+        n += 1;
+    }
+}
+
+/// Walk `src_dir` and copy every regular file into `dest_root`, preserving
+/// relative structure. Known build/cache folders (see `SKIP_DIRS`) are pruned.
+fn copy_tree(src_dir: &Path, dest_root: &Path, out: &mut Vec<String>) -> Result<(), String> {
+    fs::create_dir_all(dest_root).map_err(|e| e.to_string())?;
+    let mut stack: Vec<(PathBuf, PathBuf)> = vec![(src_dir.to_path_buf(), dest_root.to_path_buf())];
+    while let Some((src, dest)) = stack.pop() {
+        let entries = match fs::read_dir(&src) {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("[minion] read_dir {src:?}: {err}");
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy().into_owned();
+            // Dotfiles/dotdirs are almost always noise (.git, .DS_Store, editor
+            // config, lockfiles). Users who want them can `minion add` explicitly.
+            if name_str.starts_with('.') {
+                continue;
+            }
+            let src_path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                if should_skip_dir(&name_str) {
+                    continue;
+                }
+                let next_dest = dest.join(&name_str);
+                if let Err(e) = fs::create_dir_all(&next_dest) {
+                    eprintln!("[minion] mkdir {next_dest:?}: {e}");
+                    continue;
+                }
+                stack.push((src_path, next_dest));
+            } else if file_type.is_file() {
+                let dest_file = dest.join(&name_str);
+                match fs::copy(&src_path, &dest_file) {
+                    Ok(_) => out.push(dest_file.to_string_lossy().into_owned()),
+                    Err(e) => eprintln!("[minion] copy {src_path:?} -> {dest_file:?}: {e}"),
+                }
+            }
+            // Skip symlinks / sockets / etc.
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn copy_into_inbox(state: tauri::State<AppState>, paths: Vec<String>) -> Result<Vec<String>, String> {
     let inbox = &state.inbox;
@@ -104,36 +232,17 @@ fn copy_into_inbox(state: tauri::State<AppState>, paths: Vec<String>) -> Result<
     let mut moved = Vec::new();
     for src in paths {
         let src_path = PathBuf::from(&src);
-        if !src_path.exists() || !src_path.is_file() {
+        if !src_path.exists() {
             continue;
         }
-        let mut dest = inbox.join(
-            src_path
-                .file_name()
-                .map(|s| s.to_os_string())
-                .unwrap_or_else(|| "unnamed".into()),
-        );
-        if dest.exists() {
-            let stem = src_path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "file".into());
-            let ext = src_path
-                .extension()
-                .map(|s| format!(".{}", s.to_string_lossy()))
-                .unwrap_or_default();
-            let mut n = 1;
-            loop {
-                let candidate = inbox.join(format!("{stem} ({n}){ext}"));
-                if !candidate.exists() {
-                    dest = candidate;
-                    break;
-                }
-                n += 1;
-            }
+        if src_path.is_dir() {
+            let dest_root = unique_dir_dest(inbox, &src_path);
+            copy_tree(&src_path, &dest_root, &mut moved)?;
+        } else if src_path.is_file() {
+            let dest = unique_file_dest(inbox, &src_path);
+            fs::copy(&src_path, &dest).map_err(|e| e.to_string())?;
+            moved.push(dest.to_string_lossy().into_owned());
         }
-        fs::copy(&src_path, &dest).map_err(|e| e.to_string())?;
-        moved.push(dest.to_string_lossy().into_owned());
     }
     Ok(moved)
 }

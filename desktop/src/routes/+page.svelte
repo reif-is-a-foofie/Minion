@@ -118,6 +118,12 @@
     await handleDropped(arr);
   }
 
+  async function browseForFolder() {
+    const picked = await openDialog({ multiple: false, directory: true });
+    if (!picked) return;
+    await handleDropped([picked as string]);
+  }
+
   async function removeSource(src: Source) {
     if (!confirm(`Forget "${src.path}"?\n(This removes it from Minion; your original file is untouched.)`)) return;
     await deleteSource({ source_id: src.source_id });
@@ -145,6 +151,9 @@
           const r = msg.result as { path?: string; reason?: string };
           if (r.path) pushFeed(r.path, `skipped (${r.reason ?? ""})`);
         } else if (msg.type === "source_removed") {
+          await refreshSources();
+        } else if (msg.type === "tree_done") {
+          pushFeed(msg.root, `folder done (+${msg.added}, skipped ${msg.skipped})`);
           await refreshSources();
         }
       });
@@ -207,15 +216,18 @@
   <section class="drop" class:active={dragging} role="button" tabindex="0" onclick={browseForFiles} onkeydown={(e) => e.key === "Enter" && browseForFiles()}>
     <div class="drop-inner">
       <div class="drop-icon">↓</div>
-      <div class="drop-title">Drop files anywhere</div>
+      <div class="drop-title">Drop files or folders</div>
       <div class="drop-sub">
         {#if config}
-          They land in <code>{config.inbox}</code>
+          They land in <code>{config.inbox}</code> — folders recurse; <code>node_modules</code>, <code>.git</code> etc. are skipped.
         {:else}
-          Notes, PDFs, images, audio, code — any agent you connect can read them.
+          Notes, PDFs, images, audio, code, whole repos — any agent you connect can read them.
         {/if}
       </div>
-      <button class="ghost" onclick={(e) => { e.stopPropagation(); browseForFiles(); }}>or browse…</button>
+      <div class="drop-actions">
+        <button class="ghost" onclick={(e) => { e.stopPropagation(); browseForFiles(); }}>browse files…</button>
+        <button class="ghost" onclick={(e) => { e.stopPropagation(); browseForFolder(); }}>browse folder…</button>
+      </div>
     </div>
   </section>
 
@@ -424,6 +436,11 @@
     padding: 1px 6px;
     border-radius: 4px;
     font-size: 12px;
+  }
+  .drop-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: center;
   }
 
   .search {
