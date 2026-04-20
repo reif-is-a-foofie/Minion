@@ -1,0 +1,5 @@
+# Everything. Heaviest install: pulls in whisper + tree-sitter grammar wheels.
+-r requirements-docs.txt
+-r requirements-images.txt
+-r requirements-audio.txt
+-r requirements-code.txt

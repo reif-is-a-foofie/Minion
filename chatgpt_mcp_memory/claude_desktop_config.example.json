@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "chatgpt-memory-local": {
+    "minion": {
       "command": "/Users/YOUR_USER/path/to/chatgpt_mcp_memory/.venv/bin/python",
       "args": [
         "/Users/YOUR_USER/path/to/chatgpt_mcp_memory/src/mcp_server.py"

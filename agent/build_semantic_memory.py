@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from typing import Optional
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 
 
 DEFAULT_EXPORT_DIR = "/Users/reify/Classified/minion/d9eced211a2a0b9cd1b2d52f595ee063aea7ff88cddbcaad683ae4aa25df7992-2026-03-21-20-25-15-b54da2dcfb0a4295aae2c768c88d320c"
@@ -245,15 +245,13 @@ def main():
     os.makedirs(AGENT_DIR, exist_ok=True)
     chunks, export_dir = build_chunks()
 
-    model = SentenceTransformer(MODEL_NAME)
+    model = TextEmbedding(model_name=MODEL_NAME)
     texts = [chunk.text for chunk in chunks]
-    embeddings = model.encode(
-        texts,
-        batch_size=64,
-        show_progress_bar=True,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    )
+    vecs = list(model.embed(texts, batch_size=64))
+    embeddings = np.asarray(vecs, dtype=np.float32)
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    embeddings = embeddings / norms
 
     with open(CHUNKS_PATH, "w") as fh:
         for chunk in chunks:

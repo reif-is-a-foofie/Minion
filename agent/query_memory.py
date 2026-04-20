@@ -4,7 +4,7 @@ import os
 import sys
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 
 
 AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,15 +28,14 @@ def load_chunks():
 
 def search(query, top_k=8, role=None):
     manifest = load_manifest()
-    model = SentenceTransformer(manifest["model_name"])
+    model = TextEmbedding(model_name=manifest["model_name"])
     chunks = load_chunks()
     embeddings = np.load(EMBEDDINGS_PATH)
 
-    query_embedding = model.encode(
-        [query],
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    )[0]
+    query_embedding = np.asarray(next(iter(model.embed([query]))), dtype=np.float32)
+    norm = float(np.linalg.norm(query_embedding))
+    if norm > 0:
+        query_embedding = query_embedding / norm
 
     scores = embeddings @ query_embedding
     ranked = np.argsort(-scores)

@@ -160,8 +160,12 @@ def main() -> None:
     with open(manifest_path, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
 
-    print(str(export_root))
-    print(str(manifest_path))
+    # Sentinel-delimited result block. bin/minion parses between these markers
+    # so we never mistake a late-flushed progress line for a path.
+    print("===INGEST_RESULT_BEGIN===", flush=True)
+    print(str(export_root), flush=True)
+    print(str(manifest_path), flush=True)
+    print("===INGEST_RESULT_END===", flush=True)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,4 @@
+# Optional: tree-sitter for function/class-level chunking of source code.
+-r requirements.txt
+tree-sitter>=0.22
+tree-sitter-language-pack>=0.3

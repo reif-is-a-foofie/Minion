@@ -31,7 +31,7 @@ def install_claude_desktop_mcp(
     *,
     workspace_dir: Path,
     derived_dir: Path,
-    server_name: str = "chatgpt-memory-local",
+    server_name: str = "minion",
     config_path: Optional[Path] = None,
 ) -> Tuple[Path, Optional[Path]]:
     """
@@ -41,10 +41,14 @@ def install_claude_desktop_mcp(
     """
     vpy = _ensure_python_env(workspace_dir)
     mcp_script = _src("mcp_server.py")
+    # IMPORTANT: do NOT call vpy.resolve(). The venv's bin/python is a symlink
+    # to the system interpreter; resolving it dereferences the symlink and
+    # Python then loads the system site-packages instead of the venv's,
+    # breaking imports (numpy, fastembed, etc.). Keep the venv path verbatim.
     entry: Dict[str, Any] = {
-        "command": str(vpy.resolve()),
+        "command": str(vpy),
         "args": [str(mcp_script.resolve())],
-        "env": {"CHATGPT_MCP_DATA_DIR": str(derived_dir.resolve())},
+        "env": {"MINION_DATA_DIR": str(derived_dir.resolve())},
     }
     path = config_path or _default_claude_desktop_config_path()
     path = path.expanduser().resolve()
@@ -308,7 +312,6 @@ def _ensure_python_env(workspace_dir: Path) -> Path:
         if uv:
             _run_explain([uv, "python", "install", "3.11"])
             _run_explain([uv, "venv", "--python", "3.11", str(workspace_dir / ".venv")])
-            _run_explain([uv, "pip", "install", "-r", str(req)])
         else:
             py = _python_for_venv()
             _run_explain([py, "-m", "venv", str(workspace_dir / ".venv")])
@@ -316,8 +319,13 @@ def _ensure_python_env(workspace_dir: Path) -> Path:
         if not vpy.exists():
             raise SystemExit("Failed to create a Python virtualenv under .venv — see errors above.")
 
-    _run_explain([str(vpy), "-m", "pip", "install", "--upgrade", "pip"])
-    _run_explain([str(vpy), "-m", "pip", "install", "-r", str(req)])
+    # uv-created venvs intentionally ship without `pip`, so route installs through
+    # `uv pip` whenever uv is on PATH — works for both uv- and stdlib-created venvs.
+    if uv:
+        _run_explain([uv, "pip", "install", "--python", str(vpy), "-r", str(req)])
+    else:
+        _run_explain([str(vpy), "-m", "pip", "install", "--upgrade", "pip"])
+        _run_explain([str(vpy), "-m", "pip", "install", "-r", str(req)])
     stamp.parent.mkdir(parents=True, exist_ok=True)
     stamp.write_text(fp, encoding="utf-8")
     return vpy
@@ -375,16 +383,31 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+_INGEST_BEGIN = "===INGEST_RESULT_BEGIN==="
+_INGEST_END = "===INGEST_RESULT_END==="
+
+
 def _parse_ingest_output(out: str) -> Tuple[str, str]:
-    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
-    if len(lines) < 2:
+    lines = [ln.rstrip("\n") for ln in out.splitlines()]
+    stripped = [ln.strip() for ln in lines]
+
+    # Preferred: sentinel-delimited result block (robust to stray progress lines).
+    if _INGEST_BEGIN in stripped and _INGEST_END in stripped:
+        i = stripped.index(_INGEST_BEGIN)
+        j = stripped.index(_INGEST_END, i + 1)
+        block = [ln for ln in stripped[i + 1 : j] if ln]
+        if len(block) >= 2 and Path(block[0]).exists():
+            return block[0], block[1]
+
+    # Fallback for older ingest scripts: last two non-empty lines.
+    non_empty = [ln for ln in stripped if ln]
+    if len(non_empty) < 2:
         raise RuntimeError(f"Unexpected ingest output:\n{out}")
-    # ingest_chatgpt_export.py prints unzip progress first; export_root + manifest are always last.
-    export_root, manifest_path = lines[-2], lines[-1]
+    export_root, manifest_path = non_empty[-2], non_empty[-1]
     if not Path(export_root).exists():
         raise RuntimeError(
             "Could not parse ingest paths (last lines were not export paths). Tail of output:\n"
-            + "\n".join(lines[-12:])
+            + "\n".join(non_empty[-12:])
         )
     return export_root, manifest_path
 
@@ -440,6 +463,8 @@ def _try_setup_shortcut(argv: List[str]) -> Optional[int]:
     reserved = {
         "doctor",
         "setup",
+        "quickstart",
+        "eval",
         "mcp",
         "mcp-config",
         "ask_minion",
@@ -632,6 +657,16 @@ def cmd_setup(args: argparse.Namespace) -> int:
         shutil.copy2(retrieval_policy_src, retrieval_policy_run)
         shutil.copy2(retrieval_policy_src, retrieval_policy_derived)
 
+    # Deterministic brief for the MCP server to auto-attach on first tool call.
+    # The server prefers richer core_profile.md / identity_profile.md when present,
+    # so this is strictly a fallback; generating it is still cheap and useful for eval.
+    try:
+        _run_tee(
+            _python_u(vpy, _src("build_brief.py"), ["--derived-dir", str(derived_dir)])
+        )
+    except Exception as e:
+        print(f"   Warning: brief.md not generated: {e}")
+
     if plain:
         print("Step 5/5 — Connecting memory search to Claude Desktop…")
     else:
@@ -640,7 +675,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         cfg_written, cfg_backup = install_claude_desktop_mcp(
             workspace_dir=workspace_dir,
             derived_dir=derived_dir,
-            server_name="chatgpt-memory-local",
+            server_name="minion",
             config_path=None,
         )
         if plain:
@@ -666,7 +701,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print("What you do next (in Claude) — two different things:")
         print("")
         print("  A) Tools wired (already done): step 5 wrote the Minion MCP into Claude Desktop’s")
-        print("     config file so Claude can *see* search_memory / get_chunk. Quit and reopen")
+        print("     config file so Claude can *see* ask_minion / get_chunk. Quit and reopen")
         print("     Claude Desktop so that takes effect.")
         print("")
         print("  B) Paste into Claude — profile only (required):")
@@ -717,23 +752,166 @@ def cmd_setup(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_quickstart(args: argparse.Namespace) -> int:
+    """
+    v1 minimal pipeline: zip -> embed -> MCP in Claude. Skips persona / Ollama.
+    """
+    export_path = Path(_resolve_setup_export(args)).expanduser().resolve()
+    if not export_path.exists():
+        raise SystemExit(f"Missing export path: {export_path}")
+    if not _is_valid_export_path(export_path):
+        raise SystemExit(f"Not a ChatGPT export (.zip or folder): {export_path}")
+
+    ws_arg = getattr(args, "workspace", None)
+    workspace_dir = (
+        Path(ws_arg).expanduser().resolve() if ws_arg else _workspace_beside_export(export_path)
+    )
+    _ensure_dir(workspace_dir)
+
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = workspace_dir / "runs" / stamp
+    raw_out_dir = run_dir / "raw"
+    derived_dir = run_dir / "derived"
+    _ensure_dir(raw_out_dir)
+    _ensure_dir(derived_dir)
+
+    vpy = _ensure_python_env(workspace_dir)
+
+    print(f"Workspace: {workspace_dir}")
+    print(f"Run dir:   {run_dir}")
+    print("")
+
+    print("1/3 Ingesting export…")
+    ingest_out = _run_tee(
+        _python_u(vpy, _src("ingest_chatgpt_export.py"), [str(export_path), "--out", str(raw_out_dir)])
+    )
+    export_root, manifest_path = _parse_ingest_output(ingest_out)
+    export_root_path = Path(export_root).expanduser().resolve()
+    print(f"   export_root: {export_root_path}")
+    print(f"   manifest:    {manifest_path}")
+    print("")
+
+    print("2/3 Building semantic index (fastembed)…")
+    build_args = [
+        "--export",
+        str(export_root_path),
+        "--derived-dir",
+        str(derived_dir),
+    ]
+    if getattr(args, "include_assistant", False):
+        build_args.append("--include-assistant")
+    _run_tee(_python_u(vpy, _src("build_index.py"), build_args))
+    print(f"   derived_dir: {derived_dir}")
+    print("")
+
+    retrieval_policy_src = _chatgpt_mcp_dir() / "retrieval_policy.md"
+    if retrieval_policy_src.exists():
+        shutil.copy2(retrieval_policy_src, run_dir / "retrieval_policy.md")
+        shutil.copy2(retrieval_policy_src, derived_dir / "retrieval_policy.md")
+
+    # Deterministic brief (preferences, names, frameworks) auto-attached by the
+    # MCP server on the first tool call of each Claude session. Non-fatal: a missing
+    # brief just skips injection, it does not block wiring up the MCP server.
+    try:
+        _run_tee(
+            _python_u(vpy, _src("build_brief.py"), ["--derived-dir", str(derived_dir)])
+        )
+    except Exception as e:
+        print(f"   Warning: brief.md not generated: {e}")
+
+    print("3/3 Installing MCP into Claude Desktop config…")
+    try:
+        cfg_written, cfg_backup = install_claude_desktop_mcp(
+            workspace_dir=workspace_dir,
+            derived_dir=derived_dir,
+            server_name="minion",
+            config_path=None,
+        )
+        print(f"   {cfg_written}")
+        if cfg_backup is not None:
+            print(f"   backup: {cfg_backup}")
+    except Exception as e:
+        print(f"   Warning: {e}")
+        print(f'   Run:  minion mcp-config --derived-dir "{derived_dir}"')
+    print("")
+
+    print("Done. Next:")
+    print("  - Restart Claude Desktop so it picks up the MCP server.")
+    print(f'  - Sanity-check: minion eval --derived-dir "{derived_dir}"')
+    return 0
+
+
+def cmd_build_brief(args: argparse.Namespace) -> int:
+    """Regenerate <derived>/brief.md from chunks.jsonl (deterministic, no Ollama)."""
+    derived_dir = Path(args.derived_dir).expanduser().resolve()
+    if not derived_dir.exists():
+        raise SystemExit(f"Missing derived dir: {derived_dir}")
+
+    workspace_dir = (
+        Path(args.workspace).expanduser().resolve() if args.workspace else _default_workspace_dir()
+    )
+    vpy = _ensure_python_env(workspace_dir)
+
+    extra: List[str] = ["--derived-dir", str(derived_dir)]
+    if getattr(args, "max_chars", None):
+        extra.extend(["--max-chars", str(args.max_chars)])
+    _run_tee(_python_u(vpy, _src("build_brief.py"), extra))
+    return 0
+
+
+def cmd_eval(args: argparse.Namespace) -> int:
+    derived_dir = Path(args.derived_dir).expanduser().resolve()
+    if not derived_dir.exists():
+        raise SystemExit(f"Missing derived dir: {derived_dir}")
+
+    workspace_dir = (
+        Path(args.workspace).expanduser().resolve() if args.workspace else _default_workspace_dir()
+    )
+    vpy = _ensure_python_env(workspace_dir)
+
+    runner = _repo_root() / "eval" / "run_eval.py"
+    if not runner.exists():
+        raise SystemExit(f"Missing eval runner: {runner}")
+
+    cmd: List[str] = [str(vpy), "-u", str(runner), "--derived-dir", str(derived_dir)]
+    if args.golden:
+        cmd.extend(["--golden", str(Path(args.golden).expanduser().resolve())])
+    if args.server_py:
+        cmd.extend(["--server-py", str(Path(args.server_py).expanduser().resolve())])
+    if args.top_k is not None:
+        cmd.extend(["--top-k", str(args.top_k)])
+    if args.json:
+        cmd.append("--json")
+
+    env = dict(os.environ)
+    env["MINION_DATA_DIR"] = str(derived_dir)
+    # Drive through _run_tee so users see progress; returncode propagates.
+    try:
+        _run_tee(cmd, env=env)
+    except subprocess.CalledProcessError as e:
+        return int(e.returncode or 1)
+    return 0
+
+
 def cmd_mcp_config(args: argparse.Namespace) -> int:
     """Merge Minion MCP into Claude Desktop's claude_desktop_config.json (default), or --print-only JSON."""
     workspace_dir = Path(args.workspace).expanduser().resolve()
     derived_dir = Path(args.derived_dir).expanduser().resolve()
-    server_name = str(args.server_name or "chatgpt-memory-local")
+    server_name = str(args.server_name or "minion")
     quiet = getattr(args, "quiet", False)
     print_only = getattr(args, "print_only", False)
 
     if print_only:
         vpy = _ensure_python_env(workspace_dir)
         mcp_script = _src("mcp_server.py")
+        # See install_claude_desktop_mcp: never resolve() the venv python, or
+        # Python will load the system site-packages and miss numpy/fastembed.
         payload = {
             "mcpServers": {
                 server_name: {
-                    "command": str(vpy.resolve()),
+                    "command": str(vpy),
                     "args": [str(mcp_script.resolve())],
-                    "env": {"CHATGPT_MCP_DATA_DIR": str(derived_dir)},
+                    "env": {"MINION_DATA_DIR": str(derived_dir)},
                 }
             }
         }
@@ -776,7 +954,7 @@ def cmd_mcp(args: argparse.Namespace) -> int:
     vpy = _ensure_python_env(workspace_dir)
 
     env = dict(os.environ)
-    env["CHATGPT_MCP_DATA_DIR"] = str(derived_dir)
+    env["MINION_DATA_DIR"] = str(derived_dir)
     # Run MCP server over stdio; Claude Desktop starts this process.
     os.execve(
         str(vpy),
@@ -784,6 +962,143 @@ def cmd_mcp(args: argparse.Namespace) -> int:
         env,
     )
     return 0
+
+
+def _derived_dir_default() -> Path:
+    """Best-effort default derived dir when one isn't supplied on the CLI."""
+    env = os.environ.get("MINION_DATA_DIR")
+    if env:
+        return Path(env).expanduser().resolve()
+    ws = _default_workspace_dir()
+    cand = ws / "data" / "derived"
+    if cand.exists():
+        return cand
+    return _chatgpt_mcp_dir() / "data" / "derived"
+
+
+def _run_in_venv(script: str, extra_args: List[str], *, workspace: Optional[Path] = None) -> int:
+    """Invoke a src/*.py script inside the project venv so imports (sqlite_vec, etc.) work."""
+    workspace_dir = (workspace or _default_workspace_dir()).expanduser().resolve()
+    vpy = _ensure_python_env(workspace_dir)
+    cmd = [str(vpy), str(_src(script))] + extra_args
+    result = subprocess.run(cmd)
+    return int(result.returncode)
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    derived = Path(args.derived_dir or _derived_dir_default()).expanduser().resolve()
+    derived.mkdir(parents=True, exist_ok=True)
+    extra: List[str] = ["--data-dir", str(derived)]
+    if args.inbox:
+        extra.extend(["--inbox", str(Path(args.inbox).expanduser().resolve())])
+    if args.once:
+        extra.append("--once")
+    if args.force:
+        extra.append("--force")
+    if not args.quiet:
+        extra.append("--verbose")
+    return _run_in_venv("watcher.py", extra, workspace=Path(args.workspace) if args.workspace else None)
+
+
+def _cli_add(derived: Path, paths: List[Path], *, force: bool, workspace: Optional[Path]) -> int:
+    """Explicit ingest: parse+embed+upsert each path into the DB."""
+    script = """
+import json, sys
+from pathlib import Path
+from store import DB_FILENAME, connect
+from ingest import ingest_file
+
+data_dir = Path(sys.argv[1])
+force = sys.argv[2] == '1'
+paths = [Path(p) for p in sys.argv[3:]]
+conn = connect(data_dir / DB_FILENAME)
+for p in paths:
+    res = ingest_file(conn, p, force=force)
+    print(json.dumps({
+        'path': res.path, 'source_id': res.source_id, 'kind': res.kind,
+        'parser': res.parser, 'chunks': res.chunk_count,
+        'skipped': res.skipped, 'reason': res.reason,
+    }, ensure_ascii=False))
+"""
+    workspace_dir = (workspace or _default_workspace_dir()).expanduser().resolve()
+    vpy = _ensure_python_env(workspace_dir)
+    cmd = [str(vpy), "-c", script, str(derived), "1" if force else "0", *[str(p) for p in paths]]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(_src("x").parent) + os.pathsep + env.get("PYTHONPATH", "")
+    result = subprocess.run(cmd, env=env)
+    return int(result.returncode)
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    derived = Path(args.derived_dir or _derived_dir_default()).expanduser().resolve()
+    derived.mkdir(parents=True, exist_ok=True)
+    paths = [Path(p).expanduser().resolve() for p in args.paths]
+    missing = [p for p in paths if not p.exists()]
+    if missing:
+        print("Missing paths: " + ", ".join(str(m) for m in missing), file=sys.stderr)
+        return 2
+    return _cli_add(derived, paths, force=args.force, workspace=Path(args.workspace) if args.workspace else None)
+
+
+def cmd_rm(args: argparse.Namespace) -> int:
+    derived = Path(args.derived_dir or _derived_dir_default()).expanduser().resolve()
+    script = """
+import sys
+from pathlib import Path
+from store import DB_FILENAME, connect, delete_source, delete_source_by_path
+
+data_dir = Path(sys.argv[1])
+conn = connect(data_dir / DB_FILENAME)
+total = 0
+for target in sys.argv[2:]:
+    if target.startswith('src-'):
+        n = delete_source(conn, target)
+    else:
+        n = delete_source_by_path(conn, str(Path(target).expanduser().resolve()))
+    print(f'{target}: removed {n} chunks')
+    total += n
+print(f'total removed chunks: {total}')
+"""
+    workspace_dir = (Path(args.workspace) if args.workspace else _default_workspace_dir()).expanduser().resolve()
+    vpy = _ensure_python_env(workspace_dir)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(_src("x").parent) + os.pathsep + env.get("PYTHONPATH", "")
+    cmd = [str(vpy), "-c", script, str(derived), *args.targets]
+    result = subprocess.run(cmd, env=env)
+    return int(result.returncode)
+
+
+def cmd_ls(args: argparse.Namespace) -> int:
+    derived = Path(args.derived_dir or _derived_dir_default()).expanduser().resolve()
+    script = """
+import json, sys, time
+from pathlib import Path
+from store import DB_FILENAME, connect, list_sources, count_chunks, count_sources
+
+data_dir = Path(sys.argv[1])
+kind = sys.argv[2] or None
+path_glob = sys.argv[3] or None
+as_json = sys.argv[4] == '1'
+conn = connect(data_dir / DB_FILENAME)
+rows = list_sources(conn, kind=kind, path_glob=path_glob, limit=1000)
+if as_json:
+    print(json.dumps({'sources': rows, 'total_chunks': count_chunks(conn)}, indent=2, ensure_ascii=False))
+else:
+    print(f"{count_sources(conn)} sources, {count_chunks(conn)} chunks")
+    for r in rows:
+        ts = time.strftime('%Y-%m-%d', time.localtime(r['mtime'])) if r.get('mtime') else '-'
+        print(f"  [{r['kind']:>14}] {r['chunk_count']:>5}c {ts}  {r['path']}")
+"""
+    workspace_dir = (Path(args.workspace) if args.workspace else _default_workspace_dir()).expanduser().resolve()
+    vpy = _ensure_python_env(workspace_dir)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(_src("x").parent) + os.pathsep + env.get("PYTHONPATH", "")
+    cmd = [
+        str(vpy), "-c", script, str(derived),
+        args.kind or "", args.path_glob or "", "1" if args.json else "0",
+    ]
+    result = subprocess.run(cmd, env=env)
+    return int(result.returncode)
 
 
 def cmd_ask_minion(args: argparse.Namespace) -> int:
@@ -885,6 +1200,91 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p_setup.set_defaults(func=cmd_setup)
 
+    p_quick = sub.add_parser(
+        "quickstart",
+        help="Minimal v1 pipeline: ingest zip -> build semantic index -> install MCP into Claude.",
+        description="Skips persona/Ollama steps. Intended for the fastest path to a working MCP.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Example:  minion quickstart ~/Downloads/export.zip",
+    )
+    p_quick.add_argument(
+        "--export-zip",
+        "--export",
+        required=False,
+        default=None,
+        dest="export_zip_opt",
+        metavar="PATH",
+        help="ChatGPT export: .zip or unzipped folder (same as the positional argument)",
+    )
+    p_quick.add_argument(
+        "--workspace",
+        default=None,
+        help="Private workspace directory (default: minion_private next to the export)",
+    )
+    p_quick.add_argument(
+        "--include-assistant",
+        action="store_true",
+        help="Index assistant messages too (default: user-only)",
+    )
+    p_quick.add_argument(
+        "export_zip_pos",
+        nargs="?",
+        default=None,
+        metavar="EXPORT",
+        help="ChatGPT export (.zip or folder). You can use this instead of --export-zip.",
+    )
+    p_quick.set_defaults(func=cmd_quickstart)
+
+    p_brief = sub.add_parser(
+        "build-brief",
+        help="Regenerate <derived>/brief.md (deterministic profile the MCP auto-attaches on first tool call).",
+    )
+    p_brief.add_argument(
+        "--derived-dir",
+        required=True,
+        help="Derived dir containing chunks.jsonl.",
+    )
+    p_brief.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace whose .venv provides the Python runtime.",
+    )
+    p_brief.add_argument(
+        "--max-chars",
+        type=int,
+        default=None,
+        help="Hard cap on brief.md size (default 4000; env MINION_BRIEF_MAX_CHARS).",
+    )
+    p_brief.set_defaults(func=cmd_build_brief)
+
+    p_eval = sub.add_parser(
+        "eval",
+        help="Run golden-query test harness against the MCP server over stdio.",
+    )
+    p_eval.add_argument(
+        "--derived-dir",
+        required=True,
+        help="Derived dir (chunks/embeddings/manifest) the MCP will serve.",
+    )
+    p_eval.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace whose .venv runs the MCP (default: home minion_private).",
+    )
+    p_eval.add_argument(
+        "--golden",
+        default=None,
+        help="Path to golden_queries.yaml (default: <repo>/eval/golden_queries.yaml).",
+    )
+    p_eval.add_argument(
+        "--server-py",
+        default=None,
+        help="Override MCP server script path (default: chatgpt_mcp_memory/src/mcp_server.py).",
+    )
+    p_eval.add_argument("--top-k", type=int, default=None, help="Override top_k for all queries.")
+    p_eval.add_argument("--json", action="store_true", help="Emit machine-readable JSON report to stdout.")
+    p_eval.set_defaults(func=cmd_eval)
+
     p_mcpcfg = sub.add_parser(
         "mcp-config",
         help="Merge Minion into Claude Desktop claude_desktop_config.json (default). Use --print-only for JSON only.",
@@ -892,13 +1292,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_mcpcfg.add_argument(
         "--derived-dir",
         required=True,
-        help="Directory with chunks.jsonl / embeddings (same as CHATGPT_MCP_DATA_DIR)",
+        help="Directory with chunks.jsonl / embeddings (same as MINION_DATA_DIR)",
     )
     p_mcpcfg.add_argument("--workspace", default=str(_default_workspace_dir()), help="Workspace whose .venv runs the MCP")
     p_mcpcfg.add_argument(
         "--server-name",
-        default="chatgpt-memory-local",
-        help="Key name under mcpServers (default: chatgpt-memory-local)",
+        default="minion",
+        help="Key name under mcpServers (default: minion)",
     )
     p_mcpcfg.add_argument(
         "--config-path",
@@ -939,6 +1339,48 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_ask.add_argument("--save-extractions", default=None, help="JSONL path for per-conversation extractions")
     p_ask.add_argument("--max-window-chars", type=int, default=14000)
     p_ask.set_defaults(func=cmd_ask_minion)
+
+    p_watch = sub.add_parser(
+        "watch",
+        help="Watch <data_dir>/../inbox and auto-ingest dropped files (docs, pdfs, images, audio, code).",
+    )
+    p_watch.add_argument("--derived-dir", default=None, help="Directory holding memory.db (default: $MINION_DATA_DIR or minion_private/data/derived)")
+    p_watch.add_argument("--inbox", default=None, help="Inbox directory (default: <derived>/../inbox)")
+    p_watch.add_argument("--once", action="store_true", help="Reconcile and exit")
+    p_watch.add_argument("--force", action="store_true", help="Re-ingest unchanged files")
+    p_watch.add_argument("--quiet", action="store_true", help="Suppress per-file INFO logs")
+    p_watch.add_argument("--workspace", default=None, help="Workspace whose .venv runs the watcher")
+    p_watch.set_defaults(func=cmd_watch)
+
+    p_add = sub.add_parser(
+        "add",
+        help="Ingest one or more files directly into memory.db (bypasses the inbox).",
+    )
+    p_add.add_argument("paths", nargs="+", help="Files to ingest")
+    p_add.add_argument("--derived-dir", default=None, help="Directory holding memory.db")
+    p_add.add_argument("--force", action="store_true", help="Re-ingest even if the sha256 matches")
+    p_add.add_argument("--workspace", default=None, help="Workspace whose .venv runs ingest")
+    p_add.set_defaults(func=cmd_add)
+
+    p_rm = sub.add_parser(
+        "rm",
+        help="Remove sources from memory.db by path or source_id.",
+    )
+    p_rm.add_argument("targets", nargs="+", help="Paths or source_ids (src-*) to remove")
+    p_rm.add_argument("--derived-dir", default=None, help="Directory holding memory.db")
+    p_rm.add_argument("--workspace", default=None, help="Workspace whose .venv runs delete")
+    p_rm.set_defaults(func=cmd_rm)
+
+    p_ls = sub.add_parser(
+        "ls",
+        help="List indexed sources grouped by kind.",
+    )
+    p_ls.add_argument("--derived-dir", default=None, help="Directory holding memory.db")
+    p_ls.add_argument("--kind", default=None, help="Filter by kind (text/pdf/image/audio/code/...)")
+    p_ls.add_argument("--path-glob", default=None, help="SQL GLOB over path")
+    p_ls.add_argument("--json", action="store_true", help="JSON output")
+    p_ls.add_argument("--workspace", default=None, help="Workspace whose .venv runs query")
+    p_ls.set_defaults(func=cmd_ls)
 
     args = parser.parse_args(argv)
     return int(args.func(args))

@@ -1,5 +1,10 @@
+# Core: storage + embeddings + MCP. Required for every install.
 numpy>=1.26.0,<2.0.0
-# Intel macOS PyPI tops out around torch 2.2.x; sentence-transformers 3.x expects newer torch.
-torch>=2.2.0,<2.3
-sentence-transformers>=2.7.0,<3.0.0
+# fastembed bundles ONNX models + onnxruntime; avoids torch/transformers entirely.
+fastembed>=0.4,<0.8
+tqdm>=4.66
 ollama>=0.3.3
+# SQLite-vec gives us vector KNN without a separate service.
+sqlite-vec>=0.1.6
+# Watchdog powers the inbox auto-ingester.
+watchdog>=4.0

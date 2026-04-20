@@ -1,0 +1,74 @@
+# Minion MCP golden-query harness.
+#
+# Each case is:
+#   query:          the search_memory query string
+#   expect_any_of:  a list of matchers; a case PASSES if >= 1 matcher hits a returned chunk.
+#                   Each matcher is one of:
+#                     - substring: "text"            # case-insensitive substring of chunk.text
+#                     - conversation_id: "uuid..."   # exact match on chunk.conversation_id
+#                     - chunk_id: "chunk-000123"     # exact match on chunk.chunk_id
+#                     - title: "substring"           # case-insensitive substring of conversation_title
+#   top_k:          optional override (default 8)
+#   role:           optional "user" | "assistant" (default: no filter)
+#
+# Tune these to your own export. The defaults below are generic placeholders you
+# should replace with queries whose "expected" answers you actually know.
+#
+# Tip: run `minion eval --derived-dir <path> --json` to see what the MCP returned
+# for each query, then harden expectations from there.
+
+cases:
+  - query: "what is my preferred programming language"
+    expect_any_of:
+      - substring: "python"
+    top_k: 8
+
+  - query: "projects I have worked on"
+    expect_any_of:
+      - substring: "project"
+    top_k: 8
+
+  - query: "where do I live"
+    expect_any_of:
+      - substring: "live"
+    top_k: 8
+
+  - query: "my work or job"
+    expect_any_of:
+      - substring: "work"
+    top_k: 8
+
+  - query: "what tools do I use daily"
+    expect_any_of:
+      - substring: "use"
+    top_k: 8
+
+  - query: "health or fitness routines"
+    expect_any_of:
+      - substring: "workout"
+      - substring: "exercise"
+      - substring: "gym"
+    top_k: 8
+
+  - query: "what I am learning"
+    expect_any_of:
+      - substring: "learn"
+    top_k: 8
+
+  - query: "personal goals"
+    expect_any_of:
+      - substring: "goal"
+    top_k: 8
+
+  - query: "recent plans or decisions"
+    expect_any_of:
+      - substring: "plan"
+      - substring: "decid"
+    top_k: 8
+
+  - query: "travel or trips"
+    expect_any_of:
+      - substring: "trip"
+      - substring: "travel"
+      - substring: "flight"
+    top_k: 8

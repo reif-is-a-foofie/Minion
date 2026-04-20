@@ -1,11 +1,25 @@
-# ChatGPT Export → Claude Desktop MCP (Local)
+# Minion: Local-First Memory MCP for Claude Desktop
 
-This turns a freshly-downloaded ChatGPT export **ZIP** into:
+Minion turns a folder on disk into Claude's long-term memory. Drop a file into
+`data/inbox/`—PDF, image, audio, code, ChatGPT export, plain text—and Minion
+parses, embeds, and exposes it to Claude via MCP. Nothing leaves the machine.
 
-- a few **pasteable persona** files (`core_profile.md`, `retrieval_policy.md`)
-- an **on-demand semantic memory** MCP server (Claude Desktop calls tools like `search_memory`)
+What's indexable today:
 
-Nothing is uploaded. The index lives on local disk.
+| Kind | Extensions | Parser |
+| ---- | ---------- | ------ |
+| Text / Markdown / structured | `.md .txt .rst .org .csv .json .yaml .toml .ini .log` | stdlib |
+| HTML | `.html .htm` | `trafilatura` (boilerplate-stripped) |
+| PDF | `.pdf` | `pypdf` with `pdfminer.six` fallback |
+| DOCX | `.docx` | `python-docx` |
+| Image | `.png .jpg .webp .bmp .tif …` | `rapidocr-onnxruntime` OCR (+ optional Ollama `llava` caption) |
+| Audio / video | `.mp3 .wav .m4a .mp4 .webm …` | `faster-whisper` (`tiny.en` default) |
+| Source code | `.py .js .ts .go .rs .java .c .cpp .rb .php …` | `tree-sitter-language-pack` (function/class chunks) |
+| ChatGPT export | `.zip` or unzipped folder | built-in (same as legacy `build_index.py`) |
+
+The storage layer is a single SQLite file (`memory.db`) using
+[`sqlite-vec`](https://github.com/asg017/sqlite-vec) for vector KNN. Adding,
+updating, and deleting sources are atomic—no full rebuild required.
 
 ## 0) Prereqs (Intel macOS)
 
@@ -28,6 +42,17 @@ Restart your terminal so `uv` is on PATH.
 
 ## 1) Install dependencies
 
+Requirements are split so you only pull in what you need:
+
+| File | What it adds |
+| ---- | ------------ |
+| `requirements.txt` | core: numpy, fastembed, sqlite-vec, watchdog, ollama, tqdm |
+| `requirements-docs.txt` | +PDF / DOCX / HTML parsers |
+| `requirements-images.txt` | +image OCR (rapidocr, pure Python) |
+| `requirements-audio.txt` | +faster-whisper transcription |
+| `requirements-code.txt` | +tree-sitter for code-aware chunking |
+| `requirements-all.txt` | everything above |
+
 ### Option A: `uv` (recommended)
 
 From this folder:
@@ -35,21 +60,55 @@ From this folder:
 ```bash
 uv python install 3.11
 uv venv --python 3.11
-uv pip install -r requirements.txt
+uv pip install -r requirements-all.txt   # or just requirements.txt for core only
 ```
 
 ### Option B: classic venv (depends on system Python)
-
-From this folder:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r requirements-all.txt
 ```
 
-## 2) Ingest a ChatGPT export ZIP
+## 2) Drop files into the inbox (recommended)
+
+The fastest path for arbitrary files is the watched inbox. Minion reconciles
+the inbox on MCP startup and then live-watches it.
+
+```bash
+mkdir -p data/inbox
+cp ~/Desktop/meeting-notes.md data/inbox/
+cp ~/Downloads/contract.pdf    data/inbox/
+cp ~/Screenshots/whiteboard.png data/inbox/
+cp ~/Recordings/standup.mp3    data/inbox/
+```
+
+The watcher starts automatically inside `minion mcp`. To run it standalone
+(useful while iterating):
+
+```bash
+source .venv/bin/activate
+python src/watcher.py --data-dir data/derived --verbose
+# or from anywhere:
+minion watch
+```
+
+CRUD without the inbox:
+
+```bash
+minion add  ~/path/to/file.pdf another/file.md   # explicit ingest
+minion ls   --kind pdf                           # list sources
+minion rm   ~/path/to/file.pdf                   # delete (path or src-...)
+minion watch --once                              # one-shot reconcile, exit
+```
+
+Unchanged files (matching sha256) are skipped. Modified files replace their
+prior chunks+embeddings atomically. Deleted files are reaped on the next
+reconcile.
+
+## 3) Ingest a ChatGPT export ZIP (optional, legacy path)
 
 Put the ChatGPT export zip somewhere (example: `~/Downloads/chatgpt-export.zip`), then:
 
@@ -60,7 +119,7 @@ python src/ingest_chatgpt_export.py ~/Downloads/chatgpt-export.zip
 
 This prints the **export root directory** it found (contains `conversations-*.json`).
 
-## 3) Build the semantic index
+## 4) Build the semantic index (ChatGPT export fast path)
 
 Use the printed export root:
 
@@ -71,9 +130,8 @@ python src/build_index.py --export "/path/printed/by/ingest"
 
 Outputs:
 
-- `data/derived/chunks.jsonl`
-- `data/derived/embeddings.npy`
-- `data/derived/manifest.json`
+- `data/derived/memory.db` (SQLite + sqlite-vec, the live index)
+- `data/derived/manifest.json` (legacy, kept for introspection tools)
 
 Optional: include assistant messages too:
 
@@ -81,7 +139,19 @@ Optional: include assistant messages too:
 python src/build_index.py --export "/path/to/export" --include-assistant
 ```
 
-## 4) Build persona artifacts (optional but recommended)
+### Migrating an existing flat-file index
+
+If you previously ran an older Minion that produced `chunks.jsonl` +
+`embeddings.npy`, upgrade in place:
+
+```bash
+python src/migrate_to_sqlite.py --derived-dir data/derived
+```
+
+Or just start the MCP / watcher — `mcp_server.py` auto-migrates on first
+launch when it sees the legacy files and no `memory.db`.
+
+## 5) Build persona artifacts (optional but recommended)
 
 ```bash
 source .venv/bin/activate
@@ -93,7 +163,7 @@ Outputs:
 - `data/derived/persona_sourcebook.md`
 - `data/derived/persona_quote_bank.md`
 
-## 5) Generate `core_profile.md` (recommended)
+## 6) Generate `core_profile.md` (recommended)
 
 This produces a **derived** `core_profile.md` from the export-backed persona evidence (no hardcoded personality).
 
@@ -107,7 +177,7 @@ Outputs:
 - `core_profile.md` (generated)
 - `data/derived/core_profile_manifest.json` + `data/derived/core_profile.built` (build marker + metadata)
 
-## 5b) `ask_minion` — chunk-native strategic profile (Claude agent workflow)
+## 6b) `ask_minion` — chunk-native strategic profile (Claude agent workflow)
 
 After `chunks.jsonl` exists (from step 3), you can synthesize a longer **strategic / identity** document from the **same chunks** the MCP searches—decisions, frameworks, beliefs, projects—via map→reduce and local Ollama:
 
@@ -137,7 +207,7 @@ Outputs:
 
 This complements `core_profile.md` (persona from the quote bank / sourcebook). Paste either or both into Claude’s system context.
 
-## 6) Pasteable persona for Claude
+## 7) Pasteable persona for Claude
 
 **MCP vs instructions:** `claude_desktop_config.json` (updated by `minion mcp-config` / setup) only **registers** the Minion server so **tools exist**. To get good **invocation** of `search_memory`, paste the files below into **Claude → Custom Instructions** (and/or project instructions).
 
@@ -152,13 +222,13 @@ Optionally also attach / paste selected sections from:
 - `data/derived/persona_sourcebook.md`
 - `data/derived/persona_quote_bank.md`
 
-## 7) Wire it into Claude Desktop (MCP)
+## 8) Wire it into Claude Desktop (MCP)
 
 Claude Desktop reads (macOS):
 
 - `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-**Default:** `minion setup` **writes this file for you** (merges the `chatgpt-memory-local` entry; backs up the previous file to `claude_desktop_config.json.minion.bak` when it existed).
+**Default:** `minion setup` **writes this file for you** (merges the `minion` entry; backs up the previous file to `claude_desktop_config.json.minion.bak` when it existed).
 
 To point at an existing index later (same paths as `minion setup` would use):
 
@@ -170,7 +240,7 @@ That **merges** into `claude_desktop_config.json`—no copy-paste. Restart Claud
 
 - `--print-only` — print a JSON fragment only; **does not** write (for debugging).
 - `--config-path` / env **`CLAUDE_DESKTOP_CONFIG`** — non-default config file location.
-- `--server-name` — if `chatgpt-memory-local` collides with another server.
+- `--server-name` — if `minion` collides with another server.
 - `--quiet` — less output when writing; with `--print-only`, JSON only on stdout.
 
 **Manual:** see `claude_desktop_config.example.json` (`command`, `args`, `CHATGPT_MCP_DATA_DIR`).
@@ -179,37 +249,52 @@ That **merges** into `claude_desktop_config.json`—no copy-paste. Restart Claud
 
 Restart Claude Desktop after any config change.
 
-## 8) Verify inside Claude
+## 9) Verify inside Claude
 
 Ask Claude:
 
-- “Call `index_info`.”
-- “Call `search_memory` for `Good Capital` with `top_k=6`.”
-- “Take the top hit `chunk_id` and call `get_chunk`.”
+- "Call `index_info`." — shows chunk / source counts, db path, inbox path.
+- "Call `list_sources` with `kind='pdf'`." — confirms a recently-dropped file.
+- "Call `ask_minion` for `Good Capital` with `top_k=6`."
+- "Take the top hit `chunk_id` and call `get_chunk`."
+
+The full tool surface: `ask_minion`, `get_chunk`, `list_sources`,
+`source_info`, `index_info`. `ask_minion` supports `kind`, `path_glob`,
+`since`, and `role` filters for precise retrieval.
 
 ## Privacy + token discipline (how this stays cheap)
 
-- The full index stays on disk (`embeddings.npy`, `chunks.jsonl`).
+- The full index stays on disk (`memory.db`, a single SQLite file).
 - Claude only receives **top-k short snippets** (default `top_k=8`, `max_chars=900`).
+- MCP runs over stdio (no network ports); optional Ollama captioning is the
+  only network-adjacent call and is off unless `MINION_VISION_MODEL` is set.
 
-## Future sources (extensibility)
+## Adding a new file type
 
-Add new `ingest_*.py` scripts that convert a source into the same internal message/chunk format, then reuse `build_index.py`.
+Each parser is a single file under `src/parsers/` that returns
+`ParseResult(chunks=[...], kind, parser, source_meta)`. To support a new
+format:
 
-Suggested connector pattern:
+1. Drop a module at `src/parsers/<yourfmt>.py` exporting `def parse(path: Path) -> ParseResult`.
+2. Register its extensions in `src/parsers/__init__._EXT_REGISTRY`.
+3. If it needs a heavy dep, add it to a new `requirements-<yourfmt>.txt` and
+   `import` it lazily inside `parse()` so core installs stay tiny.
 
-- Add `src/ingest_<source>.py` that outputs either:
-  - an unzipped “raw” directory under `data/raw/`, plus a manifest, or
-  - a normalized JSONL of messages/documents
-- Keep the indexing surface stable:
-  - `build_index.py` consumes the export directory (or future normalized format) and always writes:
-    - `data/derived/chunks.jsonl`
-    - `data/derived/embeddings.npy`
-    - `data/derived/manifest.json`
-- Keep privacy defaults:
-  - local disk only
-  - MCP over stdio (no ports)
-  - strict `top_k` + `max_chars` caps
+The ingest pipeline (`src/ingest.py`), watcher, MCP, and CLI will pick up the
+new kind automatically.
+
+## Environment knobs
+
+| Env var | Default | Purpose |
+| ------- | ------- | ------- |
+| `MINION_DATA_DIR` | repo `data/derived` | Where `memory.db` lives |
+| `MINION_INBOX` | `<MINION_DATA_DIR>/../inbox` | Watched folder |
+| `MINION_DISABLE_WATCHER` | unset | Set to `1` to skip auto-watch inside `minion mcp` |
+| `MINION_EMBED_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | fastembed model name |
+| `MINION_WHISPER_MODEL` | `tiny.en` | faster-whisper model for audio |
+| `MINION_VISION_MODEL` | unset | Ollama model name for image captioning (e.g. `llava`) |
+| `MINION_RETRIEVAL_POLICY` | `<data>/retrieval_policy.md` | Override policy path |
+| `MINION_PROFILE` | auto | Profile brief auto-attached on first tool call |
 
 ## Packaging: Minion (macOS)
 
