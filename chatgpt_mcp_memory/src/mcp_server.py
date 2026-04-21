@@ -37,6 +37,13 @@ from store import (
     list_sources as store_list_sources,
     search as store_search,
 )
+from build_voice import (
+    AUTO_DRAFT_SENTINEL,
+    USER_EDITS_SENTINEL,
+    build_skeleton as voice_build_skeleton,
+    is_voice_built,
+    write_auto_draft as voice_write_auto_draft,
+)
 
 
 APP_NAME = "Minion"
@@ -80,6 +87,14 @@ def _brief_max_chars() -> int:
         return max(500, int(raw))
     except ValueError:
         return 4000
+
+
+def _voice_max_chars() -> int:
+    raw = _env_first("MINION_VOICE_MAX_CHARS", default="5000")
+    try:
+        return max(500, int(raw))
+    except ValueError:
+        return 5000
 
 
 def _data_dir() -> Path:
@@ -129,6 +144,57 @@ def _load_retrieval_instructions() -> str:
     return _INSTRUCTIONS_FALLBACK
 
 
+def _voice_path() -> Path:
+    """Return the resolved path to voice.md (may not exist yet)."""
+    explicit = _env_first("MINION_VOICE")
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    return _data_dir() / "voice.md"
+
+
+def _load_voice() -> Optional[str]:
+    """Return the durable user-voice directives, if present.
+
+    Search order:
+        1. $MINION_VOICE (explicit path)
+        2. <data_dir>/voice.md
+        3. <data_dir>/../voice.md
+    """
+    explicit = _env_first("MINION_VOICE")
+    candidates: List[Path] = []
+    if explicit:
+        candidates.append(Path(explicit).expanduser().resolve())
+    data_dir = _data_dir()
+    for base in (data_dir, data_dir.parent):
+        candidates.append(base / "voice.md")
+
+    cap = _voice_max_chars()
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not text:
+            continue
+        if len(text) > cap:
+            text = text[: cap - 30].rstrip() + "\n\n_…truncated…_\n"
+        return text
+    return None
+
+
+def _voice_is_built() -> bool:
+    """True if voice.md exists and has non-stub content in either block."""
+    path = _voice_path()
+    try:
+        if not path.is_file():
+            return False
+        return is_voice_built(path.read_text(encoding="utf-8"))
+    except OSError:
+        return False
+
+
 def _load_profile_brief() -> Optional[str]:
     explicit = _env_first("MINION_PROFILE")
     candidates: List[Path] = []
@@ -160,7 +226,7 @@ def _load_profile_brief() -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-_INDEX_LOCK = threading.Lock()
+_INDEX_LOCK = threading.RLock()  # reentrant: _get_model acquires then calls _get_conn
 _CONN: Optional[sqlite3.Connection] = None
 _MODEL: Optional[TextEmbedding] = None
 _MODEL_NAME: Optional[str] = None
@@ -480,6 +546,78 @@ def _tool_conversation_chunks(arguments: Dict[str, Any]) -> Dict[str, Any]:
     return {"conversation_id": conversation_id, "chunks": out, "count": len(out)}
 
 
+def _tool_get_voice(_: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the durable user-voice directives verbatim.
+
+    Also injected into initialize.instructions every session; this tool lets
+    callers re-read it mid-session or in clients that don't surface the
+    initialize payload to the model.
+    """
+    text = _load_voice()
+    return {
+        "present": bool(text),
+        "built": _voice_is_built(),
+        "voice": text or "",
+        "char_count": len(text or ""),
+    }
+
+
+_COMMIT_MIN_CHARS = 200
+_COMMIT_MAX_CHARS = 6000
+
+
+def _tool_commit_voice(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Persist Claude's synthesized voice block to voice.md.
+
+    Overwrites the AUTO_DRAFT section; preserves USER_EDITS verbatim.
+    """
+    markdown = (args.get("voice_markdown") or "").strip()
+    if not markdown:
+        return {"status": "error", "error": "voice_markdown is required and must be non-empty"}
+    if len(markdown) < _COMMIT_MIN_CHARS:
+        return {
+            "status": "error",
+            "error": f"voice_markdown too short ({len(markdown)} chars; min {_COMMIT_MIN_CHARS}). "
+                     "Synthesize more substantive directives.",
+        }
+    if len(markdown) > _COMMIT_MAX_CHARS:
+        return {
+            "status": "error",
+            "error": f"voice_markdown too long ({len(markdown)} chars; max {_COMMIT_MAX_CHARS}). "
+                     "Tighten the synthesis.",
+        }
+    if not any(h in markdown for h in ("###", "##")):
+        return {
+            "status": "error",
+            "error": "voice_markdown must contain at least one markdown heading (## or ###).",
+        }
+
+    path = _voice_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    chunks_path = _data_dir() / "chunks.jsonl"
+    n_chunks = 0
+    if chunks_path.is_file():
+        with chunks_path.open("r", encoding="utf-8") as f:
+            for _ in f:
+                n_chunks += 1
+
+    voice_write_auto_draft(path, markdown, n_chunks=n_chunks)
+    new_text = path.read_text(encoding="utf-8")
+
+    return {
+        "status": "ok",
+        "voice_path": str(path),
+        "bytes_written": path.stat().st_size,
+        "built": is_voice_built(new_text),
+        "note": (
+            "Voice profile committed. It is injected into `initialize.instructions` "
+            "on every future session. User edits go below the USER_EDITS sentinel "
+            "and survive future re-bootstraps."
+        ),
+    }
+
+
 def _tool_index_info(_: Dict[str, Any]) -> Dict[str, Any]:
     conn = _get_conn()
     return {
@@ -566,6 +704,42 @@ TOOLS: List[Dict[str, Any]] = [
                 "max_chars": {"type": "integer", "minimum": 50, "maximum": 10000, "default": DEFAULT_MAX_CHARS_FULL},
             },
             "required": ["chunk_id"],
+        },
+    },
+    {
+        "name": "get_voice",
+        "title": "Get user voice directives",
+        "description": (
+            "Return the user's durable voice profile: preferences, nevers, style "
+            "and tone directives, and characteristic writing samples. Auto-"
+            "injected into initialize.instructions every session, but call this "
+            "any time you need to re-read the rules verbatim (e.g. before "
+            "drafting long-form text in the user's voice)."
+        ),
+        "inputSchema": {"type": "object", "additionalProperties": False},
+    },
+    {
+        "name": "commit_voice",
+        "title": "Commit synthesized voice profile to disk",
+        "description": (
+            "Persist a synthesized voice-directives markdown block to voice.md. "
+            "Called by Claude at the end of the voice-bootstrap flow specified "
+            "in `initialize.instructions` (when the voice profile is unbuilt), "
+            "after gathering evidence via `ask_minion` + `browse_conversations`. "
+            "Overwrites the AUTO_DRAFT block; user hand-edits below the "
+            "USER_EDITS sentinel are preserved. Enforces a size band "
+            "(~200-6000 chars) and requires at least one markdown heading."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["voice_markdown"],
+            "properties": {
+                "voice_markdown": {
+                    "type": "string",
+                    "description": "Markdown body to write into the auto-draft block.",
+                },
+            },
         },
     },
     {
@@ -723,12 +897,103 @@ def _handle_initialize(req: Dict[str, Any]) -> Dict[str, Any]:
     _SESSION_STATE["brief_sent"] = False
 
     instructions = _load_retrieval_instructions()
+
+    built = _voice_is_built()
+    voice = _load_voice() if built else None
+
+    if built and voice:
+        instructions += (
+            "\n\n---\n\n"
+            "# User voice (durable directives. Treat as binding style and preference rules.)\n\n"
+            + voice
+            + "\n\n_These voice directives are injected every session. They are "
+            "binding: respect the nevers/preferences/style unless the user overrides "
+            "them in-conversation. Call `get_voice` to re-read them verbatim._"
+        )
+    else:
+        instructions += (
+            "\n\n---\n\n"
+            "# Voice bootstrap required (one-time, silent self-setup)\n\n"
+            "The user's voice profile has not been built yet. On your FIRST "
+            "substantive turn this session, run this self-setup silently "
+            "BEFORE answering the user's question. It is a one-time action; "
+            "the result is persisted to `voice.md` and auto-injected into "
+            "every future session.\n\n"
+            "## Procedure\n\n"
+            "1. **Gather evidence via semantic retrieval.** `ask_minion` with "
+            "`mode='relevance'` is an NLP semantic search over the user's own "
+            "utterances (MiniLM embeddings over ~22k chunks). Trust it. Query "
+            "in the *shape of the answer*, not the shape of the question. "
+            "Users don't narrate their preferences (`I want responses "
+            "formatted as...`); they state imperatives (`no emojis`, `be "
+            "direct`). Phrase your queries as hypothetical user utterances. "
+            "Always filter `role='user'` so you see only the user's own "
+            "directives, not assistant replies. 3-5 queries is the right "
+            "budget. Good seeds:\n\n"
+            "```\n"
+            "ask_minion(query=\"don't use emojis, em dashes, or ellipses in your responses\",\n"
+            "           mode='relevance', role='user', top_k=12)\n"
+            "ask_minion(query=\"respond in short paragraphs, no bullet points or headers\",\n"
+            "           mode='relevance', role='user', top_k=12)\n"
+            "ask_minion(query=\"be direct, no preamble, no hedging, cut the filler\",\n"
+            "           mode='relevance', role='user', top_k=12)\n"
+            "ask_minion(query=\"write in the voice of a specific author or register\",\n"
+            "           mode='relevance', role='user', top_k=12)\n"
+            "ask_minion(query=\"keep your tone confident and analytical, not apologetic\",\n"
+            "           mode='relevance', role='user', top_k=12)\n"
+            "```\n\n"
+            "   Supplement with `browse_conversations(limit=15, order='newest')` "
+            "for recent work context. Use `conversation_chunks(...)` to pull a "
+            "whole thread only if a single hit needs more context. Reserve "
+            "`mode='keyword'` for one narrow job: if a style reference surfaces "
+            "(a name like `Paul Graham`, `Hemingway`), follow up with "
+            "`mode='keyword'` to find all occurrences of that specific token. "
+            "Do not use keyword mode as a semantic fallback.\n\n"
+            "2. **Synthesize** a short, binding voice profile in Markdown. "
+            "Use these exact H3 headings; mark any section without support "
+            "as `_(insufficient signal)_` rather than inventing rules:\n\n"
+            "   - `### Typography` - hard character rules (em dashes, "
+            "emojis, ellipses, quotes).\n"
+            "   - `### Formatting` - paragraphs vs bullets, headers, tables, "
+            "code blocks.\n"
+            "   - `### Length and density` - compression, preamble, hedging, "
+            "word-count targets.\n"
+            "   - `### Tone and register` - 3-5 specific phrases "
+            "(`diagnostic, time-pressed, systems-minded`). Avoid generic "
+            "adjectives like `professional` or `clear`.\n"
+            "   - `### Style references` - writers, works, or registers the "
+            "user explicitly references. Leave empty if none surface.\n"
+            "   - `### Hard nos` - things the user rejects about responses.\n"
+            "   - `### Voice sample` - ONE short paragraph (60-150 words) "
+            "in the user's own voice, synthesized from patterns. Not a "
+            "direct quote.\n\n"
+            "3. **Commit** by calling `commit_voice` with the markdown as "
+            "`voice_markdown`. Total length 400-1800 chars. The tool "
+            "enforces size and heading checks.\n\n"
+            "## Critical distinctions\n\n"
+            "- **Voice directives vs content directives.** A user asking "
+            "Claude to `write the words Enter and Exit on a sign` is about "
+            "a generated asset, NOT voice. A user saying `respond in "
+            "paragraphs` or `don't hedge` IS voice. When in doubt, omit.\n"
+            "- **Evidence only.** Infer rules only from what the retrieved "
+            "hits support. Do not import defaults or your general priors.\n"
+            "- **Domain filtering.** If the user's chats are dominated by a "
+            "domain (real estate, code, scripture), extract voice cues only; "
+            "do not encode domain content as rules.\n\n"
+            "## Housekeeping\n\n"
+            "- Run silently. Do not narrate the bootstrap to the user.\n"
+            "- Do not show the draft for approval. The user can always edit "
+            "`voice.md` below the USER_EDITS sentinel afterward.\n"
+            "- After `commit_voice` returns `status=ok`, proceed with the "
+            "user's actual question and apply the voice you just synthesized "
+            "from here onward in the conversation."
+        )
+
     if _load_profile_brief() is not None:
         instructions += (
-            "\n\nOn your first tool call this session, Minion attaches a condensed user "
-            "brief (preferences, key names, recurring frameworks) under "
-            "`structuredContent.profile_brief`. Treat it as grounding; call "
-            "`ask_minion` for deeper context."
+            "\n\nOn your first tool call this session, Minion also attaches a "
+            "condensed user brief (observed patterns from chat history) under "
+            "`structuredContent.profile_brief`. Treat it as priors, not binding rules."
         )
     return _jsonrpc_result(
         req_id,
@@ -750,6 +1015,8 @@ _DISPATCH = {
     "ask_minion": _tool_ask_minion,
     "search_memory": _tool_ask_minion,  # legacy alias
     "get_chunk": _tool_get_chunk,
+    "get_voice": _tool_get_voice,
+    "commit_voice": _tool_commit_voice,
     "browse_conversations": _tool_browse_conversations,
     "conversation_chunks": _tool_conversation_chunks,
     "list_sources": _tool_list_sources,

@@ -667,6 +667,15 @@ def cmd_setup(args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"   Warning: brief.md not generated: {e}")
 
+    # Durable voice profile (nevers / preferences / style / samples) — injected
+    # into initialize.instructions every session. Non-fatal like the brief.
+    try:
+        _run_tee(
+            _python_u(vpy, _src("build_voice.py"), ["--derived-dir", str(derived_dir)])
+        )
+    except Exception as e:
+        print(f"   Warning: voice.md not generated: {e}")
+
     if plain:
         print("Step 5/5 — Connecting memory search to Claude Desktop…")
     else:
@@ -819,6 +828,15 @@ def cmd_quickstart(args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"   Warning: brief.md not generated: {e}")
 
+    # Voice profile — durable nevers/preferences/style directives injected into
+    # initialize.instructions every session. Non-fatal.
+    try:
+        _run_tee(
+            _python_u(vpy, _src("build_voice.py"), ["--derived-dir", str(derived_dir)])
+        )
+    except Exception as e:
+        print(f"   Warning: voice.md not generated: {e}")
+
     print("3/3 Installing MCP into Claude Desktop config…")
     try:
         cfg_written, cfg_backup = install_claude_desktop_mcp(
@@ -856,6 +874,28 @@ def cmd_build_brief(args: argparse.Namespace) -> int:
     if getattr(args, "max_chars", None):
         extra.extend(["--max-chars", str(args.max_chars)])
     _run_tee(_python_u(vpy, _src("build_brief.py"), extra))
+    return 0
+
+
+def cmd_build_voice(args: argparse.Namespace) -> int:
+    """Ensure <derived>/voice.md exists as a bootstrap-ready skeleton.
+
+    voice.md is built by Claude itself on the first MCP session (via the
+    `bootstrap_voice` + `commit_voice` tools). This command only ensures the
+    skeleton file with both sentinels exists, so the MCP server can detect
+    "unbuilt" state and trigger the bootstrap. User hand-edits below the
+    <!-- MINION_VOICE_USER_EDITS --> sentinel are preserved across runs.
+    """
+    derived_dir = Path(args.derived_dir).expanduser().resolve()
+    if not derived_dir.exists():
+        raise SystemExit(f"Missing derived dir: {derived_dir}")
+
+    workspace_dir = (
+        Path(args.workspace).expanduser().resolve() if args.workspace else _default_workspace_dir()
+    )
+    vpy = _ensure_python_env(workspace_dir)
+
+    _run_tee(_python_u(vpy, _src("build_voice.py"), ["--derived-dir", str(derived_dir)]))
     return 0
 
 
@@ -1256,6 +1296,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Hard cap on brief.md size (default 4000; env MINION_BRIEF_MAX_CHARS).",
     )
     p_brief.set_defaults(func=cmd_build_brief)
+
+    p_voice = sub.add_parser(
+        "build-voice",
+        help=(
+            "Ensure <derived>/voice.md skeleton exists (Claude bootstraps the "
+            "actual voice directives on the first MCP session)."
+        ),
+    )
+    p_voice.add_argument(
+        "--derived-dir",
+        required=True,
+        help="Derived dir containing chunks.jsonl.",
+    )
+    p_voice.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace whose .venv provides the Python runtime.",
+    )
+    p_voice.set_defaults(func=cmd_build_voice)
 
     p_eval = sub.add_parser(
         "eval",
