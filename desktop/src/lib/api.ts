@@ -23,6 +23,10 @@ export type AppConfig = {
   inbox: string;
   api_port: number;
   api_base: string;
+  /** `<data_dir>/logs` — sidecar stdout/stderr and shell events (release .app). */
+  logs_dir: string;
+  desktop_log: string;
+  sidecar_log: string;
 };
 
 export type Source = {

@@ -19,17 +19,85 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
 // ---------------------------------------------------------------------------
-// Debug NDJSON instrumentation (active until post-release verification).
+// Persistent file logs (release builds): `<MINION_DATA_DIR>/logs/`
+//   - `minion-desktop.log` — shell lifecycle (this file)
+//   - `sidecar.log`       — Python FastAPI / uvicorn stdout+stderr
+// Dev (`cargo tauri dev`): sidecar stdio stays inherited so the terminal
+// stays readable; desktop lines still append to the log files.
+// Optional NDJSON: set $MINION_DEBUG_LOG to a path for structured `dbg` lines.
+// ---------------------------------------------------------------------------
+static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
+static LOG_MUTEX: Mutex<()> = Mutex::new(());
+
+fn logs_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("logs")
+}
+
+fn init_file_logging(data_dir: &Path) {
+    let dir = logs_dir(data_dir);
+    let _ = fs::create_dir_all(&dir);
+    let _ = LOG_DIR.set(dir);
+}
+
+fn log_ts_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn shell_log(level: &str, msg: &str) {
+    let Ok(_guard) = LOG_MUTEX.lock() else {
+        return;
+    };
+    let Some(dir) = LOG_DIR.get() else {
+        return;
+    };
+    let path = dir.join("minion-desktop.log");
+    let line = format!(
+        "{} {} {}\n",
+        log_ts_unix(),
+        level,
+        msg.replace('\n', " ")
+    );
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+    eprintln!("[minion] {msg}");
+}
+
+fn append_sidecar_log_separator(data_dir: &Path) {
+    let path = logs_dir(data_dir).join("sidecar.log");
+    let Ok(_guard) = LOG_MUTEX.lock() else {
+        return;
+    };
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(
+            f,
+            "\n=== sidecar session {} ===",
+            log_ts_unix()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Debug NDJSON instrumentation.
 // Writes one JSON line per significant event to the session logfile defined
-// by $MINION_DEBUG_LOG (set during `cargo tauri build` for this session).
-// Safe to leave in place — overhead is a single append() when the env var
-// is set, zero otherwise.
+// by $MINION_DEBUG_LOG (optional).
 // ---------------------------------------------------------------------------
 fn dbg(event: &str, data: serde_json::Value) {
     let path = match std::env::var("MINION_DEBUG_LOG") {
@@ -95,6 +163,34 @@ struct AppState {
     sidecar_src_dir: Mutex<Option<PathBuf>>,
     /// Path to the venv Python that runs the sidecar. Set after bootstrap.
     sidecar_python: Mutex<Option<PathBuf>>,
+}
+
+/// How long `restart_sidecar` / vision respawn will block waiting for the
+/// background venv + pip bootstrap (same window as the UI auto-pull waiter).
+const SIDECAR_BOOTSTRAP_WAIT: Duration = Duration::from_secs(300);
+
+/// Block until setup thread has stored both paths, or timeout. Otherwise
+/// restart and vision respawn hit "sidecar python not yet bootstrapped" if the
+/// user acts during first-launch pip.
+fn wait_for_sidecar_bootstrap_paths(
+    state: &AppState,
+    timeout: Duration,
+) -> Result<(PathBuf, PathBuf), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let python = state.sidecar_python.lock().ok().and_then(|g| g.clone());
+        let src_dir = state.sidecar_src_dir.lock().ok().and_then(|g| g.clone());
+        if let (Some(py), Some(src)) = (python, src_dir) {
+            return Ok((py, src));
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                "Sidecar setup is still running — wait for first-launch setup to finish, then try again."
+                    .to_string(),
+            );
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
 }
 
 // moondream: 1.7GB vs llava's 4.5GB, purpose-built for image captioning,
@@ -200,39 +296,14 @@ fn resolve_sidecar_requirements(app: &AppHandle, src_dir: &Path) -> Option<PathB
     None
 }
 
-/// Find a usable system `python3 >= 3.10` on PATH. Returns an absolute path
-/// (so relaunches from a different cwd still work) and the version string.
-fn find_system_python() -> Option<(PathBuf, String)> {
-    for name in ["python3.12", "python3.11", "python3.10", "python3"] {
-        let out = match Command::new(name).arg("--version").output() {
-            Ok(o) => o,
-            Err(_) => continue,
-        };
-        if !out.status.success() {
-            continue;
-        }
-        let ver = String::from_utf8_lossy(&out.stdout).to_string()
-            + &String::from_utf8_lossy(&out.stderr);
-        let ver = ver.trim().to_string();
-        if let Some(rest) = ver.strip_prefix("Python 3.") {
-            if let Some(minor_str) = rest.split('.').next() {
-                if let Ok(minor) = minor_str.trim().parse::<u32>() {
-                    if minor >= 10 {
-                        let abs = Command::new("which")
-                            .arg(name)
-                            .output()
-                            .ok()
-                            .and_then(|o| {
-                                if o.status.success() {
-                                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                                    if s.is_empty() { None } else { Some(PathBuf::from(s)) }
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_else(|| PathBuf::from(name));
-                        return Some((abs, ver));
-                    }
+/// Parsed `Python 3.x.y` → minor is usable if >= 10.
+fn python310_or_newer(stdout_stderr: &str) -> Option<String> {
+    let ver = stdout_stderr.trim();
+    if let Some(rest) = ver.strip_prefix("Python 3.") {
+        if let Some(minor_str) = rest.split('.').next() {
+            if let Ok(minor) = minor_str.trim().parse::<u32>() {
+                if minor >= 10 {
+                    return Some(ver.to_string());
                 }
             }
         }
@@ -240,9 +311,159 @@ fn find_system_python() -> Option<(PathBuf, String)> {
     None
 }
 
+fn try_python_executable(exe: &Path) -> Option<(PathBuf, String)> {
+    let out = Command::new(exe).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let combined =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    let ver = python310_or_newer(&combined)?;
+    Some((exe.to_path_buf(), ver))
+}
+
+/// Locations that exist on disk but are often missing from the **PATH** of GUI
+/// apps launched from Finder / Spotlight (especially Homebrew on Apple Silicon).
+fn fixed_python_install_candidates() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    #[cfg(not(windows))]
+    {
+        for base in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
+            for name in ["python3.12", "python3.11", "python3.10", "python3"] {
+                let p = PathBuf::from(base).join(name);
+                if p.is_file() {
+                    v.push(p);
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let base = PathBuf::from(local).join("Programs").join("Python");
+            for dir in ["Python312", "Python311", "Python310"] {
+                let p = base.join(dir).join("python.exe");
+                if p.is_file() {
+                    v.push(p);
+                }
+            }
+        }
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            let p = PathBuf::from(home)
+                .join(".pyenv")
+                .join("pyenv-win")
+                .join("shims")
+                .join("python.exe");
+            if p.is_file() {
+                v.push(p);
+            }
+        }
+    }
+    v
+}
+
+fn resolve_exe_on_path(name: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let out = Command::new("where").arg(name).output().ok()?;
+    #[cfg(not(windows))]
+    let out = Command::new("which").arg(name).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
+    if line.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(line))
+}
+
+/// Find a usable system `python3 >= 3.10`. GUI-launched apps may not inherit a
+/// shell PATH, so we probe well-known install paths before `which python3`.
+fn find_system_python() -> Option<(PathBuf, String)> {
+    for exe in fixed_python_install_candidates() {
+        if let Some(pair) = try_python_executable(&exe) {
+            dbg(
+                "python_probe",
+                serde_json::json!({"path": pair.0, "via": "fixed"}),
+            );
+            return Some(pair);
+        }
+    }
+
+    #[cfg(windows)]
+    let names: &[&str] = &["python3.12", "python3.11", "python3.10", "python3", "python"];
+    #[cfg(not(windows))]
+    let names: &[&str] = &["python3.12", "python3.11", "python3.10", "python3"];
+
+    for name in names {
+        let out = match Command::new(name).arg("--version").output() {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let combined =
+            String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+        if let Some(ver) = python310_or_newer(&combined) {
+            let abs = resolve_exe_on_path(name).unwrap_or_else(|| PathBuf::from(name));
+            dbg(
+                "python_probe",
+                serde_json::json!({"path": abs, "via": "path", "name": name}),
+            );
+            return Some((abs, ver));
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows py launcher: resolve the real interpreter path for `venv`/`pip`.
+        for flag in ["-3.12", "-3.11", "-3.10", "-3"] {
+            let out = Command::new("py").arg(flag).arg("--version").output().ok()?;
+            if !out.status.success() {
+                continue;
+            }
+            let combined = String::from_utf8_lossy(&out.stdout).to_string()
+                + &String::from_utf8_lossy(&out.stderr);
+            let ver = python310_or_newer(&combined)?;
+            let exe_out = Command::new("py")
+                .arg(flag)
+                .args(["-c", "import sys; print(sys.executable)"])
+                .output()
+                .ok()?;
+            if !exe_out.status.success() {
+                continue;
+            }
+            let raw = String::from_utf8_lossy(&exe_out.stdout).trim().to_string();
+            let pb = PathBuf::from(&raw);
+            if pb.as_os_str().is_empty() || !pb.exists() {
+                continue;
+            }
+            dbg(
+                "python_probe",
+                serde_json::json!({"path": pb, "via": "py_launcher", "flag": flag}),
+            );
+            return Some((pb, ver));
+        }
+    }
+
+    None
+}
+
 /// Path to the venv's Python executable under `<data_dir>/venv`.
 fn venv_python(data_dir: &Path) -> PathBuf {
-    data_dir.join("venv").join("bin").join("python")
+    #[cfg(windows)]
+    {
+        data_dir.join("venv").join("Scripts").join("python.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        data_dir.join("venv").join("bin").join("python")
+    }
 }
 
 /// Create `<data_dir>/venv` and pip-install the sidecar requirements. Streams
@@ -258,7 +479,7 @@ fn bootstrap_venv(
     // Already bootstrapped AND core deps importable? Fast-path return.
     if py.exists() && venv_has_core(&py) {
         dbg("bootstrap", serde_json::json!({"state": "cached", "python": py}));
-        let _ = app.emit("sidecar://status", serde_json::json!({"state": "ready"}));
+        // Don't emit `ready` here — first paint must wait until spawn_sidecar succeeds.
         return Ok(py);
     }
 
@@ -286,7 +507,11 @@ fn bootstrap_venv(
             .arg("venv")
             .arg(data_dir.join("venv"))
             .status()
-            .map_err(|e| format!("venv launch failed: {e}"))?;
+            .map_err(|e| {
+                let msg = format!("venv launch failed: {e}");
+                emit("error", &msg);
+                msg
+            })?;
         if !status.success() {
             let msg = format!("venv creation failed (exit {})", status.code().unwrap_or(-1));
             emit("error", &msg);
@@ -299,6 +524,15 @@ fn bootstrap_venv(
             .status();
     }
 
+    if !py.exists() {
+        let msg = format!(
+            "venv Python missing at {} after setup — try deleting the venv folder and relaunch.",
+            py.display()
+        );
+        emit("error", &msg);
+        return Err(msg);
+    }
+
     emit(
         "installing",
         "Installing dependencies (first launch, ~2 min)…",
@@ -308,7 +542,11 @@ fn bootstrap_venv(
         .args(["-m", "pip", "install", "--disable-pip-version-check", "-r"])
         .arg(requirements)
         .status()
-        .map_err(|e| format!("pip launch failed: {e}"))?;
+        .map_err(|e| {
+            let msg = format!("pip launch failed: {e}");
+            emit("error", &msg);
+            msg
+        })?;
     if !status.success() {
         let msg = format!("pip install failed (exit {})", status.code().unwrap_or(-1));
         emit("error", &msg);
@@ -316,8 +554,6 @@ fn bootstrap_venv(
         return Err(msg);
     }
     dbg("bootstrap", serde_json::json!({"state": "pip_done"}));
-
-    emit("ready", "Minion is ready.");
     Ok(py)
 }
 
@@ -450,9 +686,49 @@ fn spawn_sidecar(
         .env("MINION_DATA_DIR", data_dir)
         .env("MINION_INBOX", inbox)
         .env("MINION_API_PORT", api_port.to_string())
-        .env("PYTHONUNBUFFERED", "1")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .env("PYTHONUNBUFFERED", "1");
+    // Release: capture sidecar output (Finder-launched apps have no TTY).
+    // Dev: inherit so `tauri dev` stays readable.
+    if !cfg!(debug_assertions) {
+        let log_dir = logs_dir(data_dir);
+        if fs::create_dir_all(&log_dir).is_ok() {
+            append_sidecar_log_separator(data_dir);
+            let sidecar_log_path = log_dir.join("sidecar.log");
+            match fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&sidecar_log_path)
+            {
+                Ok(out) => match out.try_clone() {
+                    Ok(err) => {
+                        cmd.stdout(Stdio::from(out)).stderr(Stdio::from(err));
+                    }
+                    Err(e) => {
+                        shell_log(
+                            "WARN",
+                            &format!(
+                                "could not duplicate sidecar log fd ({}): {e}",
+                                sidecar_log_path.display()
+                            ),
+                        );
+                        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+                    }
+                },
+                Err(e) => {
+                    shell_log(
+                        "WARN",
+                        &format!(
+                            "could not open sidecar log {}: {e}",
+                            sidecar_log_path.display()
+                        ),
+                    );
+                    cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+                }
+            }
+        }
+    } else {
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    }
     // Turn on delight + taste LLM by default when the sidecar inherits no explicit choice.
     if std::env::var("MINION_DELIGHT_MODEL").is_err() {
         cmd.env("MINION_DELIGHT_MODEL", DEFAULT_MINION_LLM);
@@ -470,7 +746,7 @@ fn spawn_sidecar(
             Some(child)
         }
         Err(e) => {
-            eprintln!("[minion] failed to spawn sidecar: {e}");
+            shell_log("ERROR", &format!("failed to spawn sidecar: {e}"));
             dbg("spawn_sidecar", serde_json::json!({"state": "spawn_err", "error": e.to_string()}));
             None
         }
@@ -696,11 +972,15 @@ fn ensure_ollama_server_running(state: &AppState, bin: &Path) -> Result<(), Stri
 
 #[tauri::command]
 fn app_config(state: tauri::State<AppState>) -> serde_json::Value {
+    let logs = logs_dir(&state.data_dir);
     serde_json::json!({
         "data_dir": state.data_dir.to_string_lossy(),
         "inbox": state.inbox.to_string_lossy(),
         "api_port": state.api_port,
         "api_base": format!("http://127.0.0.1:{}", state.api_port),
+        "logs_dir": logs.to_string_lossy(),
+        "desktop_log": logs.join("minion-desktop.log").to_string_lossy(),
+        "sidecar_log": logs.join("sidecar.log").to_string_lossy(),
     })
 }
 
@@ -978,6 +1258,7 @@ fn copy_into_inbox(
 /// respawning.
 #[tauri::command]
 fn restart_sidecar(state: tauri::State<AppState>) -> Result<serde_json::Value, String> {
+    let (python, src_dir) = wait_for_sidecar_bootstrap_paths(&state, SIDECAR_BOOTSTRAP_WAIT)?;
     let port = state.api_port;
 
     // Drop the handle we hold so the parent no longer waits on it.
@@ -1018,18 +1299,6 @@ fn restart_sidecar(state: tauri::State<AppState>) -> Result<serde_json::Value, S
     }
 
     let current_model = state.vision_model.lock().ok().and_then(|g| g.clone());
-    let python = state
-        .sidecar_python
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .ok_or_else(|| "sidecar python not yet bootstrapped".to_string())?;
-    let src_dir = state
-        .sidecar_src_dir
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .ok_or_else(|| "sidecar source not located".to_string())?;
     let new_child = spawn_sidecar(
         &python,
         &src_dir,
@@ -1104,6 +1373,8 @@ fn ensure_vision_model(
         ollama_pull_stream(&app, &bin, &model, "")?;
     }
 
+    let (python, src_dir) = wait_for_sidecar_bootstrap_paths(&state, SIDECAR_BOOTSTRAP_WAIT)?;
+
     // Restart the Python sidecar with the env wired so the image parser picks it up.
     {
         let mut guard = state
@@ -1115,18 +1386,6 @@ fn ensure_vision_model(
             let _ = child.wait();
         }
         thread::sleep(Duration::from_millis(200));
-        let python = state
-            .sidecar_python
-            .lock()
-            .ok()
-            .and_then(|g| g.clone())
-            .ok_or_else(|| "sidecar python not yet bootstrapped".to_string())?;
-        let src_dir = state
-            .sidecar_src_dir
-            .lock()
-            .ok()
-            .and_then(|g| g.clone())
-            .ok_or_else(|| "sidecar source not located".to_string())?;
         let new_child = spawn_sidecar(
             &python,
             &src_dir,
@@ -1206,6 +1465,8 @@ pub fn run() {
     let inbox = resolve_inbox(&data_dir);
     let _ = fs::create_dir_all(&data_dir);
     let _ = fs::create_dir_all(&inbox);
+    init_file_logging(&data_dir);
+    shell_log("INFO", "Minion desktop starting");
     let api_port: u16 = std::env::var("MINION_API_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -1260,12 +1521,25 @@ pub fn run() {
             let port_bg = api_port;
             let vm_bg = initial_vision_model.clone();
             thread::spawn(move || {
-                let state = match handle.try_state::<AppState>() {
-                    Some(s) => s,
-                    None => {
-                        dbg("setup", serde_json::json!({"state": "no_state"}));
+                // AppState may not be visible for a tick after `.manage`; retry so we never
+                // exit silently (otherwise the UI stays on "starting" forever).
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let state = loop {
+                    if let Some(s) = handle.try_state::<AppState>() {
+                        break s;
+                    }
+                    if Instant::now() >= deadline {
+                        dbg("setup", serde_json::json!({"state": "no_state_timeout"}));
+                        let _ = handle.emit(
+                            "sidecar://status",
+                            serde_json::json!({
+                                "state": "error",
+                                "message": "Startup timed out — quit Minion completely and reopen.",
+                            }),
+                        );
                         return;
                     }
+                    thread::sleep(Duration::from_millis(50));
                 };
                 let _ = handle.emit(
                     "sidecar://status",
@@ -1305,7 +1579,11 @@ pub fn run() {
                 let python = match bootstrap_venv(&handle, &data_dir_bg, &requirements) {
                     Ok(p) => p,
                     Err(e) => {
-                        dbg("setup", serde_json::json!({"state": "bootstrap_err", "error": e}));
+                        dbg("setup", serde_json::json!({"state": "bootstrap_err", "error": &e}));
+                        let _ = handle.emit(
+                            "sidecar://status",
+                            serde_json::json!({ "state": "error", "message": e }),
+                        );
                         return;
                     }
                 };
@@ -1328,7 +1606,10 @@ pub fn run() {
                         "sidecar://status",
                         serde_json::json!({
                             "state": "error",
-                            "message": "Sidecar failed to start. Check logs or relaunch.",
+                            "message": format!(
+                                "Sidecar failed to start. See {}/ for sidecar.log and minion-desktop.log (Settings → File logs), or relaunch.",
+                                logs_dir(&data_dir_bg).display()
+                            ),
                         }),
                     );
                 }

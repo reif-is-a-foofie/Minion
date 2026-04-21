@@ -51,6 +51,10 @@ anything else that speaks MCP) with one click.
   inbox; the watcher already running inside the sidecar picks them up.
   **Settings** surfaces resolved paths; **Connect** writes Claude Desktop MCP
   config with matching `MINION_DATA_DIR` and `MINION_INBOX`.
+- **File logs (release `.app`)**: `<MINION_DATA_DIR>/logs/minion-desktop.log`
+  (shell) and `sidecar.log` (Python / uvicorn). **Settings → File logs** shows
+  paths and **Reveal logs folder**. `cargo tauri dev` keeps the sidecar on the
+  terminal instead of duplicating into `sidecar.log`.
 
 ## Dev
 

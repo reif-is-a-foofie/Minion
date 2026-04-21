@@ -102,6 +102,21 @@
     }
   }
 
+  function sleep(ms: number) {
+    return new Promise<void>((r) => setTimeout(r, ms));
+  }
+
+  /** WKWebView often surfaces connection refused as the useless string "Load failed". */
+  function humanizeSettingsLoadError(msg: string): string {
+    if (msg === "Load failed" || /^failed to fetch$/i.test(msg.trim())) {
+      return "The sidecar is not up yet — wait for first-run setup to finish, then Retry or use Restart above.";
+    }
+    return msg;
+  }
+
+  const SETTINGS_LOAD_TIMEOUT_MS = 120_000;
+  const SETTINGS_LOAD_STEP_MS = 400;
+
   const KIND_DESCRIPTIONS: Record<string, string> = {
     text:             "plain text, markdown, json, yaml, csv",
     html:             "web pages, saved html",
@@ -116,16 +131,23 @@
 
   async function loadSettings() {
     settingsError = null;
-    try {
-      const res = await fetchSettings();
-      allKinds = res.all_kinds;
-      disabledKinds = new Set(res.settings.disabled_kinds ?? []);
-      settingsLoaded = true;
-    } catch (e) {
-      const msg = (e as Error).message;
-      settingsError = msg;
-      pushFeed("settings", `load failed: ${msg}`);
+    const deadline = Date.now() + SETTINGS_LOAD_TIMEOUT_MS;
+    let lastErr: Error | null = null;
+    while (Date.now() < deadline) {
+      try {
+        const res = await fetchSettings();
+        allKinds = res.all_kinds;
+        disabledKinds = new Set(res.settings.disabled_kinds ?? []);
+        settingsLoaded = true;
+        return;
+      } catch (e) {
+        lastErr = e instanceof Error ? e : new Error(String(e));
+        await sleep(SETTINGS_LOAD_STEP_MS);
+      }
     }
+    const msg = lastErr?.message ?? "unknown";
+    settingsError = msg;
+    pushFeed("settings", `load failed: ${msg}`);
   }
 
   async function toggleKind(kind: string) {
@@ -970,6 +992,29 @@
             </div>
           </div>
         {/if}
+        {#if config?.logs_dir}
+          <div class="setting-row path-row">
+            <div class="setting-main">
+              <div class="setting-label">File logs</div>
+              <div class="setting-desc path-hint">
+                Release builds write the Python sidecar and shell diagnostics under
+                <code>logs/</code> next to your index (dev builds keep the sidecar in this terminal).
+              </div>
+              <pre class="path-block">{config.desktop_log}</pre>
+              <pre class="path-block">{config.sidecar_log}</pre>
+              <div class="path-actions">
+                <button
+                  type="button"
+                  class="ghost tiny"
+                  onclick={() => revealInFinder(config!.logs_dir)}
+                  title="Show logs folder in Finder / file manager"
+                >
+                  Reveal logs folder
+                </button>
+              </div>
+            </div>
+          </div>
+        {/if}
       </div>
 
       <div class="modal-section settings-section">
@@ -979,11 +1024,18 @@
         </div>
         {#if !settingsLoaded && settingsError}
           <div class="empty">
-            Couldn't reach the sidecar: {settingsError}.
+            Couldn't reach the sidecar: {humanizeSettingsLoadError(settingsError)}{" "}
             <button class="link" onclick={loadSettings}>Retry</button>
           </div>
         {:else if !settingsLoaded}
-          <div class="empty">Loading…</div>
+          <div class="empty">
+            {#if sidecar && sidecar.state !== "ready" && sidecar.state !== "error"}
+              Waiting for setup…
+              {#if sidecar.message}<div class="setting-desc">{sidecar.message}</div>{/if}
+            {:else}
+              Connecting to the sidecar…
+            {/if}
+          </div>
         {:else}
           <ul class="kind-list">
             {#each allKinds as k}

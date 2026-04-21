@@ -1364,7 +1364,7 @@ def _handle_initialize(req: Dict[str, Any]) -> Dict[str, Any]:
         {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "minion", "title": APP_NAME, "version": "0.2.3"},
+            "serverInfo": {"name": "minion", "title": APP_NAME, "version": "0.2.4"},
             "instructions": instructions,
         },
     )

@@ -72,7 +72,7 @@ npm install
 npm run tauri dev
 ```
 
-`npm run tauri build` produces `Minion.app` and a `.dmg` under `desktop/src-tauri/target/release/bundle/`.
+`npm run tauri build` produces `Minion.app` and a `.dmg` under `desktop/src-tauri/target/release/bundle/`. Shipped builds append shell and Python traces to **`<data_dir>/logs/`** (`minion-desktop.log`, `sidecar.log`); **Settings** lists them and can reveal that folder in Finder.
 
 Without the app, drop files into `data/inbox/`. The watcher inside `minion mcp` reconciles on startup and then live-watches. CRUD commands: `minion add`, `minion ls`, `minion rm`, `minion watch`.
 
