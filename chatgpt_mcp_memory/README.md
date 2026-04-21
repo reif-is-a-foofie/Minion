@@ -46,8 +46,8 @@ Requirements are split so you only pull in what you need:
 
 | File | What it adds |
 | ---- | ------------ |
-| `requirements.txt` | core: numpy, fastembed, sqlite-vec, watchdog, ollama, tqdm |
-| `requirements-docs.txt` | +PDF / DOCX / HTML parsers |
+| `requirements.txt` | core + PDF / DOCX / HTML parsers (default install) |
+| `requirements-docs.txt` | alias of `requirements.txt` (backward compat) |
 | `requirements-images.txt` | +image OCR (rapidocr, pure Python) |
 | `requirements-audio.txt` | +faster-whisper transcription |
 | `requirements-code.txt` | +tree-sitter for code-aware chunking |
