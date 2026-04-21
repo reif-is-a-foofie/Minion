@@ -61,6 +61,49 @@
   // card so the window isn't a silent void while pip runs for ~2 minutes.
   let sidecar = $state<SidecarStatus | null>(null);
 
+  const BOOTSTRAP_TIPS = [
+    "Drop files here and I'll remember them for every agent you use.",
+    "First launch downloads the heavy stuff — embeddings, parsers, the works. It only happens once.",
+    "Your library lives on this machine; nothing ships to us when you search.",
+    "I fuse semantic search with keywords so good hits don't hide at rank six.",
+  ];
+
+  const BOOTSTRAP_STEP_LABELS = ["Say hello", "Python setup", "Install brains", "Wake server"];
+
+  function bootstrapInferStep(s: SidecarStatus): number {
+    if (typeof s.step === "number") return Math.max(0, Math.min(4, s.step));
+    switch (s.state) {
+      case "starting":
+        return 0;
+      case "bootstrapping":
+        return 1;
+      case "installing":
+        return 2;
+      case "launching":
+        return 3;
+      case "ready":
+        return 4;
+      default:
+        return 0;
+    }
+  }
+
+  function bootstrapBarPct(s: SidecarStatus | null): number {
+    if (!s || s.state === "error") return 6;
+    const st = bootstrapInferStep(s);
+    const m: Record<number, number> = { 0: 18, 1: 42, 2: 72, 3: 92, 4: 100 };
+    return m[st] ?? 18;
+  }
+
+  let bootstrapTipIx = $state(0);
+
+  $effect(() => {
+    if (!sidecar || sidecar.state === "ready" || sidecar.state === "error") return;
+    const id = setInterval(() => {
+      bootstrapTipIx = (bootstrapTipIx + 1) % BOOTSTRAP_TIPS.length;
+    }, 4200);
+    return () => clearInterval(id);
+  });
 
   // If we stop hearing from the sidecar for >12s, assume it's wedged even
   // if the socket is nominally "open" -- the UI should flag it.
@@ -897,28 +940,45 @@
     <div class="bootstrap-overlay" class:error={sidecar.state === "error"}>
       <div class="bootstrap-card">
         <img src="/minion.png" alt="" class="bootstrap-icon" />
+        <div class="bootstrap-hello">Hello, Minion</div>
         <div class="bootstrap-title">
           {#if sidecar.state === "error"}
-            Minion can't start
-          {:else if sidecar.state === "installing"}
-            Setting up Minion
-          {:else if sidecar.state === "bootstrapping"}
-            Creating environment
+            Can't start yet
           {:else}
-            Starting
+            Getting your memory online…
           {/if}
         </div>
         {#if sidecar.state !== "error"}
           <p class="bootstrap-tagline">
-            Hey — I'm Minion. I'm getting ready so I can remember the files you drop here.
+            {BOOTSTRAP_TIPS[bootstrapTipIx % BOOTSTRAP_TIPS.length]}
           </p>
+          {@const curStep = Math.min(bootstrapInferStep(sidecar), 3)}
+          <div class="bootstrap-steps" aria-label="Setup progress">
+            {#each BOOTSTRAP_STEP_LABELS as label, i}
+              <span class="bootstrap-step" class:done={curStep > i} class:current={curStep === i}>
+                {label}
+              </span>
+            {/each}
+          </div>
+          <div class="bootstrap-progress-wrap" aria-hidden="true">
+            <div
+              class="bootstrap-progress-fill"
+              style={`width: ${bootstrapBarPct(sidecar)}%`}
+            ></div>
+            {#if sidecar.state === "installing"}
+              <div class="bootstrap-progress-indeterminate"></div>
+            {/if}
+          </div>
+          <div class="bootstrap-pct-row">
+            <span class="bootstrap-pct">{bootstrapBarPct(sidecar)}%</span>
+            <span class="bootstrap-hint-inline">First launch only — then you're fast forever.</span>
+          </div>
         {/if}
         <div class="bootstrap-msg">
           {sidecar.message ?? "Working…"}
         </div>
         {#if sidecar.state !== "error"}
           <div class="bootstrap-spinner"></div>
-          <div class="bootstrap-hint">First launch only — this won't happen again.</div>
         {:else}
           <button class="ghost" onclick={() => (sidecar = null)}>Dismiss</button>
         {/if}
@@ -1422,9 +1482,17 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     padding: 28px 32px;
-    max-width: 440px;
+    max-width: 480px;
     text-align: center;
     box-shadow: var(--shadow-m);
+  }
+  .bootstrap-hello {
+    font-family: "DM Serif Display", "DM Sans", var(--ui-font);
+    font-size: 1.75rem;
+    font-weight: 400;
+    color: var(--ink);
+    margin: 0 0 4px;
+    letter-spacing: 0.02em;
   }
   .bootstrap-icon {
     width: 96px;
@@ -1438,39 +1506,151 @@
   }
   .bootstrap-title {
     font-family: var(--ui-font);
-    font-size: 16px;
+    font-size: 15px;
     font-weight: 600;
     color: var(--ink);
-    margin-bottom: 8px;
+    margin-bottom: 10px;
   }
   .bootstrap-tagline {
-    margin: 0 0 12px;
+    margin: 0 0 16px;
+    min-height: 2.8em;
     font-family: var(--ui-font);
     font-size: 13px;
-    line-height: 1.45;
+    line-height: 1.5;
     color: var(--muted);
+    transition: opacity 0.25s ease;
+  }
+  .bootstrap-steps {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 6px 8px;
+    margin: 0 0 16px;
+  }
+  .bootstrap-step {
+    font-family: var(--ui-font);
+    font-size: 10.5px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 4px 9px;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--border) 85%, transparent);
+    color: var(--ink-dim);
+    opacity: 0.55;
+    transition:
+      opacity 0.25s ease,
+      border-color 0.25s ease,
+      background 0.25s ease,
+      color 0.25s ease;
+  }
+  .bootstrap-step.done {
+    opacity: 1;
+    border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--accent);
+  }
+  .bootstrap-step.done::after {
+    content: " ✓";
+    font-size: 0.85em;
+  }
+  .bootstrap-step.current {
+    opacity: 1;
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    color: var(--ink);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
+    animation: steppulse 2s ease-in-out infinite;
+  }
+  @keyframes steppulse {
+    0%,
+    100% {
+      box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
+    }
+    50% {
+      box-shadow: 0 0 12px color-mix(in srgb, var(--accent) 25%, transparent);
+    }
+  }
+  .bootstrap-progress-wrap {
+    position: relative;
+    height: 10px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--border) 55%, var(--panel));
+    overflow: hidden;
+    margin-bottom: 8px;
+  }
+  .bootstrap-progress-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--accent) 88%, #fff),
+      var(--accent)
+    );
+    transition: width 0.55s cubic-bezier(0.33, 1, 0.68, 1);
+  }
+  .bootstrap-progress-indeterminate {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      color-mix(in srgb, #fff 35%, transparent),
+      transparent
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.4s ease-in-out infinite;
+    mix-blend-mode: overlay;
+    pointer-events: none;
+  }
+  @keyframes shimmer {
+    0% {
+      background-position: 200% 0;
+    }
+    100% {
+      background-position: -200% 0;
+    }
+  }
+  .bootstrap-pct-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+  }
+  .bootstrap-pct {
+    font-family: var(--ui-font);
+    font-size: 13px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--accent);
+  }
+  .bootstrap-hint-inline {
+    font-family: var(--ui-font);
+    font-size: 11px;
+    color: var(--ink-faint, var(--ink-dim));
+    opacity: 0.8;
+    text-align: right;
+    flex: 1;
+    min-width: 140px;
   }
   .bootstrap-msg {
     font-family: var(--ui-font);
-    font-size: 13px;
+    font-size: 12.5px;
     color: var(--ink-dim);
-    margin-bottom: 16px;
+    margin-bottom: 14px;
     white-space: pre-wrap;
+    line-height: 1.45;
   }
   .bootstrap-spinner {
-    width: 28px;
-    height: 28px;
-    margin: 0 auto 14px;
+    width: 26px;
+    height: 26px;
+    margin: 0 auto;
     border: 3px solid color-mix(in srgb, var(--accent) 20%, transparent);
     border-top-color: var(--accent);
     border-radius: 50%;
     animation: spin 900ms linear infinite;
-  }
-  .bootstrap-hint {
-    font-family: var(--ui-font);
-    font-size: 11.5px;
-    color: var(--ink-faint, var(--ink-dim));
-    opacity: 0.75;
   }
   .bootstrap-overlay.error .bootstrap-card {
     border-color: color-mix(in srgb, var(--danger) 40%, var(--border));

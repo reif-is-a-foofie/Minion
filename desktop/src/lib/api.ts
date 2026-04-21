@@ -6,7 +6,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 export type SidecarStatus = {
-  state: "starting" | "bootstrapping" | "installing" | "ready" | "error";
+  state:
+    | "starting"
+    | "bootstrapping"
+    | "installing"
+    | "launching"
+    | "ready"
+    | "error";
+  /** 0 locate → 1 Python/venv → 2 pip → 3 launch API → 4 ready (Rust may omit on old builds). */
+  step?: number;
   message?: string;
 };
 

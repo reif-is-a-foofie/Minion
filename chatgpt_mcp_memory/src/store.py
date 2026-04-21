@@ -39,6 +39,11 @@ except Exception:  # pragma: no cover - import guarded so docs-only installs sti
 DEFAULT_EMBED_DIM = 384
 DB_FILENAME = "memory.db"
 
+# Watcher thread + HTTP handlers + copy-into-inbox can write concurrently; without
+# a busy handler, SQLite returns "database is locked" immediately under WAL.
+_SQLITE_LOCK_WAIT_S = 60.0
+_SQLITE_BUSY_MS = int(_SQLITE_LOCK_WAIT_S * 1000)
+
 
 # ---------------------------------------------------------------------------
 # Dataclasses (mirror table rows, used in DAO signatures and return values)
@@ -209,11 +214,12 @@ def connect(db_path: Path, *, embed_dim: int = DEFAULT_EMBED_DIM) -> sqlite3.Con
     db_path = Path(db_path).expanduser().resolve()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), timeout=_SQLITE_LOCK_WAIT_S)
     conn.row_factory = sqlite3.Row
     _load_vec_extension(conn)
 
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_MS}")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA synchronous=NORMAL")
 

@@ -1,6 +1,6 @@
 {
   "name": "minion-desktop",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Tauri desktop for Minion: bundled sidecar, first-run venv, drop ingest, Settings + Claude MCP connect (MINION_DATA_DIR, MINION_INBOX).",
   "type": "module",
   "scripts": {

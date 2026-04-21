@@ -522,6 +522,23 @@ fn resolve_bundled_uv(app: &AppHandle) -> Option<PathBuf> {
     None
 }
 
+/// Bootstrap overlay steps for the UI: 0 locate, 1 Python/venv, 2 pip, 3 launch API, 4 ready.
+fn emit_sidecar_status(app: &AppHandle, state: &str, message: Option<&str>, step: u8) {
+    let val = if let Some(m) = message {
+        serde_json::json!({"state": state, "message": m, "step": step})
+    } else {
+        serde_json::json!({"state": state, "step": step})
+    };
+    let _ = app.emit("sidecar://status", val);
+}
+
+fn emit_sidecar_error(app: &AppHandle, message: &str) {
+    let _ = app.emit(
+        "sidecar://status",
+        serde_json::json!({"state": "error", "message": message}),
+    );
+}
+
 /// Download CPython via `uv python install` and create `venv/` — used when
 /// `python3` is not on PATH (typical for GUI apps started outside a shell).
 fn bootstrap_venv_with_managed_uv(
@@ -529,12 +546,6 @@ fn bootstrap_venv_with_managed_uv(
     data_dir: &Path,
     uv: &Path,
 ) -> Result<(), String> {
-    let emit = |stage: &str, message: &str| {
-        let _ = app.emit(
-            "sidecar://status",
-            serde_json::json!({"state": stage, "message": message}),
-        );
-    };
     let install_dir = managed_python_install_dir(data_dir);
     let _ = fs::create_dir_all(&install_dir);
 
@@ -542,9 +553,11 @@ fn bootstrap_venv_with_managed_uv(
         "INFO",
         "no system Python on PATH; installing CPython with bundled uv",
     );
-    emit(
+    emit_sidecar_status(
+        app,
         "bootstrapping",
-        "Downloading Python (bundled installer — needs network, first launch only)…",
+        Some("Downloading Python (bundled installer — needs network, first launch only)…"),
+        1,
     );
 
     let mut cmd_install = Command::new(uv);
@@ -554,7 +567,7 @@ fn bootstrap_venv_with_managed_uv(
     forward_proxy_env(&mut cmd_install);
     let st = cmd_install.status().map_err(|e| {
         let msg = format!("uv python install failed to start: {e}");
-        emit("error", &msg);
+        emit_sidecar_error(app, &msg);
         msg
     })?;
     if !st.success() {
@@ -562,7 +575,7 @@ fn bootstrap_venv_with_managed_uv(
             "Downloading Python failed (uv exit {}). Check network or set HTTP_PROXY; see logs.",
             st.code().unwrap_or(-1)
         );
-        emit("error", &msg);
+        emit_sidecar_error(app, &msg);
         return Err(msg);
     }
 
@@ -571,7 +584,12 @@ fn bootstrap_venv_with_managed_uv(
         let _ = fs::remove_dir_all(&venv_dir);
     }
 
-    emit("bootstrapping", "Creating virtual environment…");
+    emit_sidecar_status(
+        app,
+        "bootstrapping",
+        Some("Creating virtual environment…"),
+        1,
+    );
     let mut cmd_venv = Command::new(uv);
     cmd_venv
         .args([
@@ -585,7 +603,7 @@ fn bootstrap_venv_with_managed_uv(
     forward_proxy_env(&mut cmd_venv);
     let st2 = cmd_venv.status().map_err(|e| {
         let msg = format!("uv venv failed to start: {e}");
-        emit("error", &msg);
+        emit_sidecar_error(app, &msg);
         msg
     })?;
     if !st2.success() {
@@ -593,7 +611,7 @@ fn bootstrap_venv_with_managed_uv(
             "venv creation failed (uv exit {}).",
             st2.code().unwrap_or(-1)
         );
-        emit("error", &msg);
+        emit_sidecar_error(app, &msg);
         return Err(msg);
     }
 
@@ -624,11 +642,8 @@ fn bootstrap_venv_impl(
 ) -> Result<PathBuf, String> {
     let py = venv_python(data_dir);
     let venv_dir = data_dir.join("venv");
-    let emit = |stage: &str, message: &str| {
-        let _ = app.emit(
-            "sidecar://status",
-            serde_json::json!({"state": stage, "message": message}),
-        );
+    let emit = |stage: &str, message: &str, step: u8| {
+        emit_sidecar_status(app, stage, Some(message), step);
     };
 
     // Already bootstrapped AND core deps importable? Fast-path return.
@@ -647,13 +662,14 @@ fn bootstrap_venv_impl(
         emit(
             "bootstrapping",
             "Repairing Python environment (pip was missing)…",
+            1,
         );
         fs::remove_dir_all(&venv_dir).map_err(|e| {
             let msg = format!(
                 "Could not remove incomplete venv at {}: {e}",
                 venv_dir.display()
             );
-            emit("error", &msg);
+            emit_sidecar_error(app, &msg);
             shell_log("ERROR", &msg);
             msg
         })?;
@@ -672,7 +688,7 @@ fn bootstrap_venv_impl(
                 serde_json::json!({"system_python": system_py, "version": ver}),
             );
             if !py.exists() {
-                emit("bootstrapping", "Creating Python environment…");
+                emit("bootstrapping", "Creating Python environment…", 1);
                 let status = Command::new(&system_py)
                     .arg("-m")
                     .arg("venv")
@@ -680,13 +696,13 @@ fn bootstrap_venv_impl(
                     .status()
                     .map_err(|e| {
                         let msg = format!("venv launch failed: {e}");
-                        emit("error", &msg);
+                        emit_sidecar_error(app, &msg);
                         msg
                     })?;
                 if !status.success() {
                     let msg =
                         format!("venv creation failed (exit {})", status.code().unwrap_or(-1));
-                    emit("error", &msg);
+                    emit_sidecar_error(app, &msg);
                     dbg("bootstrap", serde_json::json!({"state": "venv_failed"}));
                     return Err(msg);
                 }
@@ -713,7 +729,7 @@ fn bootstrap_venv_impl(
             dbg("bootstrap", serde_json::json!({"state": "no_system_python"}));
             let uv = resolve_bundled_uv(app).ok_or_else(|| {
                 let msg = "Python was not found and the bundled installer (uv) is missing from this app. Reinstall Minion, or install Python 3.10+ from python.org and relaunch.".to_string();
-                emit("error", &msg);
+                emit_sidecar_error(app, &msg);
                 msg
             })?;
             bootstrap_venv_with_managed_uv(app, data_dir, &uv)?;
@@ -725,13 +741,14 @@ fn bootstrap_venv_impl(
             "venv Python missing at {} after setup — try deleting the venv folder and relaunch.",
             py.display()
         );
-        emit("error", &msg);
+        emit_sidecar_error(app, &msg);
         return Err(msg);
     }
 
     emit(
         "installing",
         "Installing dependencies (first launch, ~2 min; needs network)…",
+        2,
     );
     dbg("bootstrap", serde_json::json!({"state": "pip_start", "requirements": requirements}));
     let pip_out = Command::new(&py)
@@ -746,7 +763,7 @@ fn bootstrap_venv_impl(
         .output()
         .map_err(|e| {
             let msg = format!("pip launch failed: {e}");
-            emit("error", &msg);
+            emit_sidecar_error(app, &msg);
             shell_log("ERROR", &msg);
             msg
         })?;
@@ -778,13 +795,13 @@ fn bootstrap_venv_impl(
                 "WARN",
                 "pip missing during bootstrap; removing venv and retrying setup once…",
             );
-            emit("bootstrapping", "Repairing Python environment…");
+            emit("bootstrapping", "Repairing Python environment…", 1);
             fs::remove_dir_all(&venv_dir).map_err(|e| {
                 let msg = format!(
                     "Could not remove broken venv at {}: {e}",
                     venv_dir.display()
                 );
-                emit("error", &msg);
+                emit_sidecar_error(app, &msg);
                 shell_log("ERROR", &msg);
                 msg
             })?;
@@ -810,7 +827,7 @@ fn bootstrap_venv_impl(
             ssl_hint,
             tail
         );
-        emit("error", &msg);
+        emit_sidecar_error(app, &msg);
         dbg("bootstrap", serde_json::json!({"state": "pip_failed"}));
         return Err(msg);
     }
@@ -1804,31 +1821,24 @@ pub fn run() {
                     }
                     if Instant::now() >= deadline {
                         dbg("setup", serde_json::json!({"state": "no_state_timeout"}));
-                        let _ = handle.emit(
-                            "sidecar://status",
-                            serde_json::json!({
-                                "state": "error",
-                                "message": "Startup timed out — quit Minion completely and reopen.",
-                            }),
+                        emit_sidecar_error(
+                            &handle,
+                            "Startup timed out — quit Minion completely and reopen.",
                         );
                         return;
                     }
                     thread::sleep(Duration::from_millis(50));
                 };
-                let _ = handle.emit(
-                    "sidecar://status",
-                    serde_json::json!({"state": "starting", "message": "Locating sidecar…"}),
+                emit_sidecar_status(
+                    &handle,
+                    "starting",
+                    Some("Say hello — I'm locating Minion's brain…"),
+                    0,
                 );
                 let src_dir = match resolve_sidecar_src_dir(&handle) {
                     Some(d) => d,
                     None => {
-                        let _ = handle.emit(
-                            "sidecar://status",
-                            serde_json::json!({
-                                "state": "error",
-                                "message": "Could not locate Minion sidecar. Reinstall the app.",
-                            }),
-                        );
+                        emit_sidecar_error(&handle, "Could not locate Minion sidecar. Reinstall the app.");
                         return;
                     }
                 };
@@ -1839,12 +1849,9 @@ pub fn run() {
                 let requirements = match resolve_sidecar_requirements(&handle, &src_dir) {
                     Some(r) => r,
                     None => {
-                        let _ = handle.emit(
-                            "sidecar://status",
-                            serde_json::json!({
-                                "state": "error",
-                                "message": "Bundled requirements.txt missing. Reinstall the app.",
-                            }),
+                        emit_sidecar_error(
+                            &handle,
+                            "Bundled requirements.txt missing. Reinstall the app.",
                         );
                         return;
                     }
@@ -1854,10 +1861,7 @@ pub fn run() {
                     Ok(p) => p,
                     Err(e) => {
                         dbg("setup", serde_json::json!({"state": "bootstrap_err", "error": &e}));
-                        let _ = handle.emit(
-                            "sidecar://status",
-                            serde_json::json!({ "state": "error", "message": e }),
-                        );
+                        emit_sidecar_error(&handle, &e);
                         return;
                     }
                 };
@@ -1865,26 +1869,26 @@ pub fn run() {
                     *g = Some(python.clone());
                 }
 
+                emit_sidecar_status(
+                    &handle,
+                    "launching",
+                    Some("Almost there — waking up the memory server…"),
+                    3,
+                );
                 let child =
                     spawn_sidecar(&python, &src_dir, &data_dir_bg, &inbox_bg, port_bg, vm_bg.as_deref());
                 if let Some(c) = child {
                     if let Ok(mut g) = state.sidecar.lock() {
                         *g = Some(c);
                     }
-                    let _ = handle.emit(
-                        "sidecar://status",
-                        serde_json::json!({"state": "ready"}),
-                    );
+                    emit_sidecar_status(&handle, "ready", None, 4);
                 } else {
-                    let _ = handle.emit(
-                        "sidecar://status",
-                        serde_json::json!({
-                            "state": "error",
-                            "message": format!(
-                                "Sidecar failed to start. See {}/ for sidecar.log and minion-desktop.log (Settings → File logs), or relaunch.",
-                                logs_dir(&data_dir_bg).display()
-                            ),
-                        }),
+                    emit_sidecar_error(
+                        &handle,
+                        &format!(
+                            "Sidecar failed to start. See {}/ for sidecar.log and minion-desktop.log (Settings → File logs), or relaunch.",
+                            logs_dir(&data_dir_bg).display()
+                        ),
                     );
                 }
             });
