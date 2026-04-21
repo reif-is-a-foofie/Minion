@@ -107,6 +107,36 @@ and relaunch to retry a half-finished install.
 CI runs the same dependency set from an empty venv on every push (see
 `.github/workflows/virgin-python.yml`).
 
+### Testing a fresh sidecar (“new instance”)
+
+There are three levels; pick what matches how deep you want to go:
+
+1. **Python stack only (closest to first-launch `pip`)** — from repo root:
+
+   ```bash
+   ./desktop/scripts/smoke_sidecar_fresh_venv.sh
+   ```
+
+   Builds a **throwaway venv**, installs `chatgpt_mcp_memory/requirements.txt`, starts `api.py` on port **18765** (override with `MINION_SMOKE_PORT`), then polls `GET /status` until it succeeds or times out (~90s after pip). Exits 0 if the sidecar answers HTTP.
+
+2. **Same interpreter + pytest** — CI runs `pytest chatgpt_mcp_memory/tests/test_api_smoke.py` after a virgin venv install (`virgin-python.yml`). Locally: create a temp venv, `pip install -r chatgpt_mcp_memory/requirements.txt`, then run that file with dev deps (`httpx`, `websockets`, `pytest`).
+
+3. **Full Tauri + Rust bootstrap** — simulates a new machine **data directory** without wiping your real index:
+
+   ```bash
+   export MINION_DATA_DIR="$(mktemp -d)"
+   mkdir -p "$MINION_DATA_DIR/inbox"
+   cd desktop && npm install && npm run tauri dev
+   ```
+
+   Watch for the first-run overlay (venv/pip), then header **ready** and **Contents** loading. In another terminal:
+
+   ```bash
+   curl -sf http://127.0.0.1:8765/status | jq .
+   ```
+
+   Failures: **`$MINION_DATA_DIR/logs/pip-bootstrap.log`**, **`sidecar.log`**, **`minion-desktop.log`** (same paths shown under **Settings → File logs** in release builds).
+
 ## Connect any MCP client
 
 The **Connect** control merges Minion into
