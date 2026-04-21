@@ -602,6 +602,7 @@
   {#if sidecar && sidecar.state !== "ready"}
     <div class="bootstrap-overlay" class:error={sidecar.state === "error"}>
       <div class="bootstrap-card">
+        <img src="/minion.png" alt="" class="bootstrap-icon" />
         <div class="bootstrap-title">
           {#if sidecar.state === "error"}
             Minion can't start
@@ -613,6 +614,11 @@
             Starting
           {/if}
         </div>
+        {#if sidecar.state !== "error"}
+          <p class="bootstrap-tagline">
+            Hey — I'm Minion. I'm getting ready so I can remember the files you drop here.
+          </p>
+        {/if}
         <div class="bootstrap-msg">
           {sidecar.message ?? "Working…"}
         </div>
@@ -627,6 +633,7 @@
   {/if}
 
   <section class="drop" class:active={dragging} role="button" tabindex="0" onclick={browseForFiles} onkeydown={(e) => e.key === "Enter" && browseForFiles()}>
+    <img src="/minion.png" alt="" class="drop-watcher" aria-hidden="true" />
     <div class="drop-brackets">
       <span class="bracket">[</span>
       <div class="drop-body">
@@ -684,6 +691,7 @@
   <div class="modal-overlay" role="button" tabindex="-1" onclick={() => (showSettings = false)} onkeydown={(e) => e.key === "Escape" && (showSettings = false)}>
     <div class="modal" role="dialog" tabindex="-1" aria-modal="true" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
       <header class="modal-head">
+        <img src="/minion.png" alt="" class="modal-avatar" aria-hidden="true" />
         <h2>Settings</h2>
         <div class="modal-meta">server · claude desktop · file types</div>
         <button class="ghost" onclick={() => (showSettings = false)}>Close</button>
@@ -775,6 +783,7 @@
   <div class="modal-overlay" role="button" tabindex="-1" onclick={() => (showContents = false)} onkeydown={(e) => e.key === "Escape" && (showContents = false)}>
     <div class="modal" role="dialog" tabindex="-1" aria-modal="true" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
       <header class="modal-head">
+        <img src="/minion.png" alt="" class="modal-avatar" aria-hidden="true" />
         <h2>Contents</h2>
         <div class="modal-meta">
           {sources.length} source{sources.length === 1 ? "" : "s"}
@@ -846,38 +855,39 @@
 
 <style>
   :global(:root) {
-    /* Brand system: warm paper ground, teal identity, serif display for
-     * moments of presence. This app holds memories — it should feel like a
-     * quiet friend, not a corporate dashboard. */
-    --bg:            #f5f2ec;  /* site background */
+    /* Brand system: Minion's palette — soft sky-blue fluff, deep navy core,
+     * cool paper ground. Keeps the "quiet friend" feel from before, just
+     * wearing the Minion's own fur instead of borrowed teal. */
+    --bg:            #f3f6fb;  /* cool cream, faint blue undertone */
     --panel:         #ffffff;
-    --panel-2:       #efeae1;
-    --panel-3:       #e7e1d4;
-    --border:        #e1dbcd;
-    --border-strong: #cfc7b3;
-    --ink:           #26221d;  /* site text — warm graphite */
-    --ink-2:         #3d382f;
-    --heading:       #1a1a1a;  /* pitch headings */
+    --panel-2:       #eaf2fa;
+    --panel-3:       #dbe7f2;
+    --border:        #d5e0ec;
+    --border-strong: #a9bdd0;
+    --ink:           #102238;  /* deep navy — Minion's core */
+    --ink-2:         #1d3854;
+    --heading:       #0a1628;  /* pupil black */
     --text: var(--ink);
-    --muted:         #807a6c;
-    --dim:           #b4ac9c;
-    --accent:        #087074;  /* site primary teal */
-    --accent-2:      #1b7a70;  /* pitch primary teal (hover/focus) */
-    --accent-soft:   #cfe5e3;
-    --glow:          #4ea9a2;  /* halo / status pulse */
-    --success:       #0f8a5f;
-    --saved:         #7a4fc8;
-    --progress:      #2b60d6;
-    --warn:          #b45309;
-    --danger:        #b91c1c;
+    --muted:         #6f819a;
+    --ink-dim:       #4a5d73;
+    --dim:           #a6b5c5;
+    --accent:        #2a7fbf;  /* mid fluff blue — primary */
+    --accent-2:      #1d6ab0;  /* deep fluff — hover/focus */
+    --accent-soft:   #d3e5f4;
+    --glow:          #5ca8d6;  /* fluff highlight — halo/pulse */
+    --success:       #15886e;
+    --saved:         #6c5bd6;
+    --progress:      #2a7fbf;
+    --warn:          #c27a17;
+    --danger:        #c8352c;
     --ok: var(--success);
     --radius-sm: 6px;
     --radius:    10px;
     --radius-lg: 14px;
-    --shadow-s: 0 1px 2px rgba(38, 34, 29, 0.05), 0 2px 6px rgba(38, 34, 29, 0.04);
-    --shadow-m: 0 2px 10px rgba(38, 34, 29, 0.07), 0 18px 48px -16px rgba(38, 34, 29, 0.14);
+    --shadow-s: 0 1px 2px rgba(16, 34, 56, 0.05), 0 2px 6px rgba(16, 34, 56, 0.04);
+    --shadow-m: 0 2px 10px rgba(16, 34, 56, 0.07), 0 18px 48px -16px rgba(16, 34, 56, 0.16);
     --shadow-glow: 0 0 0 0.5px color-mix(in srgb, var(--accent) 30%, transparent),
-                   0 6px 24px -8px color-mix(in srgb, var(--accent) 40%, transparent);
+                   0 6px 24px -8px color-mix(in srgb, var(--accent) 45%, transparent);
     --ui-font:      "DM Sans", "Inter", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
     --display-font: "DM Serif Display", "Nanum Myeongjo", Georgia, serif;
     --serif-font:   "Nanum Myeongjo", "DM Serif Display", Georgia, serif;
@@ -946,33 +956,27 @@
     color: var(--heading);
     line-height: 1;
   }
-  /* A small, living orb: teal core + soft halo that breathes. This is the
-   * "presence" — quiet signal that something is listening. */
-  .dot {
-    display: inline-block;
-    width: 12px;
-    height: 12px;
-    border-radius: 50%;
-    background: radial-gradient(circle at 35% 30%,
-      color-mix(in srgb, var(--accent) 40%, #fff) 0%,
-      var(--accent) 60%,
-      var(--accent-2) 100%);
-    box-shadow:
-      0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent),
-      0 0 14px 2px color-mix(in srgb, var(--accent) 30%, transparent);
-    animation: presence 3.6s ease-in-out infinite;
+  /* The Minion: a fuzzy blue observer. Wears a soft halo that breathes so
+   * you can feel it watching even when idle. */
+  .brand-icon {
+    width: 34px;
+    height: 34px;
+    object-fit: contain;
     flex-shrink: 0;
+    filter: drop-shadow(0 1px 2px rgba(16, 34, 56, 0.18))
+            drop-shadow(0 0 6px color-mix(in srgb, var(--accent) 28%, transparent));
+    animation: presence 3.6s ease-in-out infinite;
   }
+  /* Aura hugs the Minion's silhouette, not a bounding box — so it works with
+   * the transparent-bg cut-out. Gently breathes between a soft and strong halo. */
   @keyframes presence {
     0%, 100% {
-      box-shadow:
-        0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent),
-        0 0 14px 2px color-mix(in srgb, var(--accent) 30%, transparent);
+      filter: drop-shadow(0 1px 2px rgba(16, 34, 56, 0.18))
+              drop-shadow(0 0 6px color-mix(in srgb, var(--accent) 28%, transparent));
     }
     50% {
-      box-shadow:
-        0 0 0 5px color-mix(in srgb, var(--accent) 10%, transparent),
-        0 0 22px 4px color-mix(in srgb, var(--accent) 45%, transparent);
+      filter: drop-shadow(0 2px 4px rgba(16, 34, 56, 0.22))
+              drop-shadow(0 0 12px color-mix(in srgb, var(--accent) 50%, transparent));
     }
   }
   .counts {
@@ -1057,12 +1061,29 @@
     text-align: center;
     box-shadow: var(--shadow-m);
   }
+  .bootstrap-icon {
+    width: 96px;
+    height: 96px;
+    object-fit: contain;
+    margin: 0 auto 14px;
+    display: block;
+    filter: drop-shadow(0 4px 10px rgba(16, 34, 56, 0.18))
+            drop-shadow(0 0 14px color-mix(in srgb, var(--accent) 35%, transparent));
+    animation: presence 3.6s ease-in-out infinite;
+  }
   .bootstrap-title {
     font-family: var(--ui-font);
     font-size: 16px;
     font-weight: 600;
     color: var(--ink);
     margin-bottom: 8px;
+  }
+  .bootstrap-tagline {
+    margin: 0 0 12px;
+    font-family: var(--ui-font);
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--muted);
   }
   .bootstrap-msg {
     font-family: var(--ui-font);
@@ -1235,6 +1256,38 @@
     color: var(--muted);
   }
   .drop-sub .divider { margin: 0 8px; color: var(--dim); }
+
+  /* Minion peeking from the drop zone's corner. Low-key when idle, alert
+   * when the user drags a file toward him. */
+  .drop-watcher {
+    position: absolute;
+    right: 22px;
+    bottom: 8px;
+    width: 96px;
+    height: 96px;
+    object-fit: contain;
+    opacity: 0.55;
+    transform: rotate(-8deg);
+    transition: opacity 240ms ease, transform 240ms ease, filter 240ms ease;
+    pointer-events: none;
+    user-select: none;
+    z-index: 0;
+    filter: drop-shadow(0 4px 10px rgba(16, 34, 56, 0.22))
+            drop-shadow(0 0 10px color-mix(in srgb, var(--accent) 25%, transparent));
+  }
+  .drop:hover .drop-watcher {
+    opacity: 0.85;
+    transform: rotate(-4deg) translateY(-4px);
+    filter: drop-shadow(0 6px 14px rgba(16, 34, 56, 0.28))
+            drop-shadow(0 0 16px color-mix(in srgb, var(--accent) 40%, transparent));
+  }
+  .drop.active .drop-watcher,
+  .app.dragging .drop-watcher {
+    opacity: 1;
+    transform: rotate(0deg) translateY(-10px) scale(1.1);
+    filter: drop-shadow(0 8px 18px rgba(16, 34, 56, 0.32))
+            drop-shadow(0 0 22px color-mix(in srgb, var(--accent) 55%, transparent));
+  }
 
   /* Terminal: a warm scrolling log. One line per event. */
   .term {
@@ -1430,6 +1483,14 @@
     color: var(--heading);
     text-transform: none;
     line-height: 1;
+  }
+  .modal-avatar {
+    width: 30px;
+    height: 30px;
+    object-fit: contain;
+    flex-shrink: 0;
+    filter: drop-shadow(0 1px 2px rgba(16, 34, 56, 0.15))
+            drop-shadow(0 0 5px color-mix(in srgb, var(--accent) 22%, transparent));
   }
   .modal-meta {
     flex: 1;

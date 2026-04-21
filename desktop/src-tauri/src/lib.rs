@@ -330,6 +330,100 @@ fn venv_has_core(py: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// PIDs of every `api.py` sidecar process belonging to this user, regardless
+/// of which app instance spawned it. Used by `restart_sidecar` so a Restart
+/// click reliably clears orphans from prior dev runs, translocated copies,
+/// or crashed parents — not just the child we happen to hold a handle to.
+///
+/// We match on a stable cmdline fragment (`api.py --port <port>`) rather
+/// than port-listener lookup alone, because a sidecar still booting hasn't
+/// bound the port yet but is already stealing it.
+fn find_sidecar_pids(api_port: u16) -> Vec<u32> {
+    // `ps -axo pid=,command=` is posix-portable and avoids the brittle
+    // parsing of lsof. `-a` includes other users' terminals (harmless; we
+    // kill only matching PIDs). `-x` includes detached processes.
+    let out = match Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&out);
+    let needle_port = format!("--port {api_port}");
+    let mut pids = Vec::new();
+    for line in text.lines() {
+        // Only Minion's sidecar: api.py invoked with our port. Prevents
+        // collateral damage to any unrelated python process a user might
+        // be running.
+        if !(line.contains("api.py") && line.contains(&needle_port)) {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if let Some((pid_str, _)) = trimmed.split_once(char::is_whitespace) {
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                pids.push(pid);
+            }
+        }
+    }
+    pids
+}
+
+/// PIDs of any process currently LISTENING on `api_port`. This catches
+/// cases where the listener isn't one of our api.py sidecars (e.g. a dev
+/// run pointed at the same port, or a previous app version). Belt-and-
+/// suspenders with `find_sidecar_pids`.
+fn find_port_listeners(api_port: u16) -> Vec<u32> {
+    let out = match Command::new("lsof")
+        .args([
+            "-nP",
+            "-iTCP",
+            &format!("-iTCP:{api_port}"),
+            "-sTCP:LISTEN",
+            "-t",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .collect()
+}
+
+/// Terminate a PID: SIGTERM first, then SIGKILL after a 500ms grace window
+/// if it's still alive. Safe on PIDs we don't own (kill returns non-zero,
+/// which we ignore). Best-effort.
+fn kill_pid_graceful(pid: u32) {
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // `kill -0` succeeds iff the process still exists. If so, force.
+    let still_alive = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if still_alive {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    }
+}
+
+/// Wait up to `timeout_ms` for nothing to be listening on `api_port`.
+/// Returns true once the port is free. Prevents the respawn from racing a
+/// slow-to-exit old listener.
+fn wait_for_port_free(api_port: u16, timeout_ms: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    while std::time::Instant::now() < deadline {
+        if find_port_listeners(api_port).is_empty() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    find_port_listeners(api_port).is_empty()
+}
+
 fn spawn_sidecar(
     python: &Path,
     src_dir: &Path,
@@ -754,22 +848,58 @@ fn copy_into_inbox(
     }))
 }
 
-/// Kill the running sidecar (if any) and respawn it with the same data_dir,
-/// inbox, and port. Returns the new PID. Used by the UI "Restart" action so
-/// users can recover from a hung sidecar or pick up code changes in dev.
+/// Kill every Minion sidecar belonging to this user and respawn one clean
+/// child. Returns the new PID plus a summary of what was swept.
+///
+/// This is deliberately more aggressive than "kill the child I spawned":
+/// the common broken state is a stray sidecar from a prior dev run, a
+/// translocated app copy, or a crashed parent that orphaned its child.
+/// The UI restart is the user's single escape hatch, so it has to be
+/// reliable. We sweep by two independent signals (cmdline match on
+/// `api.py --port <port>` + lsof listeners on that port), kill with
+/// SIGTERM→SIGKILL, then wait for the port to actually be free before
+/// respawning.
 #[tauri::command]
 fn restart_sidecar(state: tauri::State<AppState>) -> Result<serde_json::Value, String> {
-    let mut guard = state
-        .sidecar
-        .lock()
-        .map_err(|e| format!("sidecar lock poisoned: {e}"))?;
-    if let Some(mut child) = guard.take() {
-        let _ = child.kill();
-        let _ = child.wait();
+    let port = state.api_port;
+
+    // Drop the handle we hold so the parent no longer waits on it.
+    {
+        let mut guard = state
+            .sidecar
+            .lock()
+            .map_err(|e| format!("sidecar lock poisoned: {e}"))?;
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
-    // Small delay lets the OS release the TCP port before the new sidecar
-    // tries to bind. 200ms is enough in practice; we also retry-bind below.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Two-signal sweep: anything that looks like our sidecar by cmdline,
+    // plus anything currently listening on our port. Union both sets so
+    // we catch both the "booting but not listening yet" case and the
+    // "listening but not ours" case.
+    let mut victims: Vec<u32> = find_sidecar_pids(port);
+    for pid in find_port_listeners(port) {
+        if !victims.contains(&pid) {
+            victims.push(pid);
+        }
+    }
+    let swept = victims.len();
+    for pid in &victims {
+        kill_pid_graceful(*pid);
+    }
+
+    // Wait up to 3s for the port to actually be free. Binding before the
+    // OS releases it would make the new sidecar crash with "Address
+    // already in use" and the UI would stay in "reconnecting".
+    let port_free = wait_for_port_free(port, 3_000);
+    if !port_free {
+        return Err(format!(
+            "port {port} still held after killing {swept} process(es); refusing to respawn"
+        ));
+    }
+
     let current_model = state.vision_model.lock().ok().and_then(|g| g.clone());
     let python = state
         .sidecar_python
@@ -788,15 +918,22 @@ fn restart_sidecar(state: tauri::State<AppState>) -> Result<serde_json::Value, S
         &src_dir,
         &state.data_dir,
         &state.inbox,
-        state.api_port,
+        port,
         current_model.as_deref(),
     )
     .ok_or_else(|| "failed to respawn sidecar".to_string())?;
     let pid = new_child.id();
-    *guard = Some(new_child);
+    {
+        let mut guard = state
+            .sidecar
+            .lock()
+            .map_err(|e| format!("sidecar lock poisoned: {e}"))?;
+        *guard = Some(new_child);
+    }
     Ok(serde_json::json!({
         "pid": pid,
-        "api_port": state.api_port,
+        "api_port": port,
+        "swept": swept,
     }))
 }
 
@@ -948,22 +1085,44 @@ fn ensure_vision_model(
 #[tauri::command]
 fn reveal_in_finder(path: String) -> Result<(), String> {
     let p = PathBuf::from(&path);
-    let target = if p.is_file() {
-        p.parent().map(Path::to_path_buf).unwrap_or(p)
-    } else {
-        p
-    };
+    if !p.exists() {
+        return Err(format!("path does not exist: {}", p.display()));
+    }
     #[cfg(target_os = "macos")]
     {
-        Command::new("open").arg(target).spawn().map_err(|e| e.to_string())?;
+        // `open -R` selects the file in a Finder window; opening the parent
+        // alone only shows the folder with nothing highlighted.
+        if p.is_dir() {
+            Command::new("open").arg(&p).spawn().map_err(|e| e.to_string())?;
+        } else {
+            Command::new("open")
+                .arg("-R")
+                .arg(&p)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        }
     }
     #[cfg(target_os = "windows")]
     {
-        Command::new("explorer").arg(target).spawn().map_err(|e| e.to_string())?;
+        if p.is_dir() {
+            Command::new("explorer").arg(&p).spawn().map_err(|e| e.to_string())?;
+        } else {
+            // `/select,"path"` highlights the file in Explorer (quotes for spaces).
+            let arg = format!("/select,\"{}\"", p.display());
+            Command::new("explorer").arg(arg).spawn().map_err(|e| e.to_string())?;
+        }
     }
     #[cfg(target_os = "linux")]
     {
-        Command::new("xdg-open").arg(target).spawn().map_err(|e| e.to_string())?;
+        let target = if p.is_file() {
+            p.parent().map(Path::to_path_buf).unwrap_or(p)
+        } else {
+            p
+        };
+        Command::new("xdg-open")
+            .arg(target)
+            .spawn()
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
