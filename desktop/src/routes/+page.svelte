@@ -1086,34 +1086,46 @@
   }
 
   /* Per-kind badge. Uppercase mono pill colored by the type class. */
+  /* Kind tag: quiet colored letters with a leading dot. No pill, no
+   * background — the badge is the *color*, not a sticker. Keeps 30+ rows
+   * scannable without turning the log into a candy aisle. */
   .kind {
     flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
     font-family: var(--num-font);
-    font-size: 9.5px;
+    font-size: 10px;
     font-weight: 600;
-    letter-spacing: 0.04em;
-    padding: 1px 7px;
-    border-radius: 999px;
-    border: 1px solid currentColor;
-    line-height: 1.5;
+    letter-spacing: 0.06em;
+    line-height: 1.4;
+    padding: 0;
+    border: none;
+    background: none;
     text-transform: uppercase;
-    min-width: 3.25rem;
-    text-align: center;
-    opacity: 0.95;
+    min-width: 3.1rem;
   }
-  .kind-pdf  { color: #7c2d12; background: #fef3c7; border-color: #fbbf24; }
-  .kind-note { color: #166534; background: #dcfce7; border-color: #86efac; }
-  .kind-data { color: #0f766e; background: #ccfbf1; border-color: #5eead4; }
-  .kind-web  { color: #1e40af; background: #dbeafe; border-color: #93c5fd; }
-  .kind-code { color: #1e3a8a; background: #e0e7ff; border-color: #a5b4fc; }
-  .kind-img  { color: #9d174d; background: #fce7f3; border-color: #f9a8d4; } /* bubblegum */
-  .kind-aud  { color: #9a3412; background: #ffedd5; border-color: #fdba74; }
-  .kind-vid  { color: #991b1b; background: #fee2e2; border-color: #fca5a5; }
-  .kind-arc  { color: #713f12; background: #fef9c3; border-color: #fde047; }
-  .kind-dir  { color: #3730a3; background: #e0e7ff; border-color: #818cf8; }
-  .kind-sys  { color: #334155; background: #f1f5f9; border-color: #cbd5e1; }
-  .kind-vis  { color: #86198f; background: #fae8ff; border-color: #e9d5ff; }
-  .kind-dflt { color: var(--muted); background: var(--panel-3); border-color: var(--border-strong); }
+  .kind::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
+  }
+  .kind-pdf  { color: #b45309; }
+  .kind-note { color: #15803d; }
+  .kind-data { color: #0f766e; }
+  .kind-web  { color: #1d4ed8; }
+  .kind-code { color: #4338ca; }
+  .kind-img  { color: #be185d; }
+  .kind-aud  { color: #c2410c; }
+  .kind-vid  { color: #b91c1c; }
+  .kind-arc  { color: #a16207; }
+  .kind-dir  { color: #4f46e5; }
+  .kind-sys  { color: #64748b; }
+  .kind-vis  { color: #a21caf; }
+  .kind-dflt { color: var(--muted); }
 
   .fn { color: var(--ink); font-weight: 500; margin-right: 10px; }
   .msg { color: var(--muted); }
@@ -1314,14 +1326,14 @@
   }
 
   /* Modal-side kind aliases (backend emits these full words; reuse the
-   * terminal pill palette so the whole app speaks one visual vocabulary). */
-  .kind-image          { color: #9d174d; background: #fce7f3; border-color: #f9a8d4; }
-  .kind-audio          { color: #9a3412; background: #ffedd5; border-color: #fdba74; }
-  .kind-video          { color: #991b1b; background: #fee2e2; border-color: #fca5a5; }
-  .kind-html           { color: #1e40af; background: #dbeafe; border-color: #93c5fd; }
-  .kind-docx           { color: #1e3a8a; background: #e0e7ff; border-color: #a5b4fc; }
-  .kind-text           { color: #166534; background: #dcfce7; border-color: #86efac; }
-  .kind-chatgpt-export { color: #0b5e63; background: #d5ecec; border-color: #7fc7cb; }
+   * terminal palette so the whole app speaks one visual vocabulary). */
+  .kind-image          { color: #be185d; }
+  .kind-audio          { color: #c2410c; }
+  .kind-video          { color: #b91c1c; }
+  .kind-html           { color: #1d4ed8; }
+  .kind-docx           { color: #4338ca; }
+  .kind-text           { color: #15803d; }
+  .kind-chatgpt-export { color: var(--accent); }
 
   .path {
     font-family: var(--mono-font);
