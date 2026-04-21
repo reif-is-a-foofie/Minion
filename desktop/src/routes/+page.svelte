@@ -34,6 +34,76 @@
   let searchResults = $state<SearchHit[]>([]);
   let searching = $state(false);
   let dragging = $state(false);
+  /** Live pointer while OS file-drag is over the window (client / CSS px). */
+  let dragPointer = $state<{ x: number; y: number } | null>(null);
+  let dropSectionEl: HTMLElement | undefined = $state();
+
+  function parseDragPosition(payload: unknown): { x: number; y: number } | null {
+    if (!payload || typeof payload !== "object") return null;
+    const o = payload as Record<string, unknown>;
+    const pos = o.position;
+    if (pos && typeof pos === "object") {
+      const p = pos as Record<string, unknown>;
+      if (typeof p.x === "number" && typeof p.y === "number") return { x: p.x, y: p.y };
+    }
+    if (typeof o.x === "number" && typeof o.y === "number") return { x: o.x, y: o.y };
+    return null;
+  }
+
+  /** CSS variables: Minion follows the drag toward the cursor and grows slightly when it's close. */
+  const minionDragVars = $derived.by(() => {
+    if (typeof window === "undefined" || !dragging) return "";
+    let cx: number;
+    let cy: number;
+    if (dropSectionEl) {
+      const drop = dropSectionEl.getBoundingClientRect();
+      // Corner minion matches .drop-watcher: 96×96, right 22px, bottom 8px
+      cx = drop.right - 22 - 48;
+      cy = drop.bottom - 8 - 48;
+    } else {
+      cx = window.innerWidth * 0.82;
+      cy = window.innerHeight * 0.72;
+    }
+    const fallback = (() => {
+      if (dropSectionEl) {
+        const r = dropSectionEl.getBoundingClientRect();
+        return { x: r.left + r.width * 0.5, y: r.top + r.height * 0.35 };
+      }
+      return { x: window.innerWidth * 0.5, y: window.innerHeight * 0.4 };
+    })();
+    const pt = dragPointer ?? fallback;
+    const mx = pt.x;
+    const my = pt.y;
+    const dx = mx - cx;
+    const dy = my - cy;
+    const dist = Math.hypot(dx, dy) || 1;
+    const nx = dx / dist;
+    const ny = dy / dist;
+    const lean = 12;
+    const tx = nx * lean;
+    const ty = ny * lean;
+    const rot = Math.max(-18, Math.min(18, Math.atan2(dy, dx) * (180 / Math.PI) * 0.12));
+    const maxD = Math.hypot(window.innerWidth, window.innerHeight) * 0.5;
+    const near = 1 - Math.min(dist / maxD, 1);
+    const sc = 1.04 + near * 0.12;
+    return `--mw-tx:${tx.toFixed(1)}px; --mw-ty:${ty.toFixed(1)}px; --mw-rot:${rot.toFixed(2)}deg; --mw-sc:${sc.toFixed(3)};`;
+  });
+
+  let dragWindowListening = false;
+  function onWindowDragOver(e: DragEvent) {
+    e.preventDefault();
+    dragPointer = { x: e.clientX, y: e.clientY };
+  }
+  function attachDragWindowListeners() {
+    if (typeof window === "undefined" || dragWindowListening) return;
+    window.addEventListener("dragover", onWindowDragOver as EventListener);
+    dragWindowListening = true;
+  }
+  function detachDragWindowListeners() {
+    if (typeof window === "undefined" || !dragWindowListening) return;
+    window.removeEventListener("dragover", onWindowDragOver as EventListener);
+    dragWindowListening = false;
+  }
   type EmbedAnim = { shownDone: number; targetDone: number; total: number };
   let ingestFeed = $state<{ id: string; path: string; status: string; ts: number; embed?: EmbedAnim }[]>([]);
   let active = $state<Active>({ root: null, total: 0, done: 0, added: 0, skipped: 0 });
@@ -674,11 +744,24 @@
       // Tauri v2 native drag-drop events.
       const unlistenDrop = await listen<{ paths: string[] }>("tauri://drag-drop", async (e) => {
         dragging = false;
+        dragPointer = null;
+        detachDragWindowListeners();
         const paths = (e.payload as any)?.paths ?? [];
         await handleDropped(paths);
       });
-      const unlistenEnter = await listen("tauri://drag-enter", () => (dragging = true));
-      const unlistenLeave = await listen("tauri://drag-leave", () => (dragging = false));
+      const unlistenEnter = await listen("tauri://drag-enter", () => {
+        dragging = true;
+        attachDragWindowListeners();
+      });
+      const unlistenLeave = await listen("tauri://drag-leave", () => {
+        dragging = false;
+        dragPointer = null;
+        detachDragWindowListeners();
+      });
+      const unlistenOver = await listen<unknown>("tauri://drag-over", (e) => {
+        const p = parseDragPosition(e.payload);
+        if (p) dragPointer = p;
+      });
 
       // Vision (llava/ollama) lifecycle — emitted by Rust. We dump every line
       // into the same terminal log so there is no separate UI surface.
@@ -696,7 +779,14 @@
       const unlistenSidecar = await onSidecarStatus((s) => {
         sidecar = s;
       });
-      unlistens.push(() => unlistenDrop(), () => unlistenEnter(), () => unlistenLeave(), () => unlistenVision(), unlistenSidecar);
+      unlistens.push(
+        () => unlistenDrop(),
+        () => unlistenEnter(),
+        () => unlistenLeave(),
+        () => unlistenOver(),
+        () => unlistenVision(),
+        unlistenSidecar,
+      );
     })();
 
     // Braille spinner tick for in-flight rows. 10 fps is smooth without thrash.
@@ -705,6 +795,7 @@
     return () => {
       clearInterval(spin);
       cancelEmbedRaf();
+      detachDragWindowListeners();
       unlistens.forEach((fn) => fn());
     };
   });
@@ -730,7 +821,7 @@
   />
 </svelte:head>
 
-<main class="app" class:dragging>
+<main class="app" class:dragging style={minionDragVars}>
   <header>
     <div class="brand">
       <img src="/minion.png" alt="" class="brand-icon" />
@@ -808,7 +899,15 @@
     </div>
   {/if}
 
-  <section class="drop" class:active={dragging} role="button" tabindex="0" onclick={browseForFiles} onkeydown={(e) => e.key === "Enter" && browseForFiles()}>
+  <section
+    class="drop"
+    class:active={dragging}
+    bind:this={dropSectionEl}
+    role="button"
+    tabindex="0"
+    onclick={browseForFiles}
+    onkeydown={(e) => e.key === "Enter" && browseForFiles()}
+  >
     <img src="/minion.png" alt="" class="drop-watcher" aria-hidden="true" />
     <div class="drop-brackets">
       <span class="bracket">[</span>
@@ -1165,9 +1264,18 @@
     height: 34px;
     object-fit: contain;
     flex-shrink: 0;
+    transform-origin: 50% 65%;
     filter: drop-shadow(0 1px 2px rgba(16, 34, 56, 0.18))
             drop-shadow(0 0 6px color-mix(in srgb, var(--accent) 28%, transparent));
     animation: presence 3.6s ease-in-out infinite;
+  }
+  .app.dragging .brand-icon {
+    animation: none;
+    transform:
+      translate3d(calc(var(--mw-tx, 0px) * 0.42), calc(var(--mw-ty, 0px) * 0.38), 0)
+      rotate(calc(var(--mw-rot, 0deg) * 0.5))
+      scale(calc(1 + (var(--mw-sc, 1) - 1) * 0.45));
+    transition: transform 55ms linear;
   }
   /* Aura hugs the Minion's silhouette, not a bounding box — so it works with
    * the transparent-bg cut-out. Gently breathes between a soft and strong halo. */
@@ -1469,6 +1577,7 @@
     height: 96px;
     object-fit: contain;
     opacity: 0.55;
+    transform-origin: 50% 78%;
     transform: rotate(-8deg);
     transition: opacity 240ms ease, transform 240ms ease, filter 240ms ease;
     pointer-events: none;
@@ -1483,14 +1592,17 @@
     filter: drop-shadow(0 6px 14px rgba(16, 34, 56, 0.28))
             drop-shadow(0 0 16px color-mix(in srgb, var(--accent) 40%, transparent));
   }
-  .drop.active .drop-watcher,
+  /* OS file-drag: follow pointer + swell when the drag gets close (vars on .app). */
   .app.dragging .drop-watcher {
     opacity: 1;
-    transform: rotate(0deg) translateY(-10px) scale(1.1);
+    transition: opacity 180ms ease, transform 55ms linear, filter 240ms ease;
+    transform:
+      translate3d(var(--mw-tx, 0px), calc(var(--mw-ty, 0px) - 10px), 0)
+      rotate(calc(-6deg + var(--mw-rot, 0deg)))
+      scale(var(--mw-sc, 1.08));
     filter: drop-shadow(0 8px 18px rgba(16, 34, 56, 0.32))
             drop-shadow(0 0 22px color-mix(in srgb, var(--accent) 55%, transparent));
   }
-
   /* Terminal: a warm scrolling log. One line per event. */
   .term {
     background: var(--panel);
