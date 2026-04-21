@@ -16,7 +16,7 @@ Do not override the core profile with one-off retrieved fragments unless there i
 
 ## 2. Use Semantic Memory For Task-Relevant Context
 
-**Proactive use:** At the **start** of substantive work, call `search_memory` for short queries on likely themes—even if Reif did not ask for history. Do this whenever prior context **might** matter (including subtle or mid-thread cases).
+**Proactive use:** At the **start** of substantive work, call `ask_minion` for short queries on likely themes—even if Reif did not ask for history. Do this whenever prior context **might** matter (including subtle or mid-thread cases).
 
 Query the semantic index when you need:
 

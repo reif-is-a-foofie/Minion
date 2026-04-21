@@ -48,7 +48,7 @@ notes.
 2. Run **`minion`** (interactive, as above). **Or** for scripts/CI: `minion /path/to/export.zip` when that path exists (same as `minion setup …`), or `minion setup /path/to/export.zip` / `minion setup --export …`.
 3. When asked, paste the path to your **ChatGPT export `.zip`** from OpenAI (or drag the file into the window).
 4. Wait until it finishes (this can take a while on a big export).
-5. **You:** put text **into Claude itself** so the model knows how to behave — not just “connecting wires.” Minion copies **`retrieval_policy.md`** next to your profile in each run folder; paste **both** that file and **`core_profile.md`** into **Claude → Custom Instructions** (and/or project instructions). That tells Claude **when to call** `search_memory` (MCP), not only that the tool exists.
+5. **You:** put text **into Claude itself** so the model knows how to behave — not just “connecting wires.” Minion copies **`retrieval_policy.md`** next to your profile in each run folder; paste **both** that file and **`core_profile.md`** into **Claude → Custom Instructions** (and/or project instructions). That tells Claude **when to call** `ask_minion` (MCP), not only that the tool exists.
 6. **Quit and reopen Claude Desktop** so it loads the MCP server from the config Minion already wrote.
 
 **Two different mechanisms:** (1) **`claude_desktop_config.json`** — Minion merges this so Claude Desktop **starts** the Minion MCP and exposes **tools**. (2) **Directions to the model** — the MCP server **injects `retrieval_policy.md`** via the MCP handshake (`initialize.instructions`), so Claude gets retrieval discipline automatically when the server connects; you should still paste **`core_profile.md`** into Custom Instructions (and optionally the policy again if you want it duplicated there).
@@ -83,6 +83,7 @@ minion setup --export "/path/to/chatgpt-export.zip"
 - Keep an assistant consistent over time without stuffing long history into every chat
 - Pull up real “how you said it” evidence when writing, deciding, or delegating (projects, priorities, preferences)
 - Make the profile auditable: it’s generated from quotes + emits a build manifest so you can see how it was produced
+- **Voice capability (self-bootstrapping):** Minion maintains a `voice.md` profile — preferences, nevers, style rules, reference writers — auto-synthesized by Claude from your own chats on first run and auto-injected every session. Claude also appends new directives mid-session when you state a durable preference (after confirming). See `chatgpt_mcp_memory/README.md §7b`.
 
 ## Privacy
 

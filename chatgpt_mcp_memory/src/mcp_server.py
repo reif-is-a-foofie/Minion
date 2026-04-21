@@ -464,7 +464,39 @@ def _tool_get_chunk(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _tool_list_sources(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """List indexed sources, optionally filtered; or return full detail for one source.
+
+    If `source_id` is provided, returns `{source: {...full metadata + chunk_count...}}`
+    with parser, sha256, meta, bytes, updated_at — the single-source detail view.
+    Otherwise returns `{sources: [...], count: n}` with large fields stripped
+    for token discipline. Filters (`kind`, `path_glob`, `since`, `limit`) only
+    apply to the list view.
+    """
     conn = _get_conn()
+
+    source_id = arguments.get("source_id")
+    if source_id:
+        src = get_source(conn, str(source_id))
+        if src is None:
+            raise ValueError(f"source_id not found: {source_id}")
+        chunk_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM chunks WHERE source_id=?", (str(source_id),)
+        ).fetchone()["n"]
+        return {
+            "source": {
+                "source_id": src.source_id,
+                "path": src.path,
+                "kind": src.kind,
+                "sha256": src.sha256,
+                "mtime": src.mtime,
+                "bytes": src.bytes,
+                "parser": src.parser,
+                "updated_at": src.updated_at,
+                "chunk_count": int(chunk_count),
+                "meta": src.meta,
+            }
+        }
+
     kind = arguments.get("kind")
     kind = str(kind) if kind else None
     path_glob = arguments.get("path_glob")
@@ -482,29 +514,6 @@ def _tool_list_sources(arguments: Dict[str, Any]) -> Dict[str, Any]:
         r.pop("meta", None)
         r.pop("sha256", None)
     return {"sources": rows, "count": len(rows)}
-
-
-def _tool_source_info(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    source_id = str(arguments.get("source_id") or "")
-    conn = _get_conn()
-    src = get_source(conn, source_id)
-    if src is None:
-        raise ValueError(f"source_id not found: {source_id}")
-    chunk_count = conn.execute(
-        "SELECT COUNT(*) AS n FROM chunks WHERE source_id=?", (source_id,)
-    ).fetchone()["n"]
-    return {
-        "source_id": src.source_id,
-        "path": src.path,
-        "kind": src.kind,
-        "sha256": src.sha256,
-        "mtime": src.mtime,
-        "bytes": src.bytes,
-        "parser": src.parser,
-        "updated_at": src.updated_at,
-        "chunk_count": int(chunk_count),
-        "meta": src.meta,
-    }
 
 
 def _tool_browse_conversations(arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -546,22 +555,6 @@ def _tool_conversation_chunks(arguments: Dict[str, Any]) -> Dict[str, Any]:
         r2["text"] = _cap_text(r.get("text") or "", max_chars)
         out.append(r2)
     return {"conversation_id": conversation_id, "chunks": out, "count": len(out)}
-
-
-def _tool_get_voice(_: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the durable user-voice directives verbatim.
-
-    Also injected into initialize.instructions every session; this tool lets
-    callers re-read it mid-session or in clients that don't surface the
-    initialize payload to the model.
-    """
-    text = _load_voice()
-    return {
-        "present": bool(text),
-        "built": _voice_is_built(),
-        "voice": text or "",
-        "char_count": len(text or ""),
-    }
 
 
 _COMMIT_MIN_CHARS = 200
@@ -781,18 +774,6 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
-        "name": "get_voice",
-        "title": "Get user voice directives",
-        "description": (
-            "Return the user's durable voice profile: preferences, nevers, style "
-            "and tone directives, and characteristic writing samples. Auto-"
-            "injected into initialize.instructions every session, but call this "
-            "any time you need to re-read the rules verbatim (e.g. before "
-            "drafting long-form text in the user's voice)."
-        ),
-        "inputSchema": {"type": "object", "additionalProperties": False},
-    },
-    {
         "name": "commit_voice",
         "title": "Commit synthesized voice profile to disk",
         "description": (
@@ -910,30 +891,29 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "list_sources",
-        "title": "List indexed sources",
+        "title": "List indexed sources (or one in detail)",
         "description": (
-            "List files currently in memory with (path, kind, chunk_count, mtime). "
-            "Use before ask_minion when the user asks 'what do you know about X?' "
-            "or to verify a file they just dropped into the inbox is indexed."
+            "Two modes, one tool:\n"
+            "- List: returns (source_id, path, kind, chunk_count, mtime) for "
+            "every indexed file matching the filters. Use before ask_minion "
+            "when the user asks 'what do you know about X?' or to verify a "
+            "file they just dropped into the inbox is indexed.\n"
+            "- Detail: pass `source_id` to get full metadata for one source "
+            "(parser, sha256, bytes, updated_at, parser-specific fields). "
+            "Other filters are ignored in detail mode."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
+                "source_id": {
+                    "type": ["string", "null"],
+                    "description": "When set, returns full detail for this one source (other filters ignored).",
+                },
                 "kind": {"type": ["string", "null"]},
                 "path_glob": {"type": ["string", "null"]},
                 "since": {"type": ["number", "null"]},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100},
             },
-        },
-    },
-    {
-        "name": "source_info",
-        "title": "Source metadata",
-        "description": "Full metadata for one source (path, parser, sha, bytes, chunk_count, parser-specific fields).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"source_id": {"type": "string"}},
-            "required": ["source_id"],
         },
     },
     {
@@ -1021,7 +1001,7 @@ def _handle_initialize(req: Dict[str, Any]) -> Dict[str, Any]:
             + voice
             + "\n\n_These voice directives are injected every session. They are "
             "binding: respect the nevers/preferences/style unless the user overrides "
-            "them in-conversation. Call `get_voice` to re-read them verbatim._"
+            "them in-conversation._"
             + "\n\n## Capturing new voice signals mid-session\n\n"
             "When the user signals a durable voice preference in-session — "
             "statements like `save this`, `remember this`, `write like Didion "
@@ -1167,13 +1147,11 @@ _DISPATCH = {
     "ask_minion": _tool_ask_minion,
     "search_memory": _tool_ask_minion,  # legacy alias
     "get_chunk": _tool_get_chunk,
-    "get_voice": _tool_get_voice,
     "commit_voice": _tool_commit_voice,
     "append_to_voice": _tool_append_to_voice,
     "browse_conversations": _tool_browse_conversations,
     "conversation_chunks": _tool_conversation_chunks,
     "list_sources": _tool_list_sources,
-    "source_info": _tool_source_info,
     "index_info": _tool_index_info,
 }
 

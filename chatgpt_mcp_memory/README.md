@@ -209,18 +209,51 @@ This complements `core_profile.md` (persona from the quote bank / sourcebook). P
 
 ## 7) Pasteable persona for Claude
 
-**MCP vs instructions:** `claude_desktop_config.json` (updated by `minion mcp-config` / setup) only **registers** the Minion server so **tools exist**. To get good **invocation** of `search_memory`, paste the files below into **Claude → Custom Instructions** (and/or project instructions).
+**MCP vs instructions:** `claude_desktop_config.json` (updated by `minion mcp-config` / setup) only **registers** the Minion server so **tools exist**. To get good **invocation** of `ask_minion`, paste the files below into **Claude → Custom Instructions** (and/or project instructions).
 
 In Claude, paste content from:
 
 - `core_profile.md`
-- `retrieval_policy.md` (includes **proactive** `search_memory` guidance)
-- `identity_profile.md` (from `ask_minion` — same workflow, strategic layer over the chunk corpus)
+- `retrieval_policy.md` (includes **proactive** `ask_minion` guidance)
+- `identity_profile.md` (from `ask_minion` CLI — same workflow, strategic layer over the chunk corpus)
 
 Optionally also attach / paste selected sections from:
 
 - `data/derived/persona_sourcebook.md`
 - `data/derived/persona_quote_bank.md`
+
+## 7b) Voice profile (self-bootstrapping)
+
+Minion maintains a durable **voice profile** at
+`<derived>/voice.md` — your style rules, nevers, reference writers, and
+exemplars. It is auto-injected into `initialize.instructions` every
+session, so Claude respects your voice without you pasting anything.
+
+**How it gets built:** the profile is *not* hand-authored. On first run
+(when `voice.md` is empty / stubbed), the server injects a **bootstrap
+directive** instead of the profile. That directive instructs Claude to:
+
+1. Run 6–8 HyDE-style semantic queries against your own chats
+   (`ask_minion` with `mode='relevance'`, `role='user'` — e.g. *"don't
+   use emojis"*, *"write like Ted Chiang"*, *"explain in paragraphs not
+   bullets"*) to find evidence of how you actually write.
+2. Also run one keyword pass for named authors / references.
+3. Synthesize a structured voice document (preferences, nevers, style,
+   tone, reference writers, exemplars) grounded in chunk_ids it found.
+4. Call **`commit_voice`** once to persist it.
+
+From then on, every new Claude session starts with your voice injected.
+The profile is layered: `AUTO_DRAFT` (Claude-generated, replaceable) +
+`USER_EDITS` (your hand-written overrides, never touched by Claude).
+
+**Ongoing maintenance:** during any session, if Claude hears a durable
+preference from you (*"actually, I hate bullet lists — always paragraphs"*),
+it confirms with you and then calls **`append_to_voice`** to add that
+directive to the appropriate section. No manual file editing required;
+the profile evolves with the chats.
+
+Schema, section headings, and safety rails (length caps, idempotency,
+section allow-list) live in `src/build_voice.py`.
 
 ## 8) Wire it into Claude Desktop (MCP)
 
@@ -245,7 +278,13 @@ That **merges** into `claude_desktop_config.json`—no copy-paste. Restart Claud
 
 **Manual:** see `claude_desktop_config.example.json` (`command`, `args`, `CHATGPT_MCP_DATA_DIR`).
 
-**Injected directions (no paste required for retrieval policy):** On MCP connect, the Minion server sends **`retrieval_policy.md`** in the protocol’s `initialize.instructions` field (so Claude sees *when* to call `search_memory`, not only that tools exist). The file must live next to your index: **`CHATGPT_MCP_DATA_DIR/retrieval_policy.md`**. `minion setup` and `minion mcp-config` copy it from this package into that folder. Override path with env **`CHATGPT_MCP_RETRIEVAL_POLICY`**; cap length with **`CHATGPT_MCP_INSTRUCTIONS_MAX_CHARS`** (default `20000`). You can still paste the same policy into Custom Instructions for emphasis, or paste only **`core_profile.md`** there to avoid duplication.
+**Injected directions (no paste required):** On MCP connect, the Minion server sends three things in the protocol's `initialize.instructions` field so Claude sees *when* to call the tools and *how you want to be written to*:
+
+1. **`retrieval_policy.md`** — proactive `ask_minion` guidance. Must live next to your index (**`CHATGPT_MCP_DATA_DIR/retrieval_policy.md`**); `minion setup` / `mcp-config` copy it from this package. Override path with env **`CHATGPT_MCP_RETRIEVAL_POLICY`**; cap length with **`CHATGPT_MCP_INSTRUCTIONS_MAX_CHARS`** (default `20000`).
+2. **`voice.md`** — your durable voice profile (preferences, nevers, style). Auto-injected when built, otherwise a short **bootstrap directive** is injected instead, telling Claude to synthesize your voice from chat history on first run (see §7b).
+3. **Core profile** — if **`MINION_PROFILE`** points at a file, its contents are attached once per session.
+
+You can still paste the same policy + `core_profile.md` into Custom Instructions for emphasis.
 
 Restart Claude Desktop after any config change.
 
@@ -257,10 +296,23 @@ Ask Claude:
 - "Call `list_sources` with `kind='pdf'`." — confirms a recently-dropped file.
 - "Call `ask_minion` for `Good Capital` with `top_k=6`."
 - "Take the top hit `chunk_id` and call `get_chunk`."
+- "Call `browse_conversations` with `title_like='profile'`, then call `conversation_chunks` on the top hit."
 
-The full tool surface: `ask_minion`, `get_chunk`, `list_sources`,
-`source_info`, `index_info`. `ask_minion` supports `kind`, `path_glob`,
-`since`, and `role` filters for precise retrieval.
+### Full tool surface (8)
+
+| Tool | Purpose |
+| ---- | ------- |
+| `ask_minion` | Semantic + keyword + temporal search. Modes: `relevance` (default), `keyword` (FTS, for proper nouns), `temporal` (`first`/`last`). Filters: `kind`, `path_glob`, `since`, `role`. |
+| `get_chunk` | Fetch a full chunk by `chunk_id` (expand a search hit). |
+| `browse_conversations` | List distinct conversations; filter by `title_like`, `since`, `until`; order newest/oldest. |
+| `conversation_chunks` | Fetch every chunk in one conversation in order (whole-thread view). |
+| `list_sources` | **Two modes:** list (`kind`/`path_glob`/`since` filters) **or** detail (pass `source_id` for full metadata: parser, sha256, bytes, chunk_count). |
+| `index_info` | Aggregate db stats (chunk/source counts, paths). Diagnostic. |
+| `commit_voice` | One-shot: persist Claude's synthesized voice profile to `voice.md` (called during bootstrap — see §7b). |
+| `append_to_voice` | Mid-session: append one directive to a section of `voice.md` after user confirmation. |
+
+`ask_minion` supports `kind`, `path_glob`, `since`, and `role` filters plus
+a `mode` parameter for precise retrieval.
 
 ## Privacy + token discipline (how this stays cheap)
 
@@ -287,14 +339,17 @@ new kind automatically.
 
 | Env var | Default | Purpose |
 | ------- | ------- | ------- |
-| `MINION_DATA_DIR` | repo `data/derived` | Where `memory.db` lives |
+| `MINION_DATA_DIR` / `CHATGPT_MCP_DATA_DIR` | repo `data/derived` | Where `memory.db` and `voice.md` live |
 | `MINION_INBOX` | `<MINION_DATA_DIR>/../inbox` | Watched folder |
 | `MINION_DISABLE_WATCHER` | unset | Set to `1` to skip auto-watch inside `minion mcp` |
 | `MINION_EMBED_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | fastembed model name |
 | `MINION_WHISPER_MODEL` | `tiny.en` | faster-whisper model for audio |
 | `MINION_VISION_MODEL` | unset | Ollama model name for image captioning (e.g. `llava`) |
-| `MINION_RETRIEVAL_POLICY` | `<data>/retrieval_policy.md` | Override policy path |
-| `MINION_PROFILE` | auto | Profile brief auto-attached on first tool call |
+| `MINION_RETRIEVAL_POLICY` / `CHATGPT_MCP_RETRIEVAL_POLICY` | `<data>/retrieval_policy.md` | Override policy path |
+| `CHATGPT_MCP_INSTRUCTIONS_MAX_CHARS` | `20000` | Cap for injected `initialize.instructions` |
+| `MINION_VOICE` | `<data>/voice.md` | Override voice-profile path |
+| `MINION_VOICE_MAX_CHARS` | `5000` | Cap for voice-profile injection |
+| `MINION_PROFILE` | unset | File path to a core profile, auto-attached on first tool call |
 
 ## Packaging: Minion (macOS)
 

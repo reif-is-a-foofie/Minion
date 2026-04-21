@@ -264,12 +264,24 @@ def test_commit_voice_rejects_junk(mcp_client):
     assert sc2.get("status") == "error", "no-heading markdown should be rejected"
 
 
-def test_get_voice_tool_returns_voice(mcp_client):
-    result = mcp_client.call_tool("get_voice", {})
-    sc = result.get("structuredContent") or {}
-    assert "# User voice" in (sc.get("voice") or "")
-    assert "built" in sc
-    assert sc.get("char_count", 0) > 100
+def test_list_sources_detail_mode(mcp_client):
+    """list_sources in list mode returns rows; pass source_id for full detail."""
+    rows_result = mcp_client.call_tool("list_sources", {"limit": 5})
+    sc = rows_result.get("structuredContent") or {}
+    sources = sc.get("sources") or []
+    assert sources, f"list_sources returned nothing: {rows_result!r}"
+    assert "source" not in sc, "list mode should not return 'source' singular"
+
+    sid = sources[0]["source_id"]
+    detail = mcp_client.call_tool("list_sources", {"source_id": sid})
+    dsc = detail.get("structuredContent") or {}
+    src = dsc.get("source")
+    assert src, f"detail mode missing 'source': {detail!r}"
+    assert src["source_id"] == sid
+    # Detail view includes fields stripped from list view.
+    assert "sha256" in src
+    assert "parser" in src
+    assert "chunk_count" in src
 
 
 def test_append_to_voice_roundtrip(request, tmp_path):
