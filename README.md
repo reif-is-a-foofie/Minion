@@ -64,7 +64,7 @@ Paste `core_profile.md` and `retrieval_policy.md` from your run folder into Clau
 
 ## Drop stuff in
 
-There is a **desktop app** (Tauri + SvelteKit) over the same FastAPI sidecar and SQLite + sqlite-vec store as the CLI. Release builds **bundle the Python source** into the `.app` and, on first launch, create a **venv under your data dir** and `pip install` what they need—no separate repo checkout for day-to-day use. Drop files onto the window; watch the activity log (embedding progress eases instead of jumping); open **Contents** to search; **Settings** shows the exact **`MINION_DATA_DIR` / `MINION_INBOX`** paths and a **Connect** button that writes both into Claude Desktop’s MCP entry (mirror those env vars in Cursor or any other MCP host so searches hit the same index the app just wrote).
+There is a **desktop app** (Tauri + SvelteKit) over the same FastAPI sidecar and SQLite + sqlite-vec store as the CLI. Release builds **bundle the Python source** into the `.app` and, on first launch, create a **venv under your data directory** and `pip install` what they need—no separate repo checkout for day-to-day use. Defaults on macOS: **`~/Library/Application Support/Minion/data`** for the index and sidecar state, **`.../data/inbox`** for drops (override with `MINION_DATA_DIR` / `MINION_INBOX`). Drop files onto the window; watch the activity log (embedding progress eases instead of jumping); open **Contents** to search; **Settings** shows the exact **`MINION_DATA_DIR` / `MINION_INBOX`** paths and a **Connect** button that writes both into Claude Desktop’s MCP entry (mirror those env vars in Cursor or any other MCP host so searches hit the same index the app just wrote).
 
 ```bash
 cd desktop

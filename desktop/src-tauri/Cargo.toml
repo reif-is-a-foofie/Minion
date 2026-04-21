@@ -1,7 +1,7 @@
 [package]
 name = "minion-desktop"
 version = "0.2.3"
-description = "Minion desktop: drop-zone memory for your agents"
+description = "Tauri desktop for Minion: bundled sidecar, first-run venv, drop ingest, Settings + Claude MCP connect (MINION_DATA_DIR, MINION_INBOX)."
 authors = ["Minion"]
 edition = "2021"
 

@@ -261,7 +261,7 @@ Claude Desktop reads (macOS):
 
 - `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-**Default:** `minion setup` **writes this file for you** (merges the `minion` entry; backs up the previous file to `claude_desktop_config.json.minion.bak` when it existed).
+**Default:** `minion setup` **writes this file for you** (merges the `minion` entry; backs up the previous file to `claude_desktop_config.json.minion.bak` when it existed). The **Minion** macOS app’s **Connect** button does the same merge and sets both **`MINION_DATA_DIR`** and **`MINION_INBOX`** to the paths the UI is using—copy that pair into any other MCP host (e.g. Cursor) so retrieval hits the same index.
 
 To point at an existing index later (same paths as `minion setup` would use):
 
