@@ -101,6 +101,9 @@ struct AppState {
 // noticeably more stable on memory-constrained Macs. Override with the
 // MINION_VISION_MODEL env var if you want llava or another vision model.
 const DEFAULT_VISION_MODEL: &str = "moondream";
+/// Ollama tag for ingest delight one-liners + corpus taste-pin extraction (tiny, local).
+/// User may override via `MINION_DELIGHT_MODEL` / `MINION_TASTE_MODEL`.
+const DEFAULT_MINION_LLM: &str = "qwen2.5:0.5b";
 const OLLAMA_PORT: u16 = 11434;
 
 // ---------------------------------------------------------------------------
@@ -450,6 +453,13 @@ fn spawn_sidecar(
         .env("PYTHONUNBUFFERED", "1")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    // Turn on delight + taste LLM by default when the sidecar inherits no explicit choice.
+    if std::env::var("MINION_DELIGHT_MODEL").is_err() {
+        cmd.env("MINION_DELIGHT_MODEL", DEFAULT_MINION_LLM);
+    }
+    if std::env::var("MINION_TASTE_MODEL").is_err() {
+        cmd.env("MINION_TASTE_MODEL", DEFAULT_MINION_LLM);
+    }
     if let Some(model) = vision_model {
         cmd.env("MINION_VISION_MODEL", model);
     }
@@ -571,6 +581,113 @@ fn ollama_has_model(bin: &Path, model: &str) -> bool {
         let stem = name.split(':').next().unwrap_or("");
         stem == target
     })
+}
+
+fn minion_llm_env_disabled(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "off" | "false" | "none"
+    )
+}
+
+/// Which Ollama tags delight + taste need (mirrors Python `ingest_delight` / `corpus_pins_llm`).
+fn resolve_minion_llm_pull_tags() -> Vec<String> {
+    let delight_resolved: Option<String> = match std::env::var("MINION_DELIGHT_MODEL") {
+        Ok(s) => {
+            if minion_llm_env_disabled(&s) {
+                None
+            } else {
+                Some(s.trim().to_string())
+            }
+        }
+        Err(_) => Some(DEFAULT_MINION_LLM.to_string()),
+    };
+    let taste_resolved: Option<String> = match std::env::var("MINION_TASTE_MODEL") {
+        Ok(s) => {
+            if minion_llm_env_disabled(&s) {
+                None
+            } else {
+                Some(s.trim().to_string())
+            }
+        }
+        Err(_) => delight_resolved.clone(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for m in [delight_resolved, taste_resolved].into_iter().flatten() {
+        if !out.contains(&m) {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// Pull one model if missing; stream lines to `vision://progress` (same channel as vision pulls).
+fn ollama_pull_stream(app: &AppHandle, bin: &Path, model: &str, line_prefix: &str) -> Result<(), String> {
+    if ollama_has_model(bin, model) {
+        return Ok(());
+    }
+    let _ = emit_vision(
+        app,
+        "pulling_start",
+        &format!("{line_prefix}pulling {model}"),
+    );
+    let mut child = Command::new(bin)
+        .arg("pull")
+        .arg(model)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn ollama pull: {e}"))?;
+    if let Some(stdout) = child.stdout.take() {
+        let app2 = app.clone();
+        let pre = line_prefix.to_string();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let _ = emit_vision(
+                    &app2,
+                    "pulling",
+                    &format!("{pre}{line}"),
+                );
+            }
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let app2 = app.clone();
+        let pre = line_prefix.to_string();
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = emit_vision(
+                    &app2,
+                    "pulling",
+                    &format!("{pre}{line}"),
+                );
+            }
+        });
+    }
+    let status = child.wait().map_err(|e| format!("wait pull: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "ollama pull {model} failed (exit {})",
+            status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_ollama_server_running(state: &AppState, bin: &Path) -> Result<(), String> {
+    if tcp_port_open("127.0.0.1", OLLAMA_PORT, Duration::from_millis(200)) {
+        return Ok(());
+    }
+    if let Some(child) = spawn_ollama(bin) {
+        if let Ok(mut g) = state.ollama.lock() {
+            *g = Some(child);
+        }
+    }
+    if wait_for_ollama(Duration::from_secs(15)) {
+        Ok(())
+    } else {
+        Err("timed out waiting for ollama server".into())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -981,58 +1098,10 @@ fn ensure_vision_model(
         .ok_or_else(|| "ollama not installed".to_string())?;
     let model = model.unwrap_or_else(|| DEFAULT_VISION_MODEL.to_string());
 
-    // Start the server if not already up (e.g. user quit Ollama.app).
-    if !tcp_port_open("127.0.0.1", OLLAMA_PORT, Duration::from_millis(200)) {
-        if let Some(child) = spawn_ollama(&bin) {
-            if let Ok(mut g) = state.ollama.lock() {
-                *g = Some(child);
-            }
-        }
-        if !wait_for_ollama(Duration::from_secs(15)) {
-            return Err("timed out waiting for ollama server".into());
-        }
-    }
+    ensure_ollama_server_running(&state, &bin)?;
 
-    // Fast path: model already pulled — just wire env.
     if !ollama_has_model(&bin, &model) {
-        let _ = app.emit(
-            "vision://progress",
-            serde_json::json!({"stage": "pulling_start", "line": format!("pulling {model}")}),
-        );
-        // `ollama pull` streams progress lines on stdout; forward them.
-        let mut child = Command::new(&bin)
-            .arg("pull")
-            .arg(&model)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("spawn ollama pull: {e}"))?;
-        if let Some(stdout) = child.stdout.take() {
-            let app2 = app.clone();
-            thread::spawn(move || {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    let _ = app2.emit(
-                        "vision://progress",
-                        serde_json::json!({"stage": "pulling", "line": line}),
-                    );
-                }
-            });
-        }
-        if let Some(stderr) = child.stderr.take() {
-            let app2 = app.clone();
-            thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    let _ = app2.emit(
-                        "vision://progress",
-                        serde_json::json!({"stage": "pulling", "line": line}),
-                    );
-                }
-            });
-        }
-        let status = child.wait().map_err(|e| format!("wait pull: {e}"))?;
-        if !status.success() {
-            return Err(format!("ollama pull {model} failed (exit {})", status.code().unwrap_or(-1)));
-        }
+        ollama_pull_stream(&app, &bin, &model, "")?;
     }
 
     // Restart the Python sidecar with the env wired so the image parser picks it up.
@@ -1296,6 +1365,46 @@ pub fn run() {
                         let _ = emit_vision(&handle, "error", &format!("auto-enable failed: {e}"));
                     }
                 });
+            }
+
+            // Auto-pull delight/taste LLM(s) when Ollama is installed but tags are missing.
+            let llm_tags = resolve_minion_llm_pull_tags();
+            if !llm_tags.is_empty() {
+                if let Some(bin_llm) = ollama_bin.clone() {
+                    let handle_llm = app.handle().clone();
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(1800));
+                        let state = match handle_llm.try_state::<AppState>() {
+                            Some(s) => s,
+                            None => return,
+                        };
+                        if ensure_ollama_server_running(&state, &bin_llm).is_err() {
+                            let _ = emit_vision(
+                                &handle_llm,
+                                "error",
+                                "llm · could not reach Ollama — delight/taste need a running server",
+                            );
+                            return;
+                        }
+                        for m in llm_tags {
+                            if ollama_has_model(&bin_llm, &m) {
+                                continue;
+                            }
+                            if let Err(e) =
+                                ollama_pull_stream(&handle_llm, &bin_llm, &m, "llm · ")
+                            {
+                                let _ =
+                                    emit_vision(&handle_llm, "error", &format!("llm · {e}"));
+                                return;
+                            }
+                        }
+                        let _ = emit_vision(
+                            &handle_llm,
+                            "ready",
+                            "llm · delight/taste models ready",
+                        );
+                    });
+                }
             }
             Ok(())
         })

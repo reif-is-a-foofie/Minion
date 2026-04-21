@@ -12,6 +12,9 @@ Endpoints:
   DELETE /sources                   -> body: {"path": "..."} OR {"source_id": "..."}
   POST /search                      -> body: {"query", "top_k", "kind"?, "path_glob"?, "role"?}
   POST /ingest                      -> body: {"path": "..."}  (copies path into inbox if outside)
+  GET  /pins                        -> harvested taste pins (links, chunks, author guesses)
+  POST /pins/bootstrap              -> rebuild bootstrap pins from the full corpus
+  POST /pins/register_shared        -> mark inbox paths from explicit drops (before ingest)
   WS   /events                      -> push: {"type": "source_added|updated|removed", ...}
 
 Run:
@@ -44,6 +47,7 @@ from ingest import ingest_file, _looks_like_chatgpt_export
 from parsers import ALL_KINDS, supported_extensions
 from settings import apply_settings, load_settings, save_settings
 import telemetry
+from corpus_pins import bootstrap_corpus_pins, list_corpus_pins
 from store import (
     DB_FILENAME,
     connect,
@@ -53,6 +57,7 @@ from store import (
     delete_source_by_path,
     get_source,
     list_sources,
+    register_shared_paths,
     search as store_search,
 )
 import numpy as np
@@ -414,10 +419,35 @@ class SettingsBody(BaseModel):
     disabled_kinds: Optional[List[str]] = None
 
 
+class RegisterSharedBody(BaseModel):
+    paths: List[str] = Field(default_factory=list)
+
+
 @app.get("/settings")
 def settings_endpoint() -> Dict[str, Any]:
     data = load_settings(State.data_dir)
     return {"settings": data, "all_kinds": list(ALL_KINDS)}
+
+
+@app.get("/pins")
+def pins_endpoint(limit: int = 500) -> Dict[str, Any]:
+    """Harvested tastemakers: links, chunk refs, inferred author names."""
+    return {"pins": list_corpus_pins(State.conn(), limit=max(1, min(limit, 5000)))}
+
+
+@app.post("/pins/bootstrap")
+def pins_bootstrap_endpoint() -> Dict[str, Any]:
+    """Scan the full corpus and rebuild bootstrap-origin pins (URLs, prose, names)."""
+    return bootstrap_corpus_pins(State.conn())
+
+
+@app.post("/pins/register_shared")
+def pins_register_shared_endpoint(body: RegisterSharedBody) -> Dict[str, Any]:
+    """Register paths copied via the desktop drop zone so ingest can harvest stronger pins."""
+    if not body.paths:
+        return {"registered": 0}
+    n = register_shared_paths(State.conn(), body.paths)
+    return {"registered": n}
 
 
 @app.put("/settings")

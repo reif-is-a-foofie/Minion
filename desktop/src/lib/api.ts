@@ -292,6 +292,15 @@ export async function copyIntoInbox(paths: string[]): Promise<CopyResult> {
   return (await invoke("copy_into_inbox", { paths })) as CopyResult;
 }
 
+/** Tell the sidecar these inbox paths came from an explicit drop / picker (stronger pin harvest). */
+export async function registerSharedPaths(paths: string[]): Promise<{ registered: number }> {
+  if (!paths.length) return { registered: 0 };
+  return apiFetch("/pins/register_shared", {
+    method: "POST",
+    body: JSON.stringify({ paths }),
+  });
+}
+
 export async function revealInFinder(path: string): Promise<void> {
   await invoke("reveal_in_finder", { path });
 }

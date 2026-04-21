@@ -7,6 +7,7 @@ and model load.
 """
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import threading
@@ -19,8 +20,23 @@ from typing import Any, Callable, Dict
 import numpy as np
 
 from parsers import ParseResult, ParsedChunk, UnsupportedFile, is_disabled_kind, kind_for, parse_file
-from store import sha256_of_file, upsert_source
+from store import consume_shared_pending, sha256_of_file, upsert_source
 import telemetry
+
+log = logging.getLogger(__name__)
+
+
+def _maybe_harvest_shared_pins(
+    conn: sqlite3.Connection, source_id: str, shared: bool, path_hint: str
+) -> None:
+    if not shared:
+        return
+    try:
+        from corpus_pins import harvest_pins_for_shared_source
+
+        harvest_pins_for_shared_source(conn, source_id, path_hint=path_hint)
+    except Exception:
+        log.debug("shared corpus pin harvest failed", exc_info=True)
 
 
 def _chatgpt_export_manifest_paths(root: Path) -> List[Path]:
@@ -374,9 +390,12 @@ def _ingest_file_inner(
 
     chunk_tuples = [(c.text, c.role, c.meta) for c in result.chunks]
     stat = path.stat()
+    shared = consume_shared_pending(conn, spath)
     source_meta = dict(result.source_meta or {})
     source_meta.setdefault("suffix", path.suffix.lower())
     source_meta.setdefault("model_name", name)
+    if shared:
+        source_meta["ingest_provenance"] = "shared"
 
     source_id = upsert_source(
         conn,
@@ -390,6 +409,8 @@ def _ingest_file_inner(
         chunks=chunk_tuples,
         embeddings=embeddings,
     )
+
+    _maybe_harvest_shared_pins(conn, source_id, shared, spath)
 
     return IngestResult(
         path=spath,
@@ -461,10 +482,13 @@ def _ingest_chatgpt_export_dir(
     embeddings = _embed(model, texts, on_progress=on_progress)
 
     chunk_tuples = [(c.text, c.role, c.meta) for c in result.chunks]
+    shared = consume_shared_pending(conn, spath)
     source_meta = dict(result.source_meta or {})
     source_meta.setdefault("suffix", "(dir)")
     source_meta.setdefault("model_name", name)
     source_meta.setdefault("manifest_count", len(manifests))
+    if shared:
+        source_meta["ingest_provenance"] = "shared"
 
     source_id = upsert_source(
         conn,
@@ -478,6 +502,8 @@ def _ingest_chatgpt_export_dir(
         chunks=chunk_tuples,
         embeddings=embeddings,
     )
+
+    _maybe_harvest_shared_pins(conn, source_id, shared, spath)
 
     return IngestResult(
         path=spath,

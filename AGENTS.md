@@ -79,3 +79,20 @@ Keep these invariants when you change anything:
 - `desktop/` — Tauri app (Rust shell + SvelteKit UI).
 - `chatgpt_mcp_memory/src/telemetry.py` — the feedback-loop log.
 - `~/Library/Application Support/Minion/data/` — live DB, inbox, telemetry.
+
+## Desktop UI — run a full build before handoff
+
+`tauri dev` hot-reloads Svelte, but the **installed .app / DMG does not** pick up
+`desktop/src/` or `desktop/static/` until you bundle again.
+
+**Whenever you finish a change under `desktop/` (UI, styles, static assets,
+`tauri.conf.json`, Rust shell):** run a release bundle and note the artifact
+path for the human tester:
+
+```bash
+cd desktop && npm run tauri build
+```
+
+Paste the `Minion.app` / `.dmg` line from the end of the build output (or
+`find desktop/src-tauri/target/release/bundle -name '*.dmg'`). Skip this only
+for edits confined to `chatgpt_mcp_memory/` with no desktop impact.

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -372,6 +373,26 @@ _VALID_MODES = ("relevance", "oldest", "newest", "keyword")
 _RRF_K = 60
 
 
+def _basename_token_hits(query: str, path: Optional[str]) -> int:
+    """1 if any alphanumeric query token (len>=2) appears in the source basename.
+
+    Pushes `u9_green_roster.csv` ahead of unrelated chats when the user asks
+    for ``u9`` / ``u9 roster`` — semantic similarity alone often ranks a chat
+    paste about the same topic above the actual file row.
+    """
+    if not path or not query:
+        return 0
+    try:
+        base = Path(path).name.lower()
+    except Exception:
+        return 0
+    fused = base.replace("_", "").replace("-", "")
+    for tok in re.findall(r"[a-z0-9]{2,}", query.lower()):
+        if tok in base or tok in fused:
+            return 1
+    return 0
+
+
 def _content_fingerprint(text: str) -> str:
     """Cheap hash of the first ~400 meaningful chars.
 
@@ -552,6 +573,18 @@ def _tool_ask_minion(arguments: Dict[str, Any]) -> List[Dict[str, Any]]:
         # Bookkeeping for telemetry below.
         _SESSION_STATE["_last_rerank"] = rerank_used
         _SESSION_STATE["_last_candidates"] = len(relevance_hits)
+
+    # Filename-aware tie-break: stable-sort so hits whose *basename* contains
+    # a query token (e.g. u9 in u9_green_roster.csv) surface before long chats
+    # that merely discuss the same topic.
+    if query.strip() and hits:
+        hits = [
+            h
+            for _, h in sorted(
+                enumerate(hits),
+                key=lambda ix: (-_basename_token_hits(query, ix[1].path), ix[0]),
+            )
+        ]
 
     results: List[Dict[str, Any]] = []
     seen_sources: set[str] = set()
@@ -890,6 +923,11 @@ TOOLS: List[Dict[str, Any]] = [
             "list chats with `browse_conversations`. For time-scoped "
             "questions (first, earliest, latest, before X, since Y), use "
             "`oldest` or `newest` mode.\n\n"
+            "Dropped files (CSV roster, notes): semantic relevance often ranks "
+            "an older chat that *mentions* the topic above the new file. Use "
+            "list_sources(path_glob='*roster*.csv', since=…) to confirm the "
+            "ingest, then ask_minion with mode=keyword and/or path_glob over "
+            "the source path.\n\n"
             "When you answer from a Minion hit, name the source briefly so "
             "the user can verify — the document title, file name, or "
             "conversation title from the hit. Link to the source using the "
@@ -1034,7 +1072,10 @@ TOOLS: List[Dict[str, Any]] = [
             "conversation_title, first_create_time, last_create_time, "
             "message_count}]. Use when the user asks 'which chats have I had?', "
             "'list my conversations about X', or needs a directory view. Follow "
-            "up with conversation_chunks to pull a full thread."
+            "up with conversation_chunks to pull a full thread. "
+            "Does NOT list dropped files (CSV, PDF, notes): those are indexed "
+            "sources, not conversations — use list_sources (path_glob, since) "
+            "to find a roster or other file the user just ingested."
         ),
         "inputSchema": {
             "type": "object",
@@ -1084,9 +1125,11 @@ TOOLS: List[Dict[str, Any]] = [
         "description": (
             "Two modes, one tool:\n"
             "- List: returns (source_id, path, kind, chunk_count, mtime) for "
-            "every indexed file matching the filters. Use before ask_minion "
-            "when the user asks 'what do you know about X?' or to verify a "
-            "file they just dropped into the inbox is indexed.\n"
+            "every indexed file matching the filters. CSV and markdown files "
+            "are usually kind=text. Use before ask_minion when the user asks "
+            "'what do you know about X?' or to verify a file they just dropped "
+            "into the inbox is indexed (combine path_glob e.g. '*roster*.csv' "
+            "and since=unix_ts for recent drops).\n"
             "- Detail: pass `source_id` to get full metadata for one source "
             "(parser, sha256, bytes, updated_at, parser-specific fields). "
             "Other filters are ignored in detail mode."

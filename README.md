@@ -20,7 +20,7 @@ Reif
 
 Two things, automatically, on every session:
 
-1. **Retrieval**. An MCP server (this repo) that lets Claude search your chat history and any file you drop into the inbox. It exposes 8 tools: `ask_minion` (semantic, keyword, and temporal search), `get_chunk`, `browse_conversations`, `conversation_chunks`, `list_sources`, `index_info`, plus the voice tools below. Claude decides when to call them.
+1. **Retrieval**. An MCP server (this repo) that lets Claude search your chat history and any file you drop into the inbox. It exposes eight tools: `ask_minion` (semantic **plus** keyword fusion over the same chunks, with a filename-aware rerank so a dropped `*_roster*.csv` can surface when you say “u9”), `get_chunk`, `browse_conversations`, `conversation_chunks`, `list_sources`, `index_info`, plus the voice tools below. Claude decides when to call them. Indexed paths are usually the **inbox copy** of a file, not your original `~/Desktop/...` path—use `list_sources` or basename tokens in `ask_minion` / `path_glob` when you mean a specific drop.
 2. **Voice**. A durable `voice.md` profile (preferences, nevers, style rules, writers you want emulated) that gets injected into Claude's system prompt every session. You don't write it. On first run, Claude reads your chat history, figures out how you actually write, and commits the profile. From then on, if you state a new rule mid-conversation ("actually, I hate bullet lists"), Claude confirms and appends it via `append_to_voice`. The profile evolves from the chats, not from a text editor.
 
 The voice tool (`commit_voice` on first run, `append_to_voice` after) is what turns "Claude knows me" from a one-time paste into something that actually stays current.
@@ -32,8 +32,8 @@ Clone it, set up Python, done. Homebrew formula is dormant for now, running from
 Prereqs: Python 3.10+, [Ollama](https://ollama.com) running with whatever model you want for the profile generator (default `mistral:7b`), Claude Desktop installed.
 
 ```bash
-git clone https://github.com/reif-is-a-foofie/minion.git
-cd minion/chatgpt_mcp_memory
+git clone https://github.com/reif-is-a-foofie/Minion.git
+cd Minion/chatgpt_mcp_memory
 
 # uv is the cleanest way, works even if your system Python is a mess
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -64,13 +64,15 @@ Paste `core_profile.md` and `retrieval_policy.md` from your run folder into Clau
 
 ## Drop stuff in
 
-There's a desktop app (Tauri + SvelteKit, same SQLite + sqlite-vec store as the CLI). Drop any file onto the window, PDF, image, audio, markdown, code, and every MCP-speaking agent (Claude Desktop, Cursor, whatever) can read it.
+There is a **desktop app** (Tauri + SvelteKit) over the same FastAPI sidecar and SQLite + sqlite-vec store as the CLI. Release builds **bundle the Python source** into the `.app` and, on first launch, create a **venv under your data dir** and `pip install` what they need—no separate repo checkout for day-to-day use. Drop files onto the window; watch the activity log (embedding progress eases instead of jumping); open **Contents** to search; **Settings** shows the exact **`MINION_DATA_DIR` / `MINION_INBOX`** paths and a **Connect** button that writes both into Claude Desktop’s MCP entry (mirror those env vars in Cursor or any other MCP host so searches hit the same index the app just wrote).
 
 ```bash
 cd desktop
 npm install
 npm run tauri dev
 ```
+
+`npm run tauri build` produces `Minion.app` and a `.dmg` under `desktop/src-tauri/target/release/bundle/`.
 
 Without the app, drop files into `data/inbox/`. The watcher inside `minion mcp` reconciles on startup and then live-watches. CRUD commands: `minion add`, `minion ls`, `minion rm`, `minion watch`.
 

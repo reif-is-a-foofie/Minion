@@ -5,6 +5,7 @@ Schema
 ------
 - sources(source_id PK, path UNIQUE, kind, sha256, mtime, bytes, parser, meta_json, updated_at)
 - chunks(chunk_id PK, source_id FK ON DELETE CASCADE, seq, role, text, meta_json)
+- corpus_pins(pin_id PK, kind, ref UNIQUE per kind, weight, reason, meta_json, created_at)
 - vec_chunks (sqlite-vec virtual table): rowid -> embedding float[dim]
 
 Invariants
@@ -124,6 +125,26 @@ CREATE INDEX IF NOT EXISTS idx_chunks_conv_id
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+-- Explicit taste signals harvested from the corpus or added by the user.
+-- kind: link | chunk | author_guess — ref is normalized URL, chunk_id, or name.
+CREATE TABLE IF NOT EXISTS corpus_pins (
+    pin_id    TEXT PRIMARY KEY,
+    kind      TEXT NOT NULL,
+    ref       TEXT NOT NULL,
+    weight    REAL NOT NULL DEFAULT 1.0,
+    reason    TEXT NOT NULL DEFAULT '',
+    meta_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    UNIQUE(kind, ref)
+);
+CREATE INDEX IF NOT EXISTS idx_corpus_pins_kind ON corpus_pins(kind);
+
+-- Paths explicitly shared (desktop drop / picker). Consumed on first ingest match.
+CREATE TABLE IF NOT EXISTS shared_ingest_pending (
+    path       TEXT PRIMARY KEY,
+    created_at REAL NOT NULL
 );
 """
 
@@ -263,6 +284,31 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
 def get_meta(conn: sqlite3.Connection, key: str) -> Optional[str]:
     row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
     return row["value"] if row else None
+
+
+def register_shared_paths(conn: sqlite3.Connection, paths: Iterable[str]) -> int:
+    """Remember paths the user explicitly copied into the inbox (drops / picker)."""
+    now = time.time()
+    n = 0
+    for raw in paths:
+        try:
+            np = str(Path(raw).expanduser().resolve())
+        except OSError:
+            continue
+        conn.execute(
+            "INSERT INTO shared_ingest_pending(path, created_at) VALUES(?,?) "
+            "ON CONFLICT(path) DO UPDATE SET created_at=excluded.created_at",
+            (np, now),
+        )
+        n += 1
+    return n
+
+
+def consume_shared_pending(conn: sqlite3.Connection, path: str) -> bool:
+    """True if `path` was registered as an explicit share (row deleted)."""
+    np = str(Path(path).expanduser().resolve())
+    cur = conn.execute("DELETE FROM shared_ingest_pending WHERE path=?", (np,))
+    return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
