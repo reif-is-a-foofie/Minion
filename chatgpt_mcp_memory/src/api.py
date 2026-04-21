@@ -196,6 +196,10 @@ async def _lifespan(app: FastAPI):
     State.subscribers_lock = asyncio.Lock()
     _resolve_paths()
     _start_watcher()
+    # Nudge Claude Desktop to re-read our tool descriptions + retrieval policy
+    # whenever the MCP-relevant sources have changed since last launch. No-op
+    # if Claude's config file doesn't exist (user hasn't opted in yet).
+    _refresh_mcp_on_launch()
     yield
 
 
@@ -568,62 +572,182 @@ async def ingest_endpoint(body: IngestBody) -> Dict[str, Any]:
     return {"queued": str(dest), "kind": "file"}
 
 
-@app.post("/connect/claude-desktop")
-def connect_claude_desktop(body: ConnectBody) -> Dict[str, Any]:
-    """Merge the Minion MCP entry into Claude Desktop's config. Same behaviour
-    as `minion mcp-config` — lets the UI do it with one click."""
-    import platform
-    import shutil as _shutil
+# ---------------------------------------------------------------------------
+# Claude Desktop MCP registration
+#
+# Two entry points share the same upserter:
+#   1. /connect/claude-desktop       — UI "Connect" button; creates config if
+#                                      missing (explicit user opt-in).
+#   2. _refresh_mcp_on_launch()      — called from lifespan startup; only
+#                                      updates an existing entry so we never
+#                                      auto-install for users who don't run
+#                                      Claude.
+#
+# We stash a short content hash of the MCP-relevant sources under
+# env.MINION_BUILD_SHA. Claude Desktop watches claude_desktop_config.json and
+# reconnects any server whose entry mutates, so a hash bump forces it to
+# re-read tools/list and initialize.instructions — exactly what "uninstall +
+# reinstall" would do, minus the race window where the server goes missing.
+# ---------------------------------------------------------------------------
 
-    if body.config_path:
-        cfg_path = Path(body.config_path).expanduser().resolve()
-    else:
-        env = os.environ.get("CLAUDE_DESKTOP_CONFIG")
-        if env:
-            cfg_path = Path(env).expanduser().resolve()
-        elif sys.platform == "darwin":
-            cfg_path = Path.home() / "Library/Application Support/Claude/claude_desktop_config.json"
-        elif sys.platform == "win32":
-            appdata = os.environ.get("APPDATA", "")
-            if not appdata:
-                raise HTTPException(status_code=400, detail="APPDATA not set")
-            cfg_path = Path(appdata) / "Claude" / "claude_desktop_config.json"
-        else:
-            cfg_path = Path.home() / ".config/Claude/claude_desktop_config.json"
 
+def _default_claude_cfg_path() -> Optional[Path]:
+    env = os.environ.get("CLAUDE_DESKTOP_CONFIG")
+    if env:
+        return Path(env).expanduser().resolve()
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Application Support/Claude/claude_desktop_config.json"
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", "")
+        return Path(appdata) / "Claude" / "claude_desktop_config.json" if appdata else None
+    return Path.home() / ".config/Claude/claude_desktop_config.json"
+
+
+def _mcp_build_sha() -> str:
+    """Short content hash of everything that shapes Claude's view of Minion:
+    tool descriptions (mcp_server.py) and the retrieval policy (injected into
+    initialize.instructions). Changes here are the signal we need Claude to
+    reconnect for."""
+    import hashlib
+
+    h = hashlib.sha256()
     mcp_script = Path(__file__).resolve().parent / "mcp_server.py"
-    entry = {
+    try:
+        h.update(mcp_script.read_bytes())
+    except OSError:
+        pass
+    for candidate in (
+        State.data_dir / "retrieval_policy.md",
+        State.data_dir.parent / "retrieval_policy.md",
+    ):
+        try:
+            h.update(candidate.read_bytes())
+        except OSError:
+            pass
+    return h.hexdigest()[:16]
+
+
+def _build_mcp_entry() -> Dict[str, Any]:
+    mcp_script = Path(__file__).resolve().parent / "mcp_server.py"
+    return {
         "command": sys.executable,
         "args": [str(mcp_script)],
-        "env": {"MINION_DATA_DIR": str(State.data_dir)},
+        "env": {
+            "MINION_DATA_DIR": str(State.data_dir),
+            "MINION_BUILD_SHA": _mcp_build_sha(),
+        },
     }
 
-    backup = None
-    if cfg_path.exists():
-        backup = cfg_path.with_suffix(cfg_path.suffix + ".minion.bak")
-        _shutil.copy2(cfg_path, backup)
+
+def _upsert_mcp_entry(
+    cfg_path: Path,
+    server_name: str,
+    *,
+    create_if_missing: bool,
+) -> Dict[str, Any]:
+    """Idempotently merge Minion's MCP entry into Claude Desktop's config.
+
+    Returns: {"action": one of "created"|"refreshed"|"noop"|"skipped_missing_config",
+              "config_path": ..., "backup_path": ..., "server_name": ...,
+              "build_sha": ...}
+    """
+    entry = _build_mcp_entry()
+    build_sha = entry["env"]["MINION_BUILD_SHA"]
+
+    if not cfg_path.exists():
+        if not create_if_missing:
+            return {
+                "action": "skipped_missing_config",
+                "config_path": str(cfg_path),
+                "server_name": server_name,
+                "build_sha": build_sha,
+                "backup_path": None,
+            }
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        config: Dict[str, Any] = {}
+        raw_existed = False
+    else:
         raw = cfg_path.read_text(encoding="utf-8")
         config = json.loads(raw) if raw.strip() else {}
-    else:
-        config = {}
-        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_existed = True
 
     if not isinstance(config, dict):
-        raise HTTPException(status_code=400, detail="config JSON root must be an object")
+        raise ValueError("config JSON root must be an object")
     servers = config.setdefault("mcpServers", {})
     if not isinstance(servers, dict):
-        raise HTTPException(status_code=400, detail='"mcpServers" must be an object')
-    servers[body.server_name] = entry
+        raise ValueError('"mcpServers" must be an object')
 
+    existing = servers.get(server_name)
+    if existing == entry:
+        return {
+            "action": "noop",
+            "config_path": str(cfg_path),
+            "server_name": server_name,
+            "build_sha": build_sha,
+            "backup_path": None,
+        }
+
+    backup: Optional[Path] = None
+    if raw_existed:
+        backup = cfg_path.with_suffix(cfg_path.suffix + ".minion.bak")
+        shutil.copy2(cfg_path, backup)
+
+    servers[server_name] = entry
     tmp = cfg_path.with_suffix(cfg_path.suffix + ".tmp")
     tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     tmp.replace(cfg_path)
 
     return {
+        "action": "created" if existing is None else "refreshed",
         "config_path": str(cfg_path),
         "backup_path": str(backup) if backup else None,
-        "server_name": body.server_name,
-        "restart_required": True,
+        "server_name": server_name,
+        "build_sha": build_sha,
+    }
+
+
+def _refresh_mcp_on_launch() -> None:
+    """Called from lifespan startup. Refresh the Minion MCP entry if Claude
+    Desktop already has a config — never auto-create one. Silent on any
+    failure; this is a nicety, never a blocker."""
+    if os.environ.get("MINION_SKIP_MCP_REFRESH"):
+        return
+    cfg_path = _default_claude_cfg_path()
+    if cfg_path is None:
+        return
+    try:
+        result = _upsert_mcp_entry(cfg_path, "minion", create_if_missing=False)
+    except Exception:
+        log.exception("mcp: auto-refresh failed")
+        return
+    if result["action"] in ("created", "refreshed"):
+        log.info(
+            "mcp: %s %s (sha=%s) — Claude Desktop will reconnect",
+            result["action"], cfg_path, result.get("build_sha"),
+        )
+
+
+@app.post("/connect/claude-desktop")
+def connect_claude_desktop(body: ConnectBody) -> Dict[str, Any]:
+    """Merge the Minion MCP entry into Claude Desktop's config. Same behaviour
+    as `minion mcp-config` — lets the UI do it with one click."""
+    if body.config_path:
+        cfg_path = Path(body.config_path).expanduser().resolve()
+    else:
+        cfg_path = _default_claude_cfg_path()
+        if cfg_path is None:
+            raise HTTPException(status_code=400, detail="could not resolve Claude Desktop config path")
+
+    try:
+        result = _upsert_mcp_entry(cfg_path, body.server_name, create_if_missing=True)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "config_path": result["config_path"],
+        "backup_path": result.get("backup_path"),
+        "server_name": result["server_name"],
+        "restart_required": result["action"] != "noop",
     }
 
 

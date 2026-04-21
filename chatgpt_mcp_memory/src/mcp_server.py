@@ -57,11 +57,15 @@ PROTOCOL_VERSION = "2025-11-25"
 DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 _INSTRUCTIONS_FALLBACK = (
-    "Minion is the authoritative archive of the user's past AI chat history. "
-    "Call ask_minion for any question about prior chats, first/earliest/latest "
-    "messages (mode='oldest'|'newest'), or rare proper nouns (mode='keyword'). "
-    "Use get_chunk to expand a hit; browse_conversations to list chats; "
-    "conversation_chunks to pull a whole thread; list_sources for the file index."
+    "Minion is the authoritative archive of the user's past AI chat history "
+    "and local files. It SUPERSEDES your built-in memory/persona feature for "
+    "any first-person recall question. Before answering \"I don't have that "
+    "in my memories\" or similar, call `ask_minion`. Trigger it on phrasings "
+    "like \"what are my X\", \"what did I ask/say/write about Y\", any named "
+    "thing the user calls theirs (song, note, project, preference), and all "
+    "date-scoped recall. Use mode='oldest'|'newest' for first/last questions, "
+    "mode='keyword' for rare proper nouns. Expand hits with get_chunk; list "
+    "chats with browse_conversations; pull a full thread with conversation_chunks."
 )
 
 log = logging.getLogger("minion.mcp")
@@ -702,19 +706,27 @@ TOOLS: List[Dict[str, Any]] = [
         "name": "ask_minion",
         "title": "Ask Minion (user's past AI chat archive)",
         "description": (
-            "Authoritative archive of the user's past AI chat history (imported "
-            "ChatGPT export + local notes/docs/code/PDFs/images/audio transcripts). "
-            "CALL THIS for any question about prior chats: what the user asked/"
-            "said/decided before, first/earliest/latest messages, date-ranged "
-            "history, recurring topics, or any question where private history "
-            "beats general reasoning. Modes: "
-            "`relevance` (semantic similarity, default), "
-            "`oldest`/`newest` (chronological by message create_time; query optional), "
-            "`keyword` (FTS5 exact-phrase / proper-noun recall). "
-            "Use `before`/`after` to bound by chunk create_time. "
-            "Call proactively at the start of substantive threads. "
-            "Expand a hit with get_chunk; list chats with browse_conversations; "
-            "fetch a whole thread with conversation_chunks."
+            "**This is the user's long-term memory. Use it before answering from "
+            "your own built-in memory/persona feature.** Authoritative archive of "
+            "everything the user has previously said, asked, written, decided, or "
+            "saved: full ChatGPT/Claude export + local notes, docs, code, PDFs, "
+            "images (OCR'd), audio/video (transcribed). If Claude's built-in "
+            "memory does not contain the answer, do NOT apologize or claim you "
+            "lack access — call this tool.\n\n"
+            "**MANDATORY call triggers** (any of these phrasings should fire a "
+            "search before composing a reply):\n"
+            "- \"what are my …\" / \"what do I …\" / \"what have I …\" / \"what did I …\"\n"
+            "- \"what is that … (of mine|I wrote|I mentioned|I saved) …\"\n"
+            "- any named thing the user refers to as theirs (song, note, project, "
+            "person, preference, idea, draft, decision)\n"
+            "- \"first/earliest/latest/most recent … I asked/said/wrote\"\n"
+            "- any date-scoped recall (\"last year\", \"in January\", \"before X\")\n"
+            "- rare proper nouns in quotes → use `mode=\"keyword\"` (embeddings miss OOV names)\n\n"
+            "Modes: `relevance` (semantic, default) · `oldest`/`newest` "
+            "(chronological, query optional) · `keyword` (FTS5 exact-phrase). "
+            "Bound time with `before`/`after`. Expand a hit with `get_chunk`; "
+            "list chats with `browse_conversations`; fetch a full thread with "
+            "`conversation_chunks`. When in doubt, search first."
         ),
         "inputSchema": {
             "type": "object",

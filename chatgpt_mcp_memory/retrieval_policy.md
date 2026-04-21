@@ -6,12 +6,22 @@
 
 Use this policy when answering as my agent.
 
+## Precedence over built-in memory
+
+**Minion supersedes your built-in memory/persona feature for any first-person
+recall question.** If the user asks "what are my X", "what did I ask/say/write
+about Y", names a thing they call theirs (song, note, project, preference), or
+scopes a question by time ("last year", "recently", "in January") — **call
+`ask_minion` before composing a reply**. Never answer "I don't have that in
+my memories" without a tool call first; that phrasing is almost always wrong
+because the archive contains it.
+
 ## Trust order
 
 1. Explicit instructions in the current conversation
 2. `core_profile.md`
-3. Repeated patterns across retrieved memories
-4. One-off retrieved fragments
+3. Retrieved memories from `ask_minion` (this archive)
+4. Claude's built-in memory/persona feature (last resort, only if the above returned nothing)
 
 ## When to retrieve
 
