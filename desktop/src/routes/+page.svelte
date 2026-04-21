@@ -630,12 +630,13 @@
 
     (async () => {
       config = await getConfig();
-      await Promise.all([refreshStatus(), refreshSources()]);
-
-      // Hydrate active snapshot from /status (in case we started mid-run).
-      if (status?.active) active = status.active;
 
       startHeartbeatWatchdog();
+
+      // Register WS + bootstrap listeners BEFORE any HTTP call to the sidecar.
+      // On first launch `refreshStatus`/`fetchSources` reject until pip finishes —
+      // if those run first the whole IIFE threw and we never subscribed to
+      // `sidecar://status`, so the UI stayed on "starting" forever.
       const closeWs = await openEvents(
         async (msg) => {
         lastHeartbeat = Date.now();
@@ -712,6 +713,12 @@
         heartbeatTimer = null;
       });
 
+      // Sidecar bootstrap progress (venv / pip).
+      const unlistenSidecar = await onSidecarStatus((s) => {
+        sidecar = s;
+      });
+      unlistens.push(unlistenSidecar);
+
       // Tauri v2 native drag-drop events.
       const unlistenDrop = await listen<{ paths: string[] }>("tauri://drag-drop", async (e) => {
         dragging = false;
@@ -736,18 +743,19 @@
           else logLine("vision", line);
         },
       );
-      // Sidecar bootstrap (first-launch venv + pip) progress. Show overlay
-      // until state==="ready"; "error" leaves the overlay up with the msg.
-      const unlistenSidecar = await onSidecarStatus((s) => {
-        sidecar = s;
-      });
       unlistens.push(
         () => unlistenDrop(),
         () => unlistenEnter(),
         () => unlistenLeave(),
         () => unlistenVision(),
-        unlistenSidecar,
       );
+
+      try {
+        await Promise.all([refreshStatus(), refreshSources()]);
+        if (status?.active) active = status.active;
+      } catch {
+        /* sidecar still installing — WS + overlay will catch up when it's up */
+      }
     })();
 
     // Braille spinner tick for in-flight rows. 10 fps is smooth without thrash.
