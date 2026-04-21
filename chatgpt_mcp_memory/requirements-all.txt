@@ -2,4 +2,5 @@
 -r requirements-docs.txt
 -r requirements-images.txt
 -r requirements-audio.txt
+-r requirements-video.txt
 -r requirements-code.txt

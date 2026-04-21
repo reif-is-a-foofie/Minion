@@ -1,0 +1,6 @@
+# Optional: video ingestion. Pulls in whisper (audio track) + rapidocr
+# (keyframe OCR) + scenedetect (shot boundaries). Captioning reuses whatever
+# ollama vision model $MINION_VISION_MODEL points at; no pip dep needed.
+-r requirements-audio.txt
+-r requirements-images.txt
+scenedetect[opencv]>=0.6

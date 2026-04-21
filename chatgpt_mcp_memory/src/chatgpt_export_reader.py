@@ -47,7 +47,19 @@ def get_linear_path(mapping: Dict[str, Any], current_node: str) -> List[str]:
 
 
 def iter_conversation_json_paths(export_dir: str) -> List[str]:
-    return sorted(glob.glob(os.path.join(export_dir, "conversations-*.json")))
+    # ChatGPT export shapes we accept:
+    #   * classic single-file `conversations.json`
+    #   * chunked OpenAI exports: `conversations-<n>.json` / `conversations-YYYY-MM-DD.json`
+    #   * third-party per-conversation exporters: one file per chat in a
+    #     `json/` subfolder, filenames `YYYY-MM-DD_<slug>_<hash>.json`
+    # Dedup because some exports include multiple shapes.
+    paths = set(glob.glob(os.path.join(export_dir, "conversations.json")))
+    paths.update(glob.glob(os.path.join(export_dir, "conversations-*.json")))
+    if not paths:
+        # Per-conversation layout: `<root>/json/YYYY-MM-DD_*.json`
+        per_conv = glob.glob(os.path.join(export_dir, "json", "[12][0-9][0-9][0-9]-*.json"))
+        paths.update(per_conv)
+    return sorted(paths)
 
 
 def load_conversations_from_export(export_dir: str) -> List[Dict[str, Any]]:

@@ -29,6 +29,7 @@ import os
 import shutil
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -39,7 +40,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from ingest import ingest_file
+from ingest import ingest_file, _looks_like_chatgpt_export
 from parsers import supported_extensions
 from store import (
     DB_FILENAME,
@@ -68,18 +69,22 @@ class State:
     inbox: Path
     db_path: Path
     loop: Optional[asyncio.AbstractEventLoop] = None
-    _conn: Optional[sqlite3.Connection] = None
-    _conn_lock: threading.Lock = threading.Lock()
-    # Per-connection ingest snapshots; keys are websocket ids.
+    # sqlite3 connections are single-thread; FastAPI dispatches sync handlers
+    # onto a threadpool, so we stash one connection per thread.
+    _tls: threading.local = threading.local()
     subscribers: Set[WebSocket] = set()
     subscribers_lock: asyncio.Lock = None  # initialised in lifespan
+    # Active-ingest snapshot (for UI progress card) + lock guarding it.
+    active: Dict[str, Any] = {"root": None, "total": 0, "done": 0, "added": 0, "skipped": 0}
+    active_lock: threading.Lock = threading.Lock()
 
     @classmethod
     def conn(cls) -> sqlite3.Connection:
-        with cls._conn_lock:
-            if cls._conn is None:
-                cls._conn = connect(cls.db_path)
-            return cls._conn
+        c = getattr(cls._tls, "conn", None)
+        if c is None:
+            c = connect(cls.db_path)
+            cls._tls.conn = c
+        return c
 
 
 def _resolve_paths() -> None:
@@ -145,16 +150,105 @@ def _start_watcher() -> None:
     try:
         from watcher import reconcile_once, start_background
 
-        # Initial reconcile on the main thread, then broadcast the seed state.
-        conn = State.conn()
-        reconcile_once(conn, State.inbox)
-        _schedule_broadcast({"type": "ready", "counts": _counts()})
-
         def _factory() -> sqlite3.Connection:
             return connect(State.db_path)
 
+        def _on_watcher_event(kind: str, payload: Dict[str, Any]) -> None:
+            # Translate watcher events into the same schema the UI already
+            # consumes from /ingest so the feed and progress bar light up
+            # regardless of whether a drop came via HTTP or the file system.
+            if kind == "batch_started":
+                with State.active_lock:
+                    State.active = {
+                        "root": "watcher",
+                        "total": int(payload.get("total", 0)),
+                        "done": 0,
+                        "added": 0,
+                        "skipped": 0,
+                    }
+                _schedule_broadcast({
+                    "type": "ingest_started",
+                    "source": "watcher",
+                    "count": payload.get("total", 0),
+                    "active": dict(State.active),
+                })
+            elif kind == "file_started":
+                _schedule_broadcast({
+                    "type": "ingest_progress",
+                    "path": payload.get("path"),
+                    "index": payload.get("index"),
+                    "total": payload.get("total"),
+                })
+            elif kind == "file_progress":
+                # Forward parser/embed stage events verbatim; UI formats them.
+                _schedule_broadcast({
+                    "type": "file_progress",
+                    **{k: v for k, v in payload.items() if k != "type"},
+                })
+            elif kind == "file_done":
+                skipped = bool(payload.get("skipped"))
+                with State.active_lock:
+                    State.active["done"] = int(payload.get("index", State.active["done"]))
+                    if skipped:
+                        State.active["skipped"] += 1
+                    elif payload.get("source_id"):
+                        State.active["added"] += 1
+                _schedule_broadcast({
+                    "type": "ingest_skipped" if skipped else "source_updated",
+                    "result": payload,
+                    "counts": _counts(),
+                    "active": dict(State.active),
+                })
+            elif kind == "file_failed":
+                with State.active_lock:
+                    State.active["done"] = int(payload.get("index", State.active["done"]))
+                    State.active["skipped"] += 1
+                _schedule_broadcast({
+                    "type": "ingest_failed",
+                    "path": payload.get("path"),
+                    "active": dict(State.active),
+                })
+            elif kind == "batch_done":
+                snap = None
+                with State.active_lock:
+                    snap = dict(State.active)
+                    State.active = {"root": None, "total": 0, "done": 0, "added": 0, "skipped": 0}
+                _schedule_broadcast({
+                    "type": "tree_done",
+                    "root": "watcher",
+                    "added": snap.get("added", 0),
+                    "skipped": snap.get("skipped", 0),
+                    "counts": _counts(),
+                })
+            elif kind == "removed":
+                _schedule_broadcast({
+                    "type": "source_removed",
+                    "key": payload.get("path"),
+                    "counts": _counts(),
+                })
+
+        # Reconcile in a background thread so lifespan startup finishes
+        # immediately -- a large pre-existing inbox shouldn't block the
+        # socket from binding. We broadcast "ready" once it's done.
+        def _reconcile_bg() -> None:
+            try:
+                bg_conn = connect(State.db_path)
+                try:
+                    reconcile_once(bg_conn, State.inbox, on_event=_on_watcher_event)
+                finally:
+                    bg_conn.close()
+                _schedule_broadcast({"type": "ready", "counts": _counts()})
+            except Exception:
+                log.exception("startup reconcile failed")
+
+        threading.Thread(
+            target=_reconcile_bg, name="minion-api-reconcile", daemon=True
+        ).start()
+
         global _watcher_thread, _watcher_poll_thread
-        _watcher_thread = start_background(_factory, State.inbox)
+        _watcher_thread = start_background(
+            _factory, State.inbox, on_event=_on_watcher_event
+        )
 
         # Even with watchdog, we emit periodic heartbeats so the UI can show
         # a live count without polling the HTTP API.
@@ -271,12 +365,15 @@ class ConnectBody(BaseModel):
 
 @app.get("/status")
 def status() -> Dict[str, Any]:
+    with State.active_lock:
+        active = dict(State.active)
     return {
         "data_dir": str(State.data_dir),
         "inbox": str(State.inbox),
         "db_path": str(State.db_path),
         "supported_extensions": supported_extensions(),
         "counts": _counts(),
+        "active": active,
         "watcher": {
             "running": _watcher_thread is not None and _watcher_thread.is_alive()
             if _watcher_thread
@@ -422,32 +519,57 @@ def _resolve_dir_dest(src_dir: Path) -> Path:
 
 
 def _copy_tree_into_inbox(src_dir: Path, dest_root: Path) -> List[Path]:
-    """Mirror src_dir into dest_root under the inbox, skipping junk dirs."""
-    dest_root.mkdir(parents=True, exist_ok=True)
+    """Mirror src_dir into dest_root under the inbox, skipping junk dirs.
+
+    Implementation note: we stage the copy into a sibling dir OUTSIDE the
+    inbox first, then atomically rename it into place. Without this, the
+    watcher's fs-event debouncer can flush on the first copied file - long
+    before the rest of the tree arrives - and mis-detect a ChatGPT export
+    as a single loose JSON. The rename guarantees the tree materializes
+    under the inbox as one consistent burst of events.
+    """
     copied: List[Path] = []
-    stack: List[Path] = [src_dir]
-    while stack:
-        cur = stack.pop()
-        try:
-            entries = list(cur.iterdir())
-        except OSError:
-            continue
-        for p in entries:
-            if p.name.startswith("."):
+    staging_parent = State.data_dir / ".staging"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(tempfile.mkdtemp(prefix="ingest-", dir=str(staging_parent)))
+    stage_target = staging_dir / dest_root.name
+    stage_target.mkdir(parents=True, exist_ok=True)
+
+    try:
+        stack: List[Path] = [src_dir]
+        while stack:
+            cur = stack.pop()
+            try:
+                entries = list(cur.iterdir())
+            except OSError:
                 continue
-            rel = p.relative_to(src_dir)
-            target = dest_root / rel
-            if p.is_dir():
-                if p.name in SKIP_DIR_NAMES:
+            for p in entries:
+                if p.name.startswith("."):
                     continue
-                target.mkdir(parents=True, exist_ok=True)
-                stack.append(p)
-            elif p.is_file():
-                try:
-                    shutil.copy2(str(p), str(target))
-                    copied.append(target)
-                except OSError:
-                    log.exception("copy failed: %s", p)
+                rel = p.relative_to(src_dir)
+                target = stage_target / rel
+                if p.is_dir():
+                    if p.name in SKIP_DIR_NAMES:
+                        continue
+                    target.mkdir(parents=True, exist_ok=True)
+                    stack.append(p)
+                elif p.is_file():
+                    try:
+                        shutil.copy2(str(p), str(target))
+                    except OSError:
+                        log.exception("copy failed: %s", p)
+
+        # Atomic-ish move into the inbox. Same filesystem (data_dir and
+        # data_dir/inbox share a parent), so os.rename is a metadata op
+        # and the watcher sees the tree appear as one event burst.
+        dest_root.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(str(stage_target), str(dest_root))
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+    for root, _, files in os.walk(dest_root):
+        for name in files:
+            copied.append(Path(root) / name)
     return copied
 
 
@@ -477,10 +599,40 @@ async def ingest_endpoint(body: IngestBody) -> Dict[str, Any]:
             else:
                 _copy_tree_into_inbox(src_path, inbox_root)
 
+        # ChatGPT export directories are a single logical source, not a
+        # pile of loose JSONs. Hand the entire tree to the watcher: it
+        # detects export dirs in `_find_chatgpt_export_dirs` and ingests
+        # them via the chatgpt_export parser in one atomic pass. Running
+        # a duplicate dir-ingest from here would race the watcher on the
+        # same source_id and blank out the DB on commit-collision.
+        if _looks_like_chatgpt_export(inbox_root):
+            await _broadcast({
+                "type": "ingest_started",
+                "path": str(inbox_root),
+                "count": 1,
+                "kind_hint": "chatgpt-export",
+                "note": "watcher will ingest as a single source",
+            })
+            return {"queued": str(inbox_root), "kind": "chatgpt-export", "file_count": 1}
+
         files = _iter_files_in_tree(inbox_root)
 
         async def _run_tree() -> None:
-            await _broadcast({"type": "ingest_started", "path": str(inbox_root), "count": len(files)})
+            with State.active_lock:
+                State.active = {
+                    "root": str(inbox_root),
+                    "total": len(files),
+                    "done": 0,
+                    "added": 0,
+                    "skipped": 0,
+                }
+                snap = dict(State.active)
+            await _broadcast({
+                "type": "ingest_started",
+                "path": str(inbox_root),
+                "count": len(files),
+                "active": snap,
+            })
             loop = asyncio.get_running_loop()
 
             def _work_one(p: Path) -> Dict[str, Any]:
@@ -499,25 +651,42 @@ async def ingest_endpoint(body: IngestBody) -> Dict[str, Any]:
                 finally:
                     conn.close()
 
-            added = 0
-            skipped = 0
-            for p in files:
+            for i, p in enumerate(files, 1):
+                await _broadcast({
+                    "type": "ingest_progress",
+                    "path": str(p),
+                    "index": i,
+                    "total": len(files),
+                })
                 res = await loop.run_in_executor(None, _work_one, p)
+                with State.active_lock:
+                    State.active["done"] = i
+                    if res.get("source_id"):
+                        State.active["added"] += 1
+                    else:
+                        State.active["skipped"] += 1
+                    snap = dict(State.active)
                 if res.get("source_id"):
-                    added += 1
                     await _broadcast({
                         "type": "source_updated",
                         "result": res,
                         "counts": _counts(),
+                        "active": snap,
                     })
                 else:
-                    skipped += 1
-                    await _broadcast({"type": "ingest_skipped", "result": res})
+                    await _broadcast({
+                        "type": "ingest_skipped",
+                        "result": res,
+                        "active": snap,
+                    })
+            with State.active_lock:
+                final = dict(State.active)
+                State.active = {"root": None, "total": 0, "done": 0, "added": 0, "skipped": 0}
             await _broadcast({
                 "type": "tree_done",
                 "root": str(inbox_root),
-                "added": added,
-                "skipped": skipped,
+                "added": final.get("added", 0),
+                "skipped": final.get("skipped", 0),
                 "counts": _counts(),
             })
 
@@ -758,7 +927,13 @@ async def events_ws(ws: WebSocket) -> None:
         State.subscribers.add(ws)
     # Send a snapshot on connect so the UI hydrates without a separate fetch.
     try:
-        await ws.send_json({"type": "snapshot", "counts": _counts()})
+        with State.active_lock:
+            active = dict(State.active)
+        await ws.send_json({
+            "type": "snapshot",
+            "counts": _counts(),
+            "active": active,
+        })
         while True:
             # We don't expect client messages; drain to keep the connection alive.
             await ws.receive_text()

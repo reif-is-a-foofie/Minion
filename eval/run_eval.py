@@ -249,6 +249,9 @@ class MCPStdioClient:
         role: Optional[str] = None,
         max_chars: int = 900,
         dedupe_by_conversation: bool = True,
+        mode: Optional[str] = None,
+        before: Optional[float] = None,
+        after: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         args: Dict[str, Any] = {
             "query": query,
@@ -258,6 +261,12 @@ class MCPStdioClient:
         }
         if role:
             args["role"] = role
+        if mode:
+            args["mode"] = mode
+        if before is not None:
+            args["before"] = before
+        if after is not None:
+            args["after"] = after
         result = self.call_tool("ask_minion", args)
         structured = result.get("structuredContent")
         # New shape: {"results": [...], optional "profile_brief": "..."}.

@@ -36,22 +36,34 @@ export type SearchHit = {
   meta?: Record<string, unknown>;
 };
 
+export type Active = {
+  root: string | null;
+  total: number;
+  done: number;
+  added: number;
+  skipped: number;
+};
+
 export type Status = {
   data_dir: string;
   inbox: string;
   db_path: string;
   supported_extensions: string[];
   counts: { sources: number; chunks: number };
+  active: Active;
   watcher: { running: boolean };
 };
 
 export type EventMsg =
-  | { type: "snapshot"; counts: { sources: number; chunks: number } }
-  | { type: "ready"; counts: { sources: number; chunks: number } }
-  | { type: "heartbeat"; counts: { sources: number; chunks: number } }
-  | { type: "ingest_started"; path: string }
-  | { type: "ingest_skipped"; result: Record<string, unknown> }
-  | { type: "source_updated"; result: Record<string, unknown>; counts: any }
+  | { type: "snapshot"; counts: { sources: number; chunks: number }; active?: Active }
+  | { type: "ready"; counts: { sources: number; chunks: number }; active?: Active }
+  | { type: "heartbeat"; counts: { sources: number; chunks: number }; active?: Active }
+  | { type: "ingest_started"; path?: string; source?: string; count?: number; active?: Active }
+  | { type: "ingest_progress"; path: string; index: number; total: number }
+  | { type: "file_progress"; path: string; index: number; total: number; stage: string; [k: string]: any }
+  | { type: "ingest_skipped"; result: Record<string, unknown>; active?: Active }
+  | { type: "ingest_failed"; path: string; active?: Active }
+  | { type: "source_updated"; result: Record<string, unknown>; counts: any; active?: Active }
   | { type: "source_removed"; key: string; counts: any }
   | { type: "tree_done"; root: string; added: number; skipped: number; counts: any };
 
@@ -133,31 +145,83 @@ export async function deleteSource(body: { path?: string; source_id?: string }):
   });
 }
 
-export async function openEvents(onMessage: (e: EventMsg) => void): Promise<() => void> {
-  const cfg = await getConfig();
-  const ws = new WebSocket(`${cfg.api_base.replace("http", "ws")}/events`);
-  ws.onmessage = (ev) => {
-    try {
-      onMessage(JSON.parse(ev.data));
-    } catch {
-      // ignore malformed
-    }
-  };
-  // Auto-reconnect on close with a small backoff. The sidecar restart during
-  // dev happens fast enough that a 1.5s retry is usually enough.
+export type ConnState = "connecting" | "open" | "closed";
+
+export async function openEvents(
+  onMessage: (e: EventMsg) => void,
+  onStatus?: (s: ConnState) => void,
+): Promise<() => void> {
   let closed = false;
-  ws.onclose = () => {
+  let ws: WebSocket | null = null;
+
+  const connect = async () => {
     if (closed) return;
-    setTimeout(() => openEvents(onMessage), 1500);
+    onStatus?.("connecting");
+    const cfg = await getConfig();
+    ws = new WebSocket(`${cfg.api_base.replace("http", "ws")}/events`);
+    ws.onopen = () => onStatus?.("open");
+    ws.onmessage = (ev) => {
+      try {
+        onMessage(JSON.parse(ev.data));
+      } catch {
+        // ignore malformed
+      }
+    };
+    ws.onclose = () => {
+      if (closed) return;
+      onStatus?.("closed");
+      // Sidecar restart takes ~1-3s; retry with a short backoff.
+      setTimeout(connect, 1500);
+    };
+    ws.onerror = () => onStatus?.("closed");
   };
+  await connect();
+
   return () => {
     closed = true;
-    ws.close();
+    ws?.close();
   };
 }
 
-export async function copyIntoInbox(paths: string[]): Promise<string[]> {
-  return (await invoke("copy_into_inbox", { paths })) as string[];
+export async function restartSidecar(): Promise<{ pid: number; api_port: number }> {
+  return (await invoke("restart_sidecar")) as { pid: number; api_port: number };
+}
+
+export type VisionState = "unavailable" | "off" | "pulling" | "ready";
+export type VisionStatus = {
+  state: VisionState;
+  model: string;
+  installed: boolean;
+  server_up: boolean;
+};
+
+export async function visionStatus(): Promise<VisionStatus> {
+  return (await invoke("vision_status")) as VisionStatus;
+}
+
+export async function ensureVisionModel(model?: string): Promise<{ state: VisionState; model: string }> {
+  return (await invoke("ensure_vision_model", { model })) as { state: VisionState; model: string };
+}
+
+export type CopyDrop = {
+  source: string;
+  kind: "file" | "directory" | "missing" | "unsupported" | "duplicate";
+  dest?: string;
+  copied: number;
+  bytes: number;
+  skipped_dirs?: number;
+  skipped_dotfiles?: number;
+  errors?: string[];
+  paths?: string[];
+};
+
+export type CopyResult = {
+  drops: CopyDrop[];
+  inbox: string;
+};
+
+export async function copyIntoInbox(paths: string[]): Promise<CopyResult> {
+  return (await invoke("copy_into_inbox", { paths })) as CopyResult;
 }
 
 export async function revealInFinder(path: string): Promise<void> {

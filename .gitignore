@@ -1,9 +1,9 @@
 .DS_Store
 Untitled.png
 
-# Local virtualenvs
-.venv/
-**/.venv/
+# Local virtualenvs (match .venv, .venv-old-py39, etc.)
+.venv*/
+**/.venv*/
 
 # ChatGPT exports / raw dumps
 conversations-*.json

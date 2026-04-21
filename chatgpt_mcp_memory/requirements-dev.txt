@@ -1,0 +1,5 @@
+# Dev-only: smoke tests for the FastAPI sidecar (and future unit tests).
+# Not shipped to end users.
+pytest>=8
+httpx>=0.27
+websockets>=12

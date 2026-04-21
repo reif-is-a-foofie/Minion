@@ -22,9 +22,103 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Set
 
-from ingest import IngestResult, ingest_file
+from ingest import _ARCHIVE_EXTS, IngestResult, _looks_like_chatgpt_export, ingest_file
 from parsers import choose_parser
 from store import delete_source_by_path, iter_source_ids, sha256_of_file
+
+
+def _is_ingestable(p: Path) -> bool:
+    """A file is ingestable if a parser claims it OR it's an archive we unpack."""
+    if choose_parser(p) is not None:
+        return True
+    return p.suffix.lower() in _ARCHIVE_EXTS
+
+
+# Parser-cost tiers for priority-ordered ingest. Text-bearing parsers land
+# first so search becomes useful within seconds; slow media parsers trail.
+# Tier 0 ~ sub-second per file (plain text extraction).
+# Tier 1 ~ seconds per file  (OCR over rapidocr / ollama vision).
+# Tier 2 ~ tens of seconds   (faster-whisper transcription; grows with duration).
+_PARSER_TIER: Dict[str, int] = {
+    "text": 0, "html": 0, "code": 0, "pdf": 0, "docx": 0, "chatgpt-export": 0,
+    "image": 1,
+    "audio": 2,
+    "video": 3,  # transcript + per-scene frame OCR/caption; slowest of all
+}
+
+
+def _parser_tier(p: Path) -> int:
+    """Return cost tier for sorting; unknown kinds sort to the end."""
+    # Archives are unpacked into the inbox; let them run after text but
+    # before slow media so their contents surface quickly.
+    if p.suffix.lower() in _ARCHIVE_EXTS:
+        return 0
+    chosen = choose_parser(p)
+    if not chosen:
+        return 3
+    kind = chosen[0]
+    return _PARSER_TIER.get(kind, 3)
+
+
+def _find_chatgpt_export_dirs(inbox: Path) -> List[Path]:
+    """Return any directory under `inbox` that looks like a ChatGPT export.
+
+    We walk one level deep only (inbox children + grandchildren) to avoid a
+    full-tree scan on every reconcile. ChatGPT exports are always dropped as
+    a single top-level folder; we don't expect them nested deeply.
+    """
+    if not inbox.exists():
+        return []
+    found: List[Path] = []
+    if _looks_like_chatgpt_export(inbox):
+        found.append(inbox)
+        return found
+    for child in inbox.iterdir():
+        if child.is_dir() and _looks_like_chatgpt_export(child):
+            found.append(child)
+    return found
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _is_owned_by_chatgpt_export(path: Path, export_root: Path) -> bool:
+    """True if `path` is a file the chatgpt_export parser already handles,
+    so the per-file dispatcher should skip it.
+
+    Claimed:
+    - `<export>/conversations*.json` (native OpenAI layout)
+    - `<export>/json/*.json`          (per-conversation layout)
+    - `<export>/markdown/*.md`        (markdown twins; duplicative)
+    - `<export>/conversation-index.json`, `<export>/.export-progress.json`
+
+    NOT claimed (fall through to per-file parsers so OCR/audio/etc. work):
+    - `<export>/files/*`             (attachments)
+    - anything else inside the export root
+    """
+    try:
+        rel = path.resolve().relative_to(export_root.resolve())
+    except ValueError:
+        return False
+    parts = rel.parts
+    if len(parts) == 1:
+        name = parts[0]
+        if name.startswith("conversations") and name.endswith(".json"):
+            return True
+        if name in {"conversation-index.json", ".export-progress.json"}:
+            return True
+        return False
+    top = parts[0]
+    if top == "json" and rel.suffix.lower() == ".json":
+        return True
+    if top == "markdown" and rel.suffix.lower() in {".md", ".markdown"}:
+        return True
+    return False
 
 
 log = logging.getLogger("minion.watcher")
@@ -61,7 +155,7 @@ def reconcile_once(
     inbox: Path,
     *,
     force: bool = False,
-    on_event: Optional[Callable[[str, IngestResult], None]] = None,
+    on_event: Optional[Callable[[str, Dict[str, object]], None]] = None,
 ) -> ReconcileReport:
     """
     Walk the inbox, sync each file to DB, delete DB rows for files that
@@ -71,16 +165,49 @@ def reconcile_once(
     inbox.mkdir(parents=True, exist_ok=True)
     report = ReconcileReport()
 
+    # ChatGPT export directories are single logical sources. Ingest each one
+    # as a whole, then exclude their internal files from the per-file walk so
+    # the generic text parser doesn't shred the per-conversation JSONs.
+    export_dirs: List[Path] = [d.resolve() for d in _find_chatgpt_export_dirs(inbox)]
+    for export_dir in export_dirs:
+        try:
+            res = ingest_file(conn, export_dir, force=force)
+        except Exception:
+            log.exception("chatgpt-export ingest failed: %s", export_dir)
+            report.errors += 1
+            continue
+        if res.skipped:
+            report.skipped += 1
+            log.info("skipped export dir %s (%s)", export_dir, res.reason)
+        elif res.source_id:
+            report.added += 1
+            log.info(
+                "ingested export dir %s kind=%s parser=%s chunks=%d",
+                export_dir, res.kind, res.parser, res.chunk_count,
+            )
+        report.details.append(res)
+
     on_disk: Dict[str, Path] = {}
     for p in _iter_inbox_files(inbox):
-        if choose_parser(p) is None:
+        if not _is_ingestable(p):
+            continue
+        # Only skip files the chatgpt_export parser already claims
+        # (JSON manifests + markdown twins). Attachments under `files/`
+        # still flow through their per-file parsers so images get OCR'd.
+        if any(_is_owned_by_chatgpt_export(p, d) for d in export_dirs):
             continue
         on_disk[str(p)] = p
 
     # Drop tracked sources that no longer exist (within the inbox only).
+    # Keep directory-level ChatGPT-export sources: their path is the export
+    # root, not a file in on_disk, so naive file-presence check would wipe
+    # the text index on every startup.
     inbox_str = str(inbox)
+    live_export_paths = {str(d) for d in export_dirs}
     for source_id, path, _sha, _mtime in list(iter_source_ids(conn)):
         if not path.startswith(inbox_str):
+            continue
+        if path in live_export_paths:
             continue
         if path not in on_disk:
             n = delete_source_by_path(conn, path)
@@ -88,9 +215,40 @@ def reconcile_once(
                 report.deleted += 1
                 log.info("removed source (file gone): %s (%d chunks)", path, n)
 
-    for spath, p in on_disk.items():
+    # Surface reconcile as a single batch so the UI can show
+    # a progress card on startup just like a drag-drop. Priority-order
+    # the items so a restart with mixed media surfaces text-based search
+    # hits long before OCR/whisper finish.
+    items = sorted(on_disk.items(), key=lambda kv: (_parser_tier(kv[1]), kv[0]))
+    total = len(items)
+    if on_event and total:
         try:
-            res = ingest_file(conn, p, force=force)
+            on_event("batch_started", {"total": total})  # type: ignore[arg-type]
+        except Exception:
+            pass
+
+    for i, (spath, p) in enumerate(items, 1):
+        if on_event:
+            try:
+                on_event("file_started", {"path": spath, "index": i, "total": total})  # type: ignore[arg-type]
+            except Exception:
+                pass
+
+            def _file_progress(stage: str, info: Dict[str, object], _p=spath, _i=i, _t=total) -> None:
+                payload = {"path": _p, "index": _i, "total": _t, "stage": stage}
+                payload.update(info)
+                try:
+                    on_event("file_progress", payload)  # type: ignore[arg-type]
+                except Exception:
+                    pass
+        else:
+            _file_progress = None  # type: ignore[assignment]
+
+        try:
+            kwargs = {"force": force}
+            if on_event:
+                kwargs["on_progress"] = _file_progress  # type: ignore[assignment]
+            res = ingest_file(conn, p, **kwargs)
         except Exception as e:  # pragma: no cover - defensive
             log.exception("ingest failed: %s", p)
             report.errors += 1
@@ -107,8 +265,27 @@ def reconcile_once(
                 log.info("ingested %s kind=%s parser=%s chunks=%d",
                          p, res.kind, res.parser, res.chunk_count)
         if on_event:
-            on_event("reconcile", res)
+            try:
+                on_event("file_done", {
+                    "path": res.path,
+                    "source_id": res.source_id,
+                    "kind": res.kind,
+                    "parser": res.parser,
+                    "chunk_count": res.chunk_count,
+                    "skipped": res.skipped,
+                    "reason": res.reason,
+                    "index": i,
+                    "total": total,
+                })  # type: ignore[arg-type]
+            except Exception:
+                pass
         report.details.append(res)
+
+    if on_event and total:
+        try:
+            on_event("batch_done", {"total": total})  # type: ignore[arg-type]
+        except Exception:
+            pass
 
     return report
 
@@ -154,6 +331,7 @@ def start_background(
     inbox: Path,
     *,
     debounce: float = DEFAULT_DEBOUNCE_SEC,
+    on_event: Optional[Callable[[str, Dict[str, object]], None]] = None,
 ) -> Optional[threading.Thread]:
     """
     Start the watcher in a background daemon thread.
@@ -170,26 +348,125 @@ def start_background(
     inbox = Path(inbox).expanduser().resolve()
     inbox.mkdir(parents=True, exist_ok=True)
 
+    def _emit(kind: str, payload: Dict[str, object]) -> None:
+        if on_event is None:
+            return
+        try:
+            on_event(kind, payload)
+        except Exception:
+            log.exception("on_event callback failed")
+
     def _handle_batch(paths: Set[str]) -> None:
         conn = conn_factory()
         try:
+            # Snapshot ChatGPT export dirs present in the inbox right now; any
+            # file event inside one collapses to a single dir-level ingest.
+            export_dirs: List[Path] = [d.resolve() for d in _find_chatgpt_export_dirs(inbox)]
+
+            # Filter to actionable paths up front so batch_total is accurate.
+            actionable: List[Path] = []
+            export_dirs_to_ingest: Set[Path] = set()
             for path_str in paths:
                 p = Path(path_str)
                 if not p.exists():
-                    delete_source_by_path(conn, path_str)
-                    log.info("removed source (deleted): %s", path_str)
+                    n = delete_source_by_path(conn, path_str)
+                    if n:
+                        log.info("removed source (deleted): %s", path_str)
+                        _emit("removed", {"path": path_str, "chunks": n})
                     continue
-                if not p.is_file() or choose_parser(p) is None:
+                # Files under an export dir split two ways: the text-bearing
+                # manifests are owned by the dir-level chatgpt_export source
+                # (redirect), everything else (attachments) flows through
+                # its own parser so OCR/whisper/etc. still run.
+                owning_export = next(
+                    (d for d in export_dirs if _is_owned_by_chatgpt_export(p, d)),
+                    None,
+                )
+                if owning_export is not None:
+                    export_dirs_to_ingest.add(owning_export)
                     continue
+                if not p.is_file() or not _is_ingestable(p):
+                    continue
+                actionable.append(p)
+
+            # Ingest any affected export dirs as single sources. Each one is
+            # its own batch-of-one so the UI progress card treats it the same
+            # as a file drop (batch_started -> file_progress -> file_done ->
+            # batch_done).
+            for export_dir in export_dirs_to_ingest:
+                _emit("batch_started", {"total": 1})
+                _emit("file_started", {"path": str(export_dir), "index": 1, "total": 1})
+
+                def _export_progress(stage: str, info: Dict[str, object], _p=export_dir) -> None:
+                    payload = {"path": str(_p), "index": 1, "total": 1, "stage": stage}
+                    payload.update(info)
+                    _emit("file_progress", payload)
+
                 try:
-                    res = ingest_file(conn, p)
+                    res = ingest_file(conn, export_dir, on_progress=_export_progress)
+                    if not res.skipped:
+                        log.info(
+                            "live ingested export dir %s kind=%s parser=%s chunks=%d",
+                            export_dir, res.kind, res.parser, res.chunk_count,
+                        )
+                    _emit("file_done", {
+                        "path": res.path,
+                        "source_id": res.source_id,
+                        "kind": res.kind,
+                        "parser": res.parser,
+                        "chunk_count": res.chunk_count,
+                        "skipped": res.skipped,
+                        "reason": res.reason,
+                        "index": 1,
+                        "total": 1,
+                    })
+                except Exception:
+                    log.exception("live export-dir ingest failed: %s", export_dir)
+                    _emit("file_failed", {"path": str(export_dir), "index": 1, "total": 1})
+                _emit("batch_done", {"total": 1})
+
+            if not actionable:
+                return
+
+            # Priority-order: text first, then OCR, then transcription.
+            # Stable secondary sort on path so runs are deterministic.
+            actionable.sort(key=lambda p: (_parser_tier(p), str(p)))
+
+            total = len(actionable)
+            _emit("batch_started", {"total": total})
+            for i, p in enumerate(actionable, 1):
+                _emit("file_started", {"path": str(p), "index": i, "total": total})
+
+                def _file_progress(stage: str, info: Dict[str, object], _p=p, _i=i, _t=total) -> None:
+                    payload = {"path": str(_p), "index": _i, "total": _t, "stage": stage}
+                    payload.update(info)
+                    _emit("file_progress", payload)
+
+                try:
+                    res = ingest_file(conn, p, on_progress=_file_progress)
                     if not res.skipped:
                         log.info(
                             "live ingested %s kind=%s parser=%s chunks=%d",
                             p, res.kind, res.parser, res.chunk_count,
                         )
+                    _emit(
+                        "file_done",
+                        {
+                            "path": res.path,
+                            "source_id": res.source_id,
+                            "kind": res.kind,
+                            "parser": res.parser,
+                            "chunk_count": res.chunk_count,
+                            "skipped": res.skipped,
+                            "reason": res.reason,
+                            "index": i,
+                            "total": total,
+                        },
+                    )
                 except Exception:
                     log.exception("live ingest failed: %s", p)
+                    _emit("file_failed", {"path": str(p), "index": i, "total": total})
+            _emit("batch_done", {"total": total})
         finally:
             conn.close()
 

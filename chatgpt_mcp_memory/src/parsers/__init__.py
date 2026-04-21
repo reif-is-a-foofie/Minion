@@ -66,18 +66,23 @@ _EXT_REGISTRY: Dict[str, Tuple[str, str, str]] = {
     ".bmp":  ("image", "parsers.image", "parse"),
     ".tif":  ("image", "parsers.image", "parse"),
     ".tiff": ("image", "parsers.image", "parse"),
-    # Audio / video (audio track)
+    # Audio (speech-only parser; faster-whisper transcription).
     ".mp3":  ("audio", "parsers.audio", "parse"),
     ".wav":  ("audio", "parsers.audio", "parse"),
     ".m4a":  ("audio", "parsers.audio", "parse"),
     ".flac": ("audio", "parsers.audio", "parse"),
     ".ogg":  ("audio", "parsers.audio", "parse"),
     ".opus": ("audio", "parsers.audio", "parse"),
-    ".mp4":  ("audio", "parsers.audio", "parse"),
-    ".mov":  ("audio", "parsers.audio", "parse"),
-    ".webm": ("audio", "parsers.audio", "parse"),
-    # ChatGPT export archives
-    ".zip":  ("chatgpt-export", "parsers.chatgpt_export", "parse"),
+    # Video (scene-aware: whisper transcript + keyframe OCR + optional caption).
+    ".mp4":  ("video", "parsers.video", "parse"),
+    ".mov":  ("video", "parsers.video", "parse"),
+    ".webm": ("video", "parsers.video", "parse"),
+    ".mkv":  ("video", "parsers.video", "parse"),
+    ".avi":  ("video", "parsers.video", "parse"),
+    ".m4v":  ("video", "parsers.video", "parse"),
+    # NOTE: archives (.zip, .tar, .tar.gz) are NOT parsers -- they're
+    # unpacked in-place by the ingest layer and their contents flow
+    # through the normal per-file dispatch. See ingest._maybe_unpack_archive.
 }
 
 
@@ -131,13 +136,20 @@ def choose_parser(path: Path) -> Optional[Tuple[str, str, str]]:
             return _EXT_REGISTRY[".txt"]
         if mime.startswith("image/"):
             return _EXT_REGISTRY[".png"]
-        if mime.startswith("audio/") or mime.startswith("video/"):
+        if mime.startswith("video/"):
+            return _EXT_REGISTRY[".mp4"]
+        if mime.startswith("audio/"):
             return _EXT_REGISTRY[".mp3"]
     return None
 
 
-def parse_file(path: Path, *, parser: Optional[str] = None) -> ParseResult:
-    """Dispatch to the right parser. Raises UnsupportedFile if nothing matches."""
+def parse_file(path: Path, *, parser: Optional[str] = None, on_progress=None) -> ParseResult:
+    """Dispatch to the right parser. Raises UnsupportedFile if nothing matches.
+
+    If the concrete parser's `parse()` function accepts an `on_progress`
+    keyword, we pass it through so long-running parsers (ChatGPT exports,
+    multi-page PDFs) can stream sub-file progress.
+    """
     path = Path(path)
     if parser:
         module_path, fn_name = parser, "parse"
@@ -149,10 +161,19 @@ def parse_file(path: Path, *, parser: Optional[str] = None) -> ParseResult:
         kind, module_path, fn_name = chosen
 
     import importlib
+    import inspect
 
     mod = importlib.import_module(module_path)
     fn: ParserFn = getattr(mod, fn_name)
-    result = fn(path)
+    kwargs = {}
+    if on_progress is not None:
+        try:
+            sig = inspect.signature(fn)
+            if "on_progress" in sig.parameters:
+                kwargs["on_progress"] = on_progress
+        except (TypeError, ValueError):
+            pass
+    result = fn(path, **kwargs)
     if not result.kind or result.kind == "unknown":
         result.kind = kind
     return result
