@@ -1321,27 +1321,35 @@ def main() -> int:
 
     # Default: log to stderr. If MINION_LOG_FILE is set (desktop app), also
     # write to a rotating file so users can debug first-launch issues.
-    handlers: List[logging.Handler] = [logging.StreamHandler()]
     log_path = os.environ.get("MINION_LOG_FILE", "").strip()
+    file_audit = bool(log_path)
+    stream_h = logging.StreamHandler()
+    if args.verbose:
+        stream_h.setLevel(logging.INFO)
+    else:
+        stream_h.setLevel(logging.WARNING)
+    handlers: List[logging.Handler] = [stream_h]
     if log_path:
         try:
             from logging.handlers import RotatingFileHandler
 
             Path(log_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-            handlers.append(
-                RotatingFileHandler(
-                    filename=str(Path(log_path).expanduser()),
-                    maxBytes=10 * 1024 * 1024,
-                    backupCount=2,
-                    encoding="utf-8",
-                )
+            file_h = RotatingFileHandler(
+                filename=str(Path(log_path).expanduser()),
+                maxBytes=10 * 1024 * 1024,
+                backupCount=2,
+                encoding="utf-8",
             )
+            file_h.setLevel(logging.INFO)
+            handlers.append(file_h)
         except Exception:
             # Never crash startup due to logging.
             pass
 
+    # Root must allow INFO when a file handler needs it, even if stderr stays WARNING-only.
+    root_level = logging.INFO if (args.verbose or file_audit) else logging.WARNING
     logging.basicConfig(
-        level=logging.INFO if args.verbose else logging.WARNING,
+        level=root_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=handlers,
         force=True,
@@ -1352,7 +1360,10 @@ def main() -> int:
     # Tauri's sidecar looks at stdout for readiness; print a single line so
     # the Rust shell can flip from "starting" to "connected".
     print(f"[minion-api] listening http://{args.host}:{args.port}", flush=True)
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    if file_audit:
+        log.info("listening http://%s:%s (file log=%s)", args.host, args.port, log_path)
+    uvicorn_log_level = "info" if (args.verbose or file_audit) else "warning"
+    uvicorn.run(app, host=args.host, port=args.port, log_level=uvicorn_log_level)
     return 0
 
 

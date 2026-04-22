@@ -512,23 +512,24 @@ fn find_sidecar_pids(api_port: u16) -> Vec<u32> {
 /// run pointed at the same port, or a previous app version). Belt-and-
 /// suspenders with `find_sidecar_pids`.
 fn find_port_listeners(api_port: u16) -> Vec<u32> {
-    let out = match Command::new("lsof")
-        .args([
-            "-nP",
-            "-iTCP",
-            &format!("-iTCP:{api_port}"),
-            "-sTCP:LISTEN",
-            "-t",
-        ])
-        .output()
-    {
-        Ok(o) if o.status.success() => o.stdout,
-        _ => return Vec::new(),
-    };
-    String::from_utf8_lossy(&out)
-        .lines()
-        .filter_map(|l| l.trim().parse::<u32>().ok())
-        .collect()
+    let port_arg = format!("-iTCP:{api_port}");
+    let args = ["-nP", "-iTCP", &port_arg, "-sTCP:LISTEN", "-t"];
+    #[cfg(target_os = "macos")]
+    let candidates: &[&str] = &["/usr/sbin/lsof", "lsof"];
+    #[cfg(not(target_os = "macos"))]
+    let candidates: &[&str] = &["/usr/sbin/lsof", "/usr/bin/lsof", "lsof"];
+
+    for bin in candidates {
+        let out = match Command::new(bin).args(args).output() {
+            Ok(o) if o.status.success() => o.stdout,
+            _ => continue,
+        };
+        return String::from_utf8_lossy(&out)
+            .lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok())
+            .collect();
+    }
+    Vec::new()
 }
 
 /// Terminate a PID: SIGTERM first, then SIGKILL after a 500ms grace window
@@ -554,12 +555,15 @@ fn kill_pid_graceful(pid: u32) {
 fn wait_for_port_free(api_port: u16, timeout_ms: u64) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     while std::time::Instant::now() < deadline {
-        if find_port_listeners(api_port).is_empty() {
+        if find_port_listeners(api_port).is_empty()
+            && !tcp_port_open("127.0.0.1", api_port, Duration::from_millis(100))
+        {
             return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     find_port_listeners(api_port).is_empty()
+        && !tcp_port_open("127.0.0.1", api_port, Duration::from_millis(100))
 }
 
 #[cfg(unix)]
@@ -649,12 +653,22 @@ fn resolve_sidecar_port(preferred: u16) -> u16 {
         }
         let port = port_u32 as u16;
         let listeners = find_port_listeners(port);
-        if listeners.is_empty() {
+        let accepts_tcp = tcp_port_open("127.0.0.1", port, Duration::from_millis(150));
+        // GUI .app bundles often lack PATH: lsof may fail and return no PIDs even
+        // while uvicorn is listening. A successful TCP connect proves occupancy.
+        if listeners.is_empty() && !accepts_tcp {
             dbg(
                 "resolve_sidecar_port",
                 serde_json::json!({"picked": port, "reason": "free"}),
             );
             return port;
+        }
+        if listeners.is_empty() && accepts_tcp {
+            dbg(
+                "resolve_sidecar_port",
+                serde_json::json!({"skip": port, "reason": "tcp_probe_busy_lsof_miss"}),
+            );
+            continue;
         }
         let all_mine = listeners.iter().all(|p| pid_is_current_user(*p));
         if !all_mine {
@@ -675,7 +689,9 @@ fn resolve_sidecar_port(preferred: u16) -> u16 {
                 kill_pid_graceful(*pid);
             }
             let _ = wait_for_port_free(port, 3_000);
-            if find_port_listeners(port).is_empty() {
+            if find_port_listeners(port).is_empty()
+                && !tcp_port_open("127.0.0.1", port, Duration::from_millis(120))
+            {
                 dbg(
                     "resolve_sidecar_port",
                     serde_json::json!({"picked": port, "reason": "reclaimed"}),
