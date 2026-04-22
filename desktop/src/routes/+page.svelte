@@ -482,7 +482,15 @@
     let unlistens: Array<() => void> = [];
 
     (async () => {
+      // Default: show a bootstrap overlay until we learn the sidecar is ready.
+      // This covers the case where Rust emits early bootstrap events before
+      // the frontend has registered its event listener.
+      sidecar = { state: "starting", message: "Starting Minion…" };
+
       config = await getConfig();
+      if (config.sidecar_bootstrapped && config.sidecar_running) {
+        sidecar = { state: "ready" };
+      }
       await Promise.all([refreshStatus(), refreshSources()]);
 
       // Hydrate active snapshot from /status (in case we started mid-run).

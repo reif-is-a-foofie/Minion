@@ -23,6 +23,8 @@ export type AppConfig = {
   inbox: string;
   api_port: number;
   api_base: string;
+  sidecar_bootstrapped: boolean;
+  sidecar_running: boolean;
 };
 
 export type Source = {

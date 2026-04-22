@@ -579,11 +579,25 @@ fn ollama_has_model(bin: &Path, model: &str) -> bool {
 
 #[tauri::command]
 fn app_config(state: tauri::State<AppState>) -> serde_json::Value {
+    let sidecar_bootstrapped = state
+        .sidecar_python
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .is_some();
+    let sidecar_running = state
+        .sidecar
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|c| c.id()))
+        .is_some();
     serde_json::json!({
         "data_dir": state.data_dir.to_string_lossy(),
         "inbox": state.inbox.to_string_lossy(),
         "api_port": state.api_port,
         "api_base": format!("http://127.0.0.1:{}", state.api_port),
+        "sidecar_bootstrapped": sidecar_bootstrapped,
+        "sidecar_running": sidecar_running,
     })
 }
 
