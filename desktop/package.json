@@ -1,7 +1,7 @@
 {
   "name": "minion-desktop",
   "version": "1.0.0",
-  "description": "Minion desktop: drop-zone memory for your agents",
+  "description": "Minion — private local memory and semantic search for AI assistants (Tauri + Python sidecar).",
   "type": "module",
   "scripts": {
     "dev": "vite dev",

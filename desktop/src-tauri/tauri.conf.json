@@ -27,6 +27,11 @@
   "bundle": {
     "active": true,
     "targets": ["app"],
+    "copyright": "Copyright © 2026. Released under the MIT License.",
+    "category": "DeveloperTool",
+    "shortDescription": "Private local memory and search for your AI assistants.",
+    "longDescription": "Minion turns your Mac into searchable long-term memory: drop files into one inbox, chunk and embed locally in SQLite, and let Claude (or any MCP client) recall what you indexed. No hosted corpus — data stays under your account.",
+    "homepage": "https://github.com/reif-is-a-foofie/Minion",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -615,3 +615,73 @@ export async function copyIntoInbox(paths: string[]): Promise<CopyResult> {
 export async function revealInFinder(path: string): Promise<void> {
   await invoke("reveal_in_finder", { path });
 }
+
+/** Loopback Minion sidecar discovered via GET /capabilities. */
+export type DiagnosticsInstance = {
+  port: number;
+  version?: string;
+  product?: string;
+  self?: boolean;
+};
+
+export type DiagnosticsPeersResponse = {
+  instances: DiagnosticsInstance[];
+  scan: { port_lo: number; port_hi: number };
+};
+
+export type DiagnosticsAbout = {
+  name: string;
+  tagline: string;
+  license: string;
+  homepage: string;
+  privacy: string;
+};
+
+export type DiagnosticsLogBody = {
+  log_file_hint: string | null;
+  lines: string[];
+  count: number;
+};
+
+/** Public diagnostics GETs are intentionally unauthenticated (loopback-only). */
+async function diagFetchJson<T>(apiBase: string, path: string): Promise<T> {
+  const base = apiBase.replace(/\/$/, "");
+  const res = await fetch(`${base}${path}`, { headers: { accept: "application/json" } });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`${res.status}: ${body}`);
+  }
+  return (await res.json()) as T;
+}
+
+export async function fetchDiagnosticsAbout(apiBase?: string): Promise<DiagnosticsAbout> {
+  const cfg = await getConfig();
+  const base = apiBase ?? cfg.api_base;
+  return diagFetchJson<DiagnosticsAbout>(base, "/diagnostics/about");
+}
+
+export async function fetchDiagnosticsPeers(apiBase?: string): Promise<DiagnosticsPeersResponse> {
+  const cfg = await getConfig();
+  const base = apiBase ?? cfg.api_base;
+  return diagFetchJson<DiagnosticsPeersResponse>(base, "/diagnostics/peers");
+}
+
+export async function fetchDiagnosticsLogAtBase(apiBase: string, lines = 300): Promise<DiagnosticsLogBody> {
+  return diagFetchJson<DiagnosticsLogBody>(apiBase, `/diagnostics/log?lines=${encodeURIComponent(String(lines))}`);
+}
+
+export async function fetchDiagnosticsLogTextAtBase(apiBase: string, lines = 400): Promise<string> {
+  const base = apiBase.replace(/\/$/, "");
+  const res = await fetch(`${base}/diagnostics/log/text?lines=${encodeURIComponent(String(lines))}`, {
+    headers: { accept: "text/plain" },
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`${res.status}: ${body}`);
+  }
+  return await res.text();
+}
+
+export function loopbackApiBaseForPort(port: number): string {
+  return `http://127.0.0.1:${port}`;
+}

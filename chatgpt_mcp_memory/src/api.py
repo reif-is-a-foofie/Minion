@@ -23,6 +23,11 @@ Endpoints:
   POST /identity/export             -> write zip under data_dir/exports/
   GET  /chunks/{chunk_id}           -> one chunk for evidence drill-down
   GET  /capabilities                -> stable feature flags for local agent integrations
+  GET  /diagnostics/about           -> product blurb + privacy note (no secrets)
+  GET  /diagnostics/log             -> JSON: redacted tail of ``MINION_LOG_FILE`` sidecar log
+  GET  /diagnostics/log/text        -> plain text tail (paste into tickets)
+  GET  /diagnostics/log/stream      -> SSE: live redacted log lines (loopback use)
+  GET  /diagnostics/peers           -> JSON: Minion sidecars on 127.0.0.1 (scan ``MINION_PEER_SCAN_PORT_LO/HI``)
   POST /ingest                      -> body: {"path": "..."}  (copies path into inbox if outside)
   POST /ingest/webhook              -> JSON or NDJSON chunks (Bearer when MINION_API_TOKEN set)
   GET  /extensions                  -> parser_extensions.json schema + webhook docs
@@ -54,13 +59,14 @@ from typing import Any, Dict, List, Optional, Set
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from ingest import ingest_file, ingest_webhook_payload, _looks_like_chatgpt_export
 from parser_extensions import manifest_path
 from parsers import ALL_KINDS, load_user_extensions, supported_extensions, user_extension_mappings
 from settings import apply_settings, load_settings, save_settings
+import diagnostics
 import telemetry
 import identity
 from version import __version__
@@ -692,6 +698,7 @@ def capabilities() -> Dict[str, Any]:
     tok_on = bool(os.environ.get("MINION_API_TOKEN", "").strip())
     return {
         "service": "minion-api",
+        "product": "minion",
         "version": __version__,
         "schema_version": 1,
         "auth": {
@@ -717,8 +724,87 @@ def capabilities() -> Dict[str, Any]:
             "identity_propose": "POST /identity/claims/propose",
             "identity_export": "POST /identity/export",
             "clusters_rebuild": "POST /identity/clusters/rebuild",
+            "diagnostics_about": "GET /diagnostics/about",
+            "diagnostics_log": "GET /diagnostics/log",
+            "diagnostics_log_text": "GET /diagnostics/log/text",
+            "diagnostics_log_stream": "GET /diagnostics/log/stream",
+            "diagnostics_peers": "GET /diagnostics/peers",
         },
     }
+
+
+@app.get("/diagnostics/about")
+def diagnostics_about() -> Dict[str, Any]:
+    """Static copy for the Support pane; safe to cache in the UI."""
+    return {
+        "name": "Minion",
+        "tagline": "Private, searchable long-term memory for AI assistants — local SQLite, drop-zone ingest, MCP for Claude.",
+        "license": "MIT",
+        "homepage": "https://github.com/reif-is-a-foofie/Minion",
+        "privacy": (
+            "Diagnostics routes are GET-only and meant for 127.0.0.1. "
+            "Minion does not upload logs or telemetry to us automatically. "
+            "Log lines may still contain filenames you indexed; use redacted export when sharing."
+        ),
+    }
+
+
+@app.get("/diagnostics/log")
+def diagnostics_log(lines: int = 200) -> Dict[str, Any]:
+    """Return the tail of ``MINION_LOG_FILE`` with best-effort redaction."""
+    n = max(1, min(2500, int(lines)))
+    path, log_lines = diagnostics.read_log_tail(max_lines=n)
+    hint = str(path) if path else None
+    if hint and path is not None:
+        try:
+            home = os.path.expanduser("~")
+            if home and len(home) > 2:
+                hint = hint.replace(home, "~")
+        except Exception:
+            pass
+    return {
+        "log_file_hint": hint,
+        "lines": log_lines,
+        "count": len(log_lines),
+    }
+
+
+@app.get("/diagnostics/log/text")
+def diagnostics_log_text(lines: int = 200) -> PlainTextResponse:
+    """Plain newline-separated tail for pasting into email or tickets."""
+    body = diagnostics_log(lines=lines)
+    text = "\n".join(body.get("lines") or [])
+    return PlainTextResponse(text, media_type="text/plain; charset=utf-8")
+
+
+@app.get("/diagnostics/log/stream")
+def diagnostics_log_stream() -> StreamingResponse:
+    """SSE stream of redacted log lines (blocks a worker thread while connected)."""
+
+    return StreamingResponse(
+        diagnostics.iter_log_sse_events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/diagnostics/peers")
+def diagnostics_peers(request: Request) -> Dict[str, Any]:
+    """Find other Minion HTTP APIs on loopback (separate app instances / tests)."""
+    my_port = request.url.port
+    if my_port is None:
+        try:
+            my_port = int(os.environ.get("MINION_API_PORT", "0") or 0)
+        except ValueError:
+            my_port = 0
+    lo = int(os.environ.get("MINION_PEER_SCAN_PORT_LO", "8688") or 8688)
+    hi = int(os.environ.get("MINION_PEER_SCAN_PORT_HI", "8799") or 8799)
+    rows = diagnostics.discover_minion_peers(my_port if my_port else None, port_lo=lo, port_hi=hi)
+    return {"instances": rows, "scan": {"port_lo": lo, "port_hi": hi}}
 
 
 @app.get("/extensions")

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import {
@@ -15,6 +15,10 @@
     fetchSettings,
     reloadParserExtensions,
     fetchSources,
+    fetchDiagnosticsAbout,
+    fetchDiagnosticsLogAtBase,
+    fetchDiagnosticsLogTextAtBase,
+    fetchDiagnosticsPeers,
     fetchStatus,
     getConfig,
     ingestPath,
@@ -30,12 +34,15 @@
     updateSettings,
     waitForHealthySidecar,
     isNotFoundError,
+    loopbackApiBaseForPort,
     type Active,
     type AppConfig,
     type ConnState,
     type ExtensionsInfo,
     type IdentityClaim,
     type SearchHit,
+    type DiagnosticsAbout,
+    type DiagnosticsPeersResponse,
     type SidecarStatus,
     type Source,
     type Status,
@@ -55,7 +62,7 @@
   let connecting = $state(false);
   let connectMsg = $state<string>("");
   let showSettings = $state(false);
-  type SettingsNav = "status" | "library" | "identity" | "claude" | "ingest" | "advanced";
+  type SettingsNav = "status" | "library" | "identity" | "claude" | "ingest" | "support" | "advanced";
   let settingsNav = $state<SettingsNav>("status");
   const SETTINGS_PANE_TITLE: Record<SettingsNav, string> = {
     status: "Status",
@@ -63,6 +70,7 @@
     identity: "Identity",
     claude: "Claude (MCP)",
     ingest: "Ingest & file types",
+    support: "Support & diagnostics",
     advanced: "Advanced",
   };
   let settingsError = $state<string | null>(null);
@@ -92,6 +100,106 @@
   let clusterBusy = $state(false);
   let exportBusy = $state(false);
 
+  let supportAbout = $state<DiagnosticsAbout | null>(null);
+  let supportPeers = $state<DiagnosticsPeersResponse | null>(null);
+  let supportLogBase = $state<string>("");
+  let supportSnapshotLines = $state<string[]>([]);
+  let supportStreamLines = $state<string[]>([]);
+  let supportLogHint = $state<string | null>(null);
+  let supportPanelBusy = $state(false);
+  let supportPanelError = $state<string | null>(null);
+  let supportLogEs: EventSource | null = null;
+
+  function stopSupportLogStream() {
+    if (supportLogEs) {
+      supportLogEs.close();
+      supportLogEs = null;
+    }
+  }
+
+  function startSupportLogStream(base: string) {
+    stopSupportLogStream();
+    const url = `${base.replace(/\/$/, "")}/diagnostics/log/stream`;
+    try {
+      const es = new EventSource(url);
+      supportLogEs = es;
+      es.onmessage = (ev) => {
+        try {
+          const o = JSON.parse(ev.data) as { line?: string; heartbeat?: boolean; error?: string };
+          if (o.error) {
+            supportStreamLines = [...supportStreamLines.slice(-200), `[${o.error}]`];
+            return;
+          }
+          if (o.line) {
+            supportStreamLines = [...supportStreamLines.slice(-400), o.line];
+          }
+        } catch {
+          /* ignore malformed chunks */
+        }
+      };
+      es.onerror = () => {
+        /* keepalive; EventSource reconnects on its own */
+      };
+    } catch (e) {
+      supportPanelError = (e as Error).message;
+    }
+  }
+
+  async function refreshSupportSnapshot() {
+    if (!supportLogBase) return;
+    try {
+      const snap = await fetchDiagnosticsLogAtBase(supportLogBase, 160);
+      supportSnapshotLines = snap.lines ?? [];
+      supportLogHint = snap.log_file_hint ?? null;
+    } catch (e) {
+      supportPanelError = (e as Error).message;
+    }
+  }
+
+  async function loadSupportPanel() {
+    supportPanelBusy = true;
+    supportPanelError = null;
+    stopSupportLogStream();
+    supportStreamLines = [];
+    try {
+      const cfg = await getConfig();
+      supportLogBase = cfg.api_base;
+      const [about, peers] = await Promise.all([
+        fetchDiagnosticsAbout(cfg.api_base),
+        fetchDiagnosticsPeers(cfg.api_base),
+      ]);
+      supportAbout = about;
+      supportPeers = peers;
+      await refreshSupportSnapshot();
+      startSupportLogStream(supportLogBase);
+    } catch (e) {
+      supportPanelError = (e as Error).message;
+    } finally {
+      supportPanelBusy = false;
+    }
+  }
+
+  async function selectSupportInstance(port: number) {
+    const base = loopbackApiBaseForPort(port);
+    supportLogBase = base;
+    supportStreamLines = [];
+    stopSupportLogStream();
+    supportPanelError = null;
+    await refreshSupportSnapshot();
+    startSupportLogStream(base);
+  }
+
+  async function copyRedactedSidecarLog() {
+    if (!supportLogBase) return;
+    try {
+      const text = await fetchDiagnosticsLogTextAtBase(supportLogBase, 500);
+      await navigator.clipboard.writeText(text);
+      pushFeed("settings", "copied redacted sidecar log");
+    } catch (e) {
+      pushFeed("settings", `copy failed: ${(e as Error).message}`);
+    }
+  }
+
   async function refreshIdentity() {
     identityLoading = true;
     try {
@@ -106,6 +214,7 @@
   }
 
   function closeSettingsHub() {
+    stopSupportLogStream();
     showSettings = false;
     evidencePopup = null;
   }
@@ -116,6 +225,8 @@
     if (nav === "identity") await refreshIdentity();
     if (nav === "ingest" && !settingsLoaded) await loadSettings();
     if (nav === "ingest" && !extensionsInfo && !extensionsLoading) void loadExtensionsInfo();
+    if (nav === "support") await loadSupportPanel();
+    if (nav !== "support") stopSupportLogStream();
   }
 
   async function openSettings(nav?: SettingsNav) {
@@ -124,6 +235,7 @@
     if (!settingsLoaded) await loadSettings();
     if (settingsNav === "library") await refreshSources();
     if (settingsNav === "identity") await refreshIdentity();
+    if (settingsNav === "support") await loadSupportPanel();
   }
 
   function switchIdentityTab(tab: "proposed" | "active") {
@@ -864,8 +976,13 @@
 
     return () => {
       clearInterval(spin);
+      stopSupportLogStream();
       unlistens.forEach((fn) => fn());
     };
+  });
+
+  onDestroy(() => {
+    stopSupportLogStream();
   });
 
   // Derived groupings.
@@ -885,10 +1002,16 @@
     const cn = config.data_dir.replace(/\/+$/, "");
     return sn !== cn;
   });
+
+  /** Prefer live SSE tail so we do not double-print the same snapshot + stream. */
+  const supportLogDisplay = $derived(() => {
+    if (supportStreamLines.length) return supportStreamLines.slice(-240);
+    return supportSnapshotLines.slice(-240);
+  });
 </script>
 
 <svelte:head>
-  <title>Minion</title>
+  <title>Minion — local memory for your agents</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
   <link
@@ -1024,6 +1147,7 @@
           <button type="button" class="settings-nav-item" class:active={settingsNav === "identity"} onclick={() => void selectSettingsNav("identity")}>Identity</button>
           <button type="button" class="settings-nav-item" class:active={settingsNav === "claude"} onclick={() => void selectSettingsNav("claude")}>Claude (MCP)</button>
           <button type="button" class="settings-nav-item" class:active={settingsNav === "ingest"} onclick={() => void selectSettingsNav("ingest")}>Ingest &amp; types</button>
+          <button type="button" class="settings-nav-item" class:active={settingsNav === "support"} onclick={() => void selectSettingsNav("support")}>Support</button>
           <button type="button" class="settings-nav-item settings-nav-item-muted" class:active={settingsNav === "advanced"} onclick={() => void selectSettingsNav("advanced")}>Advanced</button>
         </nav>
       </aside>
@@ -1311,6 +1435,72 @@
                 <div class="settings-note">
                   Disabled kinds are skipped on ingest. Turn one back on and restart the sidecar to pick up those files.
                 </div>
+              {/if}
+            </div>
+          {:else if settingsNav === "support"}
+            <div class="settings-support-card">
+              {#if supportPanelBusy && !supportAbout}
+                <div class="empty">Loading diagnostics…</div>
+              {:else if supportPanelError && !supportAbout}
+                <div class="settings-error-box">
+                  <p>Couldn’t reach the diagnostics API.</p>
+                  <p class="settings-error-detail">{supportPanelError}</p>
+                  <button type="button" class="ghost" onclick={() => void loadSupportPanel()}>Retry</button>
+                </div>
+              {:else}
+                <div class="section-title small">About</div>
+                <p class="support-about-lead">
+                  <strong>{supportAbout?.name ?? "Minion"}</strong>
+                  {#if status?.version}<span class="mono support-ver">{status.version}</span>{/if}
+                </p>
+                <p class="setting-desc support-tagline">{supportAbout?.tagline ?? ""}</p>
+                {#if supportAbout?.homepage}
+                  <p class="support-home">
+                    <a href={supportAbout.homepage} target="_blank" rel="noopener noreferrer">{supportAbout.homepage}</a>
+                    <span class="mono"> · {supportAbout.license}</span>
+                  </p>
+                {/if}
+
+                <div class="section-title small support-mt">Comms hub — local instances</div>
+                <p class="setting-desc">
+                  Minion never uploads these logs. Streaming stays on <span class="mono">127.0.0.1</span> so you can watch any
+                  sidecar that responds on this Mac (e.g. a second install or an old port). Lines are redacted for bearer tokens and your home path; file
+                  names from ingest may still appear — only paste where that is acceptable.
+                </p>
+                {#if supportPeers}
+                  <p class="setting-desc mono subtle">
+                    Scan {supportPeers.scan.port_lo}–{supportPeers.scan.port_hi} · {supportPeers.instances.length} instance(s)
+                  </p>
+                  <ul class="support-peer-list">
+                    {#each supportPeers.instances as inst}
+                      <li class="support-peer-row">
+                        <button
+                          type="button"
+                          class="ghost support-peer-btn"
+                          class:active={supportLogBase === loopbackApiBaseForPort(inst.port)}
+                          onclick={() => void selectSupportInstance(inst.port)}
+                        >
+                          Port {inst.port}
+                          {#if inst.self}<span class="support-pill">this window</span>{/if}
+                          {#if inst.version}<span class="mono subtle">v{inst.version}</span>{/if}
+                        </button>
+                      </li>
+                    {/each}
+                  </ul>
+                {/if}
+
+                <div class="support-actions">
+                  <button type="button" class="ghost" onclick={() => void refreshSupportSnapshot()} disabled={supportPanelBusy}>Refresh snapshot</button>
+                  <button type="button" class="ghost" onclick={() => void copyRedactedSidecarLog()}>Copy redacted log</button>
+                </div>
+                {#if supportLogHint}
+                  <p class="setting-desc mono subtle">Log file: {supportLogHint}</p>
+                {/if}
+                {#if supportPanelError && supportAbout}
+                  <p class="settings-error-detail">{supportPanelError}</p>
+                {/if}
+                <div class="section-title small support-mt">Live stream</div>
+                <pre class="bootstrap-log support-comms-log" aria-label="Sidecar log stream">{supportLogDisplay().join("\n")}</pre>
               {/if}
             </div>
           {:else if settingsNav === "advanced"}
@@ -2455,6 +2645,75 @@
     border-radius: 6px;
     border: 1px solid var(--border);
     white-space: pre-wrap;
+  }
+
+  .settings-support-card {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px 16px;
+    background: var(--panel);
+  }
+  .support-about-lead {
+    margin: 0 0 6px;
+    font-size: 15px;
+  }
+  .support-ver {
+    margin-left: 8px;
+    font-size: 12px;
+    color: var(--muted);
+    font-weight: 500;
+  }
+  .support-tagline {
+    margin-top: 0;
+  }
+  .support-home {
+    margin: 6px 0 0;
+    font-size: 12px;
+    word-break: break-all;
+  }
+  .support-mt {
+    margin-top: 14px !important;
+  }
+  .support-peer-list {
+    list-style: none;
+    margin: 8px 0 0;
+    padding: 0;
+  }
+  .support-peer-row {
+    margin: 0 0 6px;
+  }
+  .support-peer-btn {
+    text-align: left;
+    width: 100%;
+    justify-content: flex-start;
+  }
+  .support-peer-btn.active {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .support-pill {
+    margin-left: 8px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    background: var(--accent-soft);
+    color: var(--accent-2);
+  }
+  .support-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .subtle {
+    color: var(--muted);
+  }
+  .support-comms-log {
+    max-height: 240px;
+    margin-top: 8px;
   }
 
   .settings-advanced-card {
