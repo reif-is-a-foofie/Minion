@@ -16,10 +16,12 @@
     fetchSources,
     fetchStatus,
     getConfig,
+    ingestPath,
     nukeDb,
     onSidecarStatus,
     openEvents,
     patchIdentityClaim,
+    reconcileInbox,
     rebuildPreferenceClusters,
     restartSidecar,
     revealInFinder,
@@ -49,13 +51,23 @@
   let active = $state<Active>({ root: null, total: 0, done: 0, added: 0, skipped: 0 });
   let connecting = $state(false);
   let connectMsg = $state<string>("");
-  let showContents = $state(false);
   let showSettings = $state(false);
+  type SettingsNav = "status" | "library" | "identity" | "claude" | "ingest" | "advanced";
+  let settingsNav = $state<SettingsNav>("status");
+  const SETTINGS_PANE_TITLE: Record<SettingsNav, string> = {
+    status: "Status",
+    library: "Library & search",
+    identity: "Identity",
+    claude: "Claude (MCP)",
+    ingest: "Ingest & file types",
+    advanced: "Advanced",
+  };
   let settingsError = $state<string | null>(null);
   let allKinds = $state<string[]>([]);
   let disabledKinds = $state<Set<string>>(new Set());
   let settingsLoaded = $state(false);
   let savingSettings = $state(false);
+  let rescanning = $state(false);
   let termEl: HTMLUListElement | undefined = $state();
   // Rolling per-file line id, so subsequent progress events for the same
   // path rewrite a single terminal line instead of stacking.
@@ -70,7 +82,6 @@
   /** Scrollable lines for bootstrap (Rust `sidecar://status` + local notes). */
   let bootstrapLog = $state<string[]>([]);
 
-  let showIdentity = $state(false);
   let identityClaims = $state<IdentityClaim[]>([]);
   let identityLoading = $state(false);
   let identityTab = $state<"proposed" | "active">("proposed");
@@ -143,9 +154,24 @@
     }
   }
 
-  async function openIdentity() {
-    showIdentity = true;
-    await refreshIdentity();
+  function closeSettingsHub() {
+    showSettings = false;
+    evidencePopup = null;
+  }
+
+  async function selectSettingsNav(nav: SettingsNav) {
+    settingsNav = nav;
+    if (nav === "library") await refreshSources();
+    if (nav === "identity") await refreshIdentity();
+    if (nav === "ingest" && !settingsLoaded) await loadSettings();
+  }
+
+  async function openSettings(nav?: SettingsNav) {
+    showSettings = true;
+    if (nav) settingsNav = nav;
+    if (!settingsLoaded) await loadSettings();
+    if (settingsNav === "library") await refreshSources();
+    if (settingsNav === "identity") await refreshIdentity();
   }
 
   function switchIdentityTab(tab: "proposed" | "active") {
@@ -303,6 +329,7 @@
       ok = true;
     } catch (e) {
       const msg = (e as Error).message ?? String(e);
+      const short = formatHttpErrorMessage(msg);
       // If the sidecar can't write the default path (common on locked-down setups),
       // fall back to a user-picked config file path and retry once.
       if (msg.includes("403") || msg.toLowerCase().includes("permission") || msg.toLowerCase().includes("cannot write")) {
@@ -318,13 +345,13 @@
             connectMsg = `Added to ${res.config_path.split("/").pop()}. Restart Claude Desktop to load.`;
             ok = true;
           } else {
-            connectMsg = `Failed: ${msg}`;
+            connectMsg = `Couldn’t add MCP: ${short}`;
           }
         } catch (e2) {
-          connectMsg = `Failed: ${msg}`;
+          connectMsg = `Couldn’t add MCP: ${short}`;
         }
       } else {
-        connectMsg = `Failed: ${msg}`;
+        connectMsg = `Couldn’t add MCP: ${short}`;
       }
     } finally {
       connecting = false;
@@ -353,9 +380,9 @@
       disabledKinds = new Set(res.settings.disabled_kinds ?? []);
       settingsLoaded = true;
     } catch (e) {
-      const msg = (e as Error).message;
+      const msg = formatHttpErrorMessage((e as Error).message);
       settingsError = msg;
-      pushFeed("settings", `load failed: ${msg}`);
+      pushFeed("settings", `Couldn’t load settings: ${msg}`);
     }
   }
 
@@ -369,15 +396,27 @@
       const res = await updateSettings({ disabled_kinds: Array.from(next) });
       disabledKinds = new Set(res.settings.disabled_kinds ?? []);
     } catch (e) {
-      pushFeed("settings", `save failed: ${(e as Error).message}`);
+      pushFeed("settings", `Save failed: ${formatHttpErrorMessage((e as Error).message)}`);
     } finally {
       savingSettings = false;
     }
   }
 
-  async function openSettings() {
-    showSettings = true;
-    if (!settingsLoaded) await loadSettings();
+  async function runRescanInbox(force: boolean) {
+    if (rescanning || conn !== "open") return;
+    rescanning = true;
+    try {
+      await reconcileInbox({ force });
+      pushFeed(
+        "settings",
+        force ? "Re-index started (re-embedding all files)…" : "Inbox rescan started…",
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      pushFeed("settings", msg.includes("409") ? "Rescan already running — wait for it to finish." : `Rescan failed: ${msg}`);
+    } finally {
+      rescanning = false;
+    }
   }
 
   const KIND_LABELS: Record<string, string> = {
@@ -387,9 +426,28 @@
     docx: "Docs",
     image: "Image",
     audio: "Audio",
+    video: "Video",
     code: "Code",
     "chatgpt-export": "ChatGPT",
   };
+
+  /** Turn `404 Not Found: {"detail":"…"}` into a short line for Settings and toasts. */
+  function formatHttpErrorMessage(msg: string): string {
+    const jsonStart = msg.indexOf("{");
+    if (jsonStart >= 0) {
+      try {
+        const parsed = JSON.parse(msg.slice(jsonStart)) as { detail?: unknown };
+        if (typeof parsed.detail === "string") return parsed.detail;
+        if (Array.isArray(parsed.detail))
+          return parsed.detail.map((d) => (typeof d === "string" ? d : JSON.stringify(d))).join("; ");
+      } catch {
+        /* keep unparsed */
+      }
+    }
+    const noStatus = msg.replace(/^\d{3}\s+[\w\s]+:\s*/i, "").trim();
+    const core = noStatus.length < msg.length ? noStatus : msg;
+    return core.length > 200 ? `${core.slice(0, 197)}…` : core;
+  }
 
   function prettyBytes(n: number): string {
     if (n < 1024) return `${n} B`;
@@ -445,6 +503,7 @@
     // for the vision model to finish pulling). Not a user-visible failure.
     if (/\bdeferred\b|awaiting\s+vision/.test(t)) return "progress";
     if (/\bingested\b|\bdone\b/.test(t)) return "ok";
+    if (/\bre-indexing\b/.test(t)) return "progress";
     if (/\bduplicate\b|\bunchanged\b|already\s*(saved|present|exists)/.test(t))
       return "saved";
     if (/\bcopied\b|\bunpacked\b|\bextracted\b|\bloaded\b|\bparsed\b|\bready\b|\brestarted\b/.test(t))
@@ -511,10 +570,12 @@
   function fileKind(path: string, status: string): { label: string; cls: string } {
     const p = (path || "").toLowerCase();
     const name = fileName(p);
-    if (!name || /^(drop|sidecar|vision|watcher)$/.test(name)) {
+    if (!name || /^(drop|sidecar|vision|watcher|settings|identity)$/.test(name)) {
       if (name === "sidecar")  return { label: "SYS", cls: "sys" };
       if (name === "vision")   return { label: "VIS", cls: "vis" };
       if (name === "watcher")  return { label: "WCH", cls: "sys" };
+      if (name === "settings") return { label: "SET", cls: "sys" };
+      if (name === "identity") return { label: "ID", cls: "sys" };
       return { label: "···", cls: "dflt" };
     }
     // Folder drop results come back as the folder path.
@@ -606,8 +667,22 @@
         let status: string;
         if (d.kind === "missing") status = "missing (no such path)";
         else if (d.kind === "unsupported") status = "skipped (not a file or folder)";
-        else if (d.kind === "duplicate") status = `duplicate · already in inbox (${prettyBytes(d.bytes)})`;
-        else if (d.copied === 0) status = "empty (nothing to index)";
+        else if (d.kind === "duplicate") {
+          status = `duplicate · already in inbox (${prettyBytes(d.bytes)})`;
+          if (id) updateFeed(id, { path: landed, status: `${status} · re-indexing…` });
+          else pushFeed(landed, `${status} · re-indexing…`);
+          if (d.dest) {
+            try {
+              await ingestPath(d.dest, false);
+            } catch (e) {
+              const msg = `re-ingest failed: ${(e as Error).message}`;
+              if (id) updateFeed(id, { status: `${status} · ${msg}` });
+              else pushFeed(landed, msg);
+            }
+          }
+          for (const err of d.errors ?? []) pushFeed(d.source, `error: ${err}`);
+          continue;
+        } else if (d.copied === 0) status = "empty (nothing to index)";
         else if (d.kind === "directory") {
           const extra = d.skipped_dirs ? `, pruned ${d.skipped_dirs} dirs` : "";
           status = `copied ${d.copied} files · ${prettyBytes(d.bytes)}${extra}`;
@@ -844,84 +919,15 @@
 </svelte:head>
 
 <main class="app" class:dragging>
-  <header>
+  <header class="app-header-min">
     <div class="brand">
       <img src="/minion.png" alt="" class="brand-icon" />
       <h1>Minion</h1>
     </div>
-    <div class="header-right">
-      <div class="counts">
-        {#if status}
-          <span><strong>{status.counts.sources}</strong></span>
-          <span class="watcher" class:live={status.watcher.running}>
-            {status.watcher.running ? "watching" : "paused"}
-          </span>
-        {/if}
-        <span
-          class="status-pill status-{conn}"
-          title={conn === "open"
-            ? `Sidecar ready · ${config?.api_base ?? ""}${status?.db_path ? `\nDB: ${status.db_path}` : ""}${status?.data_dir ? `\nData: ${status.data_dir}` : ""}`
-            : conn === "connecting"
-              ? "Connecting to sidecar…"
-              : conn === "unreachable"
-                ? "Sidecar unreachable. Check that Python 3.10+ is installed and click Settings → Restart."
-                : "Sidecar restarting…"}
-        >
-          <span class="status-dot"></span>
-          {conn === "open"
-            ? "ready"
-            : conn === "connecting"
-              ? "starting"
-              : conn === "unreachable"
-                ? "offline"
-                : "reconnecting"}
-        </span>
-        <button class="ghost" onclick={() => (showContents = true)} title="View indexed sources and search">
-          Contents
-        </button>
-        <button class="ghost" onclick={openIdentity} title="Review identity claims and export">
-          Identity
-        </button>
-        <button class="ghost" onclick={openSettings} title="Server, Claude Desktop, and file-type preferences">
-          Settings
-        </button>
-      </div>
-      {#if conn === "open" && status?.data_dir}
-        <div
-          class="sidecar-data-path"
-          class:mismatch={dataDirMismatch()}
-          title={`Sidecar data: ${status.data_dir}${status.db_path ? `\nDB: ${status.db_path}` : ""}`}
-        >
-          Data: {status.data_dir}
-        </div>
-      {/if}
-    </div>
+    <button type="button" class="btn-settings-main" onclick={() => void openSettings()} title="Status, library, Claude, and preferences">
+      Settings
+    </button>
   </header>
-
-  {#if connectMsg}
-    <div class="toast">{connectMsg}</div>
-  {/if}
-
-  {#if dataDirMismatch()}
-    <div class="toast toast-warn" role="status">
-      Sidecar <strong>data folder</strong> does not match this app — you may be hitting another Minion on the same port. Use
-      <strong>Settings → Restart</strong>.
-      <div class="mismatch-paths"><span class="label">App</span><span class="mono">{config?.data_dir}</span></div>
-      <div class="mismatch-paths"><span class="label">Sidecar</span><span class="mono">{status?.data_dir}</span></div>
-    </div>
-  {/if}
-
-  {#if sidecar?.state === "ready" && status && status.counts.sources > 0 && !claudeMcpAdded && !connectBannerDismissed}
-    <div class="setup-reminder" role="status">
-      <span
-        >Indexed {status.counts.sources} source{status.counts.sources === 1 ? "" : "s"}. Add Minion to Claude Desktop (MCP), then restart Claude.</span
-      >
-      <button type="button" class="ghost" disabled={connecting} onclick={() => void runConnect()}>
-        {connecting ? "…" : "Add MCP"}
-      </button>
-      <button type="button" class="ghost" onclick={dismissConnectBanner}>Dismiss</button>
-    </div>
-  {/if}
 
   {#if sidecar && sidecar.state !== "ready"}
     <div class="bootstrap-overlay" class:error={sidecar.state === "error"}>
@@ -1021,33 +1027,25 @@
 
   <section class="drop" class:active={dragging} role="button" tabindex="0" onclick={browseForFiles} onkeydown={(e) => e.key === "Enter" && browseForFiles()}>
     <img src="/minion.png" alt="" class="drop-watcher" aria-hidden="true" />
-    <div class="drop-brackets">
-      <span class="bracket">[</span>
-      <div class="drop-body">
-        <div class="drop-title">DROP FILES OR FOLDERS</div>
-        <div class="drop-hint">ChatGPT export zip · folder · other documents</div>
-        <div class="drop-sub">
-          &gt;&nbsp;
-          <button class="linklike" onclick={(e) => { e.stopPropagation(); browseForFiles(); }}>select files</button>
-          <span class="divider">/</span>
-          <button class="linklike" onclick={(e) => { e.stopPropagation(); browseForFolder(); }}>select folder</button>
-        </div>
+    <div class="drop-inner">
+      <div class="drop-title">Drop files or folders</div>
+      <div class="drop-hint">ChatGPT export (zip or folder) · PDFs · notes · media · code</div>
+      <div class="drop-actions">
+        <button class="linklike" onclick={(e) => { e.stopPropagation(); browseForFiles(); }}>Choose files…</button>
+        <span class="drop-actions-sep">·</span>
+        <button class="linklike" onclick={(e) => { e.stopPropagation(); browseForFolder(); }}>Choose folder…</button>
       </div>
-      <span class="bracket">]</span>
     </div>
   </section>
 
   <section class="term" aria-label="Activity log">
-    <div class="term-head" aria-hidden="true">
-      <span class="term-corner">┌─</span>
-      <span class="term-title">activity</span>
-      <span class="term-rule"></span>
-      <span class="term-count">{ingestFeed.length} ev</span>
-      <span class="term-corner">─┐</span>
+    <div class="activity-head">
+      <span class="activity-title">Activity</span>
+      <span class="activity-count">{ingestFeed.length === 0 ? "No events yet" : `${ingestFeed.length} event${ingestFeed.length === 1 ? "" : "s"}`}</span>
     </div>
     <ul class="term-log" bind:this={termEl}>
       {#if ingestFeed.length === 0}
-        <li class="term-empty">$ waiting for input…</li>
+        <li class="term-empty">Ingest and watcher messages show up here.</li>
       {/if}
       {#each ingestFeed as item (item.id)}
         {@const cls = statusClass(item.status)}
@@ -1067,315 +1065,319 @@
         </li>
       {/each}
     </ul>
-    <div class="term-foot" aria-hidden="true">
-      <span class="term-corner">└─</span>
-      <span class="term-rule"></span>
-      <span class="term-corner">─┘</span>
-    </div>
   </section>
 </main>
 
-{#if showIdentity}
+{#if showSettings}
   <div
-    class="modal-overlay"
+    class="modal-overlay settings-overlay"
     role="button"
     tabindex="-1"
-    onclick={() => {
-      showIdentity = false;
-      evidencePopup = null;
-    }}
-    onkeydown={(e) =>
-      e.key === "Escape" && ((showIdentity = false), (evidencePopup = null))}
+    onclick={closeSettingsHub}
+    onkeydown={(e) => e.key === "Escape" && closeSettingsHub()}
   >
     <div
-      class="modal settings-modal"
+      class="modal settings-hub"
       role="dialog"
       tabindex="-1"
       aria-modal="true"
+      aria-label="Minion preferences"
       onclick={(e) => e.stopPropagation()}
       onkeydown={(e) => e.stopPropagation()}
     >
-      <header class="modal-head">
-        <img src="/minion.png" alt="" class="modal-avatar" aria-hidden="true" />
-        <h2>Identity</h2>
-        <div class="modal-meta">structured claims · evidence · export</div>
-        <button
-          class="ghost"
-          onclick={() => {
-            showIdentity = false;
-            evidencePopup = null;
-          }}
-        >
-          Close
-        </button>
-      </header>
-
-      <div class="settings-body">
-        <div class="modal-section settings-section">
-          <div class="section-title small">Queue</div>
-          <div class="chips" style="margin-bottom: 0.75rem;">
-            <button type="button" class:chip-active={identityTab === "proposed"} onclick={() => switchIdentityTab("proposed")}>
-              Proposed
-            </button>
-            <button type="button" class:chip-active={identityTab === "active"} onclick={() => switchIdentityTab("active")}>
-              Active
-            </button>
-            <button type="button" class="ghost" onclick={() => refreshIdentity()} disabled={identityLoading}>
-              {identityLoading ? "…" : "Refresh"}
-            </button>
-            <button type="button" class="ghost" onclick={runClusterRebuild} disabled={clusterBusy}>
-              {clusterBusy ? "Clustering…" : "Rebuild clusters"}
-            </button>
-            <button type="button" class="ghost" onclick={runIdentityExport} disabled={exportBusy}>
-              {exportBusy ? "Export…" : "Export zip"}
-            </button>
+      <aside class="settings-sidebar" aria-label="Sections">
+        <div class="settings-sidebar-head">
+          <img src="/minion.png" alt="" class="modal-avatar" aria-hidden="true" />
+          <div>
+            <div class="settings-sidebar-title">Minion</div>
+            <div class="settings-sidebar-sub">Preferences</div>
           </div>
-          {#if identityClaims.length === 0}
-            <div class="empty">
-              {identityTab === "proposed"
-                ? "No proposed claims. Agents can add them via MCP (`propose_identity_update`)."
-                : "No active claims yet — approve proposals from the Proposed tab."}
-            </div>
-          {:else}
-            <ul class="source-list identity-claim-list">
-              {#each identityClaims as c}
-                <li>
-                  <div class="file-main">
-                    <span class="kind">{c.kind}</span>
-                    <span class="path mono" title={c.claim_id}>{c.claim_id}</span>
-                    {#if c.source_agent}
-                      <span class="meta">via {c.source_agent}</span>
+        </div>
+        <nav class="settings-nav-list">
+          <button type="button" class="settings-nav-item" class:active={settingsNav === "status"} onclick={() => void selectSettingsNav("status")}>Status</button>
+          <button type="button" class="settings-nav-item" class:active={settingsNav === "library"} onclick={() => void selectSettingsNav("library")}>Library &amp; search</button>
+          <button type="button" class="settings-nav-item" class:active={settingsNav === "identity"} onclick={() => void selectSettingsNav("identity")}>Identity</button>
+          <button type="button" class="settings-nav-item" class:active={settingsNav === "claude"} onclick={() => void selectSettingsNav("claude")}>Claude (MCP)</button>
+          <button type="button" class="settings-nav-item" class:active={settingsNav === "ingest"} onclick={() => void selectSettingsNav("ingest")}>Ingest &amp; types</button>
+          <button type="button" class="settings-nav-item settings-nav-item-muted" class:active={settingsNav === "advanced"} onclick={() => void selectSettingsNav("advanced")}>Advanced</button>
+        </nav>
+      </aside>
+      <div class="settings-pane">
+        <header class="settings-pane-head">
+          <h2 class="settings-pane-h2">{SETTINGS_PANE_TITLE[settingsNav]}</h2>
+          <button type="button" class="ghost" onclick={closeSettingsHub}>Close</button>
+        </header>
+        <div class="settings-pane-body">
+          {#if settingsNav === "status"}
+            <div class="settings-section settings-section-flush">
+              <div class="status-summary-grid">
+                <div class="status-card">
+                  <div class="status-card-k">Sources</div>
+                  <div class="status-card-v">{status?.counts.sources ?? "—"}</div>
+                </div>
+                <div class="status-card">
+                  <div class="status-card-k">Chunks</div>
+                  <div class="status-card-v">{status?.counts.chunks ?? "—"}</div>
+                </div>
+                <div class="status-card">
+                  <div class="status-card-k">Inbox watch</div>
+                  <div class="status-card-v" class:live={status?.watcher.running}>
+                    {#if !status}
+                      …
+                    {:else if status.watcher.running}
+                      {status.watcher.mode === "polling" ? "Polling" : "Live"}
+                    {:else}
+                      Paused
                     {/if}
                   </div>
-                  <p class="claim-text">{c.text}</p>
-                  <div class="file-actions">
-                    <button type="button" class="ghost" onclick={() => showClaimEvidence(c.claim_id)}>Evidence</button>
-                    {#if identityTab === "proposed"}
-                      <button type="button" class="ghost" onclick={() => approveClaim(c.claim_id)}>Approve</button>
-                      <button type="button" class="ghost danger" onclick={() => rejectClaim(c.claim_id)}>Reject</button>
-                    {/if}
+                </div>
+                <div class="status-card">
+                  <div class="status-card-k">Sidecar</div>
+                  <div class="status-card-v" class:live={conn === "open"}>
+                    {conn === "open" ? "Ready" : conn === "connecting" ? "Starting" : conn === "unreachable" ? "Offline" : "Reconnecting"}
                   </div>
-                </li>
-              {/each}
-            </ul>
+                </div>
+              </div>
+
+              {#if dataDirMismatch()}
+                <div class="settings-error-box settings-spaced" role="status">
+                  <p><strong>Data folder mismatch</strong> — another Minion may be on this port. Restart the sidecar from here.</p>
+                  <div class="mismatch-paths"><span class="label">App</span><span class="mono">{config?.data_dir}</span></div>
+                  <div class="mismatch-paths"><span class="label">Sidecar</span><span class="mono">{status?.data_dir}</span></div>
+                </div>
+              {/if}
+
+              {#if sidecar?.state === "ready" && status && status.counts.sources > 0 && !claudeMcpAdded && !connectBannerDismissed}
+                <div class="setup-inline settings-spaced" role="status">
+                  <div class="setup-inline-text">
+                    You have indexed {status.counts.sources} source{status.counts.sources === 1 ? "" : "s"}. Add Minion to Claude Desktop (MCP), then restart Claude.
+                  </div>
+                  <div class="setup-inline-actions">
+                    <button type="button" class="ghost" disabled={connecting} onclick={() => void runConnect()}>{connecting ? "…" : "Add MCP"}</button>
+                    <button type="button" class="ghost" onclick={dismissConnectBanner}>Dismiss</button>
+                  </div>
+                </div>
+              {/if}
+
+              <div class="setting-row">
+                <div class="setting-main">
+                  <div class="setting-label">Restart sidecar</div>
+                  <div class="setting-desc">Reloads the Python process, watchers, and HTTP API.</div>
+                </div>
+                <button type="button" class="ghost" onclick={handleRestart} disabled={restarting}>{restarting ? "restarting…" : "Restart"}</button>
+              </div>
+
+              <div class="detail-block">
+                <div class="detail-block-title">Paths</div>
+                {#if conn === "open" && config?.api_base}
+                  <div class="detail-row"><span class="detail-k">API</span><span class="detail-v mono">{config.api_base}</span></div>
+                {/if}
+                {#if status?.db_path}
+                  <div class="detail-row"><span class="detail-k">Database</span><span class="detail-v mono">{status.db_path}</span></div>
+                {/if}
+                {#if config?.data_dir}
+                  <div class="detail-row"><span class="detail-k">Data</span><span class="detail-v mono">{config.data_dir}</span></div>
+                {/if}
+                {#if status?.watcher?.mode}
+                  <div class="detail-row"><span class="detail-k">Watcher mode</span><span class="detail-v">{status.watcher.mode}</span></div>
+                {/if}
+              </div>
+            </div>
+          {:else if settingsNav === "library"}
+            <div class="settings-section settings-section-flush">
+              <div class="modal-search library-search">
+                <input
+                  placeholder="Search your memory…"
+                  bind:value={queryText}
+                  onkeydown={(e) => e.key === "Enter" && runSearch()}
+                />
+                <button type="button" onclick={runSearch} disabled={searching}>{searching ? "…" : "Search"}</button>
+              </div>
+              {#if searchResults.length}
+                <div class="library-results">
+                  <div class="section-title small">Results</div>
+                  {#each searchResults as hit}
+                    <article class="hit">
+                      <header>
+                        <span class="score">{hit.score.toFixed(3)}</span>
+                        <span class="kind kind-{hit.kind}">{KIND_LABELS[hit.kind] ?? hit.kind}</span>
+                        <span class="path" title={hit.path}>{hit.path.split("/").pop()}</span>
+                      </header>
+                      <p>{hit.text}</p>
+                    </article>
+                  {/each}
+                </div>
+              {/if}
+              <div class="section-title small library-sources-head">
+                Indexed sources
+                <div class="chips">
+                  <button type="button" class:chip-active={!filterKind} onclick={() => { filterKind = ""; refreshSources(); }}>All</button>
+                  {#each kinds() as k}
+                    <button type="button" class:chip-active={filterKind === k} onclick={() => { filterKind = k; refreshSources(); }}>
+                      {KIND_LABELS[k] ?? k} <span class="count">{grouped()[k].length}</span>
+                    </button>
+                  {/each}
+                </div>
+              </div>
+              {#if sources.length === 0}
+                <div class="empty">Nothing indexed yet. Drop files on the main window.</div>
+              {:else}
+                <ul class="source-list">
+                  {#each sources as s}
+                    <li>
+                      <div class="file-main">
+                        <span class="kind kind-{s.kind}">{KIND_LABELS[s.kind] ?? s.kind}</span>
+                        <span class="path" title={s.path}>{s.path.split("/").pop()}</span>
+                        <span class="meta">{prettyBytes(s.bytes)} · {prettyTime(s.mtime)}</span>
+                      </div>
+                      <div class="file-actions">
+                        <button type="button" class="ghost" onclick={() => revealInFinder(s.path)}>Reveal</button>
+                        <button type="button" class="ghost danger" onclick={() => removeSource(s)}>Forget</button>
+                      </div>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+            </div>
+          {:else if settingsNav === "identity"}
+            <div class="settings-section settings-section-flush">
+              <div class="chips identity-toolbar">
+                <button type="button" class:chip-active={identityTab === "proposed"} onclick={() => switchIdentityTab("proposed")}>Proposed</button>
+                <button type="button" class:chip-active={identityTab === "active"} onclick={() => switchIdentityTab("active")}>Active</button>
+                <button type="button" class="ghost" onclick={() => refreshIdentity()} disabled={identityLoading}>{identityLoading ? "…" : "Refresh"}</button>
+                <button type="button" class="ghost" onclick={runClusterRebuild} disabled={clusterBusy}>{clusterBusy ? "Clustering…" : "Rebuild clusters"}</button>
+                <button type="button" class="ghost" onclick={runIdentityExport} disabled={exportBusy}>{exportBusy ? "Export…" : "Export zip"}</button>
+              </div>
+              {#if identityClaims.length === 0}
+                <div class="empty">
+                  {identityTab === "proposed"
+                    ? "No proposed claims. Agents can add them via MCP (`propose_identity_update`)."
+                    : "No active claims yet — approve proposals from the Proposed tab."}
+                </div>
+              {:else}
+                <ul class="source-list identity-claim-list">
+                  {#each identityClaims as c}
+                    <li>
+                      <div class="file-main">
+                        <span class="kind">{c.kind}</span>
+                        <span class="path mono" title={c.claim_id}>{c.claim_id}</span>
+                        {#if c.source_agent}
+                          <span class="meta">via {c.source_agent}</span>
+                        {/if}
+                      </div>
+                      <p class="claim-text">{c.text}</p>
+                      <div class="file-actions">
+                        <button type="button" class="ghost" onclick={() => showClaimEvidence(c.claim_id)}>Evidence</button>
+                        {#if identityTab === "proposed"}
+                          <button type="button" class="ghost" onclick={() => approveClaim(c.claim_id)}>Approve</button>
+                          <button type="button" class="ghost danger" onclick={() => rejectClaim(c.claim_id)}>Reject</button>
+                        {/if}
+                      </div>
+                    </li>
+                  {/each}
+                </ul>
+              {/if}
+              {#if evidencePopup}
+                <div class="evidence-box settings-spaced">
+                  <div class="section-title small">Evidence preview</div>
+                  <div class="meta mono">{evidencePopup.path}</div>
+                  <pre class="evidence-pre">{evidencePopup.text}</pre>
+                  <button type="button" class="ghost" onclick={() => (evidencePopup = null)}>Dismiss</button>
+                </div>
+              {/if}
+            </div>
+          {:else if settingsNav === "claude"}
+            <div class="settings-section settings-section-flush">
+              <div class="setting-row setting-row-stack">
+                <div class="setting-main">
+                  <div class="setting-label">Claude Desktop</div>
+                  <div class="setting-desc">Writes Minion into your Claude Desktop MCP config. Fully quit and reopen Claude after it succeeds.</div>
+                  {#if connectMsg}
+                    <div class="setting-callout" class:setting-callout-warn={connectMsg.startsWith("Couldn’t")}>
+                      {connectMsg}
+                    </div>
+                  {/if}
+                </div>
+                <button type="button" class="ghost" onclick={() => void runConnect()} disabled={connecting}>{connecting ? "…" : "Add to Claude"}</button>
+              </div>
+            </div>
+          {:else if settingsNav === "ingest"}
+            <div class="settings-section settings-section-flush">
+              <div class="setting-row">
+                <div class="setting-main">
+                  <div class="setting-label">Data folder</div>
+                  <div class="setting-desc">Indexed files are copied or linked from your inbox under this account’s data directory.</div>
+                  {#if config?.data_dir}
+                    <div class="path-one-line mono" title={config.data_dir}>{config.data_dir}</div>
+                  {/if}
+                </div>
+                <button type="button" class="ghost" onclick={revealDataFolder} disabled={!config?.data_dir}>Reveal</button>
+              </div>
+              <div class="setting-row">
+                <div class="setting-main">
+                  <div class="setting-label">Rescan inbox</div>
+                  <div class="setting-desc">
+                    Sync everything on disk into the database.
+                    <span class="setting-tip" title="Re-parses and re-embeds every file.">Re-index all</span> is the heavy option.
+                  </div>
+                </div>
+                <div class="setting-actions">
+                  <button type="button" class="ghost" onclick={() => void runRescanInbox(false)} disabled={rescanning || conn !== "open"}>{rescanning ? "…" : "Rescan"}</button>
+                  <button type="button" class="ghost" onclick={() => void runRescanInbox(true)} disabled={rescanning || conn !== "open"}>Re-index all</button>
+                </div>
+              </div>
+              <div class="section-title small ingest-types-head">
+                File types
+                <span class="section-hint">{savingSettings ? "saving…" : "what Minion ingests"}</span>
+              </div>
+              {#if !settingsLoaded && settingsError}
+                <div class="settings-error-box">
+                  <p>Couldn’t load file-type preferences.</p>
+                  <p class="settings-error-detail">{settingsError}</p>
+                  <button type="button" class="ghost" onclick={loadSettings}>Retry</button>
+                </div>
+              {:else if !settingsLoaded}
+                <div class="empty">Loading…</div>
+              {:else}
+                <ul class="kind-list">
+                  {#each allKinds as k}
+                    {@const enabled = !disabledKinds.has(k)}
+                    <li class="kind-row" class:kind-off={!enabled}>
+                      <label class="kind-toggle">
+                        <input type="checkbox" checked={enabled} onchange={() => toggleKind(k)} disabled={savingSettings} />
+                        <span class="kind-name">
+                          <span class="kind kind-{k === 'chatgpt-export' ? 'chatgpt-export' : k}">{(KIND_LABELS[k] ?? k).toLowerCase()}</span>
+                        </span>
+                        <span class="kind-desc">{KIND_DESCRIPTIONS[k] ?? ""}</span>
+                      </label>
+                    </li>
+                  {/each}
+                </ul>
+                <div class="settings-note">
+                  Disabled kinds are skipped on ingest. Turn one back on and restart the sidecar to pick up those files.
+                </div>
+              {/if}
+            </div>
+          {:else if settingsNav === "advanced"}
+            <div class="settings-advanced-card">
+              <div class="section-title small">Danger zone</div>
+              <div class="setting-row">
+                <div class="setting-main">
+                  <div class="setting-label">Nuke local database</div>
+                  <div class="setting-desc">Deletes <span class="mono">memory.db</span> and telemetry. Indexed content is lost.</div>
+                </div>
+                <button type="button" class="ghost danger" onclick={runNukeDb}>Nuke DB</button>
+              </div>
+              <div class="setting-row">
+                <div class="setting-main">
+                  <div class="setting-label">Factory reset</div>
+                  <div class="setting-desc">Clears the database <em>and</em> the inbox.</div>
+                </div>
+                <button type="button" class="ghost danger" onclick={runFactoryReset}>Factory reset</button>
+              </div>
+            </div>
           {/if}
         </div>
-        {#if evidencePopup}
-          <div class="modal-section settings-section evidence-box">
-            <div class="section-title small">Evidence preview</div>
-            <div class="meta mono">{evidencePopup.path}</div>
-            <pre class="evidence-pre">{evidencePopup.text}</pre>
-            <button type="button" class="ghost" onclick={() => (evidencePopup = null)}>Dismiss</button>
-          </div>
-        {/if}
-      </div>
-    </div>
-  </div>
-{/if}
-
-{#if showSettings}
-  <div class="modal-overlay" role="button" tabindex="-1" onclick={() => (showSettings = false)} onkeydown={(e) => e.key === "Escape" && (showSettings = false)}>
-    <div class="modal settings-modal" role="dialog" tabindex="-1" aria-modal="true" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
-      <header class="modal-head">
-        <img src="/minion.png" alt="" class="modal-avatar" aria-hidden="true" />
-        <h2>Settings</h2>
-        <div class="modal-meta">server · claude desktop · file types</div>
-        <button class="ghost" onclick={() => (showSettings = false)}>Close</button>
-      </header>
-
-      <div class="settings-body">
-        <div class="modal-section settings-section">
-          <div class="section-title small">Server</div>
-          <div class="setting-row">
-            <div class="setting-main">
-              <div class="setting-label">Sidecar status</div>
-              <div class="setting-desc">
-                {conn === "open"
-                  ? `ready · ${config?.api_base ?? ""}`
-                  : conn === "connecting"
-                    ? "starting up…"
-                    : "unreachable — try Restart"}
-              </div>
-            </div>
-            <button
-              class="ghost"
-              onclick={handleRestart}
-              disabled={restarting}
-              title="Kill and respawn the Python sidecar"
-            >
-              {restarting ? "restarting…" : "Restart"}
-            </button>
-          </div>
-          <div class="setting-row">
-            <div class="setting-main">
-              <div class="setting-label">Data folder</div>
-              <div class="setting-desc">
-                <span class="mono">{config?.data_dir ?? "…"}</span>
-                · per macOS user under Library/Application Support unless <span class="mono">MINION_DATA_DIR</span> is set.
-                Shared Mac: each login has its own folder; the app picks a free API port so you are not talking to another user’s sidecar on <span class="mono">127.0.0.1</span>.
-              </div>
-            </div>
-            <button class="ghost" onclick={revealDataFolder} disabled={!config?.data_dir} title="Show Minion data in Finder">
-              Reveal
-            </button>
-          </div>
-          <div class="setting-row">
-            <div class="setting-main">
-              <div class="setting-label">Claude Desktop</div>
-              <div class="setting-desc">
-                {connectMsg ||
-                  "Writes a Minion entry into Claude Desktop’s MCP config. Restart Claude after it succeeds."}
-              </div>
-            </div>
-            <button
-              class="ghost"
-              onclick={() => void runConnect()}
-              disabled={connecting}
-              title="Merge Minion into claude_desktop_config.json"
-            >
-              {connecting ? "…" : "Add to Claude Desktop"}
-            </button>
-          </div>
-        </div>
-
-        <div class="modal-section settings-section">
-          <div class="section-title small">Danger zone</div>
-          <div class="setting-row">
-            <div class="setting-main">
-              <div class="setting-label">Nuke local database</div>
-              <div class="setting-desc">
-                Deletes <span class="mono">memory.db</span> (your indexed memory) and resets Minion to a clean slate.
-              </div>
-            </div>
-            <button class="ghost danger" onclick={runNukeDb} title="Delete memory.db and restart the sidecar">
-              Nuke DB
-            </button>
-          </div>
-          <div class="setting-row">
-            <div class="setting-main">
-              <div class="setting-label">Factory reset</div>
-              <div class="setting-desc">
-                Wipes the database <em>and</em> clears the inbox for a truly fresh instance.
-              </div>
-            </div>
-            <button class="ghost danger" onclick={runFactoryReset} title="Delete memory.db, clear inbox, and restart the sidecar">
-              Factory reset
-            </button>
-          </div>
-        </div>
-
-        <div class="modal-section settings-section">
-          <div class="section-title small">
-            File types
-            <span class="section-hint">{savingSettings ? "saving…" : "toggle what Minion ingests"}</span>
-          </div>
-          {#if !settingsLoaded && settingsError}
-            <div class="empty">
-              Couldn't reach the sidecar: {settingsError}.
-              <button class="link" onclick={loadSettings}>Retry</button>
-            </div>
-          {:else if !settingsLoaded}
-            <div class="empty">Loading…</div>
-          {:else}
-            <ul class="kind-list">
-              {#each allKinds as k}
-                {@const enabled = !disabledKinds.has(k)}
-                <li class="kind-row" class:kind-off={!enabled}>
-                  <label class="kind-toggle">
-                    <input
-                      type="checkbox"
-                      checked={enabled}
-                      onchange={() => toggleKind(k)}
-                      disabled={savingSettings}
-                    />
-                    <span class="kind-name">
-                      <span class="kind kind-{k === 'chatgpt-export' ? 'chatgpt-export' : k}">{(KIND_LABELS[k] ?? k).toLowerCase()}</span>
-                    </span>
-                    <span class="kind-desc">{KIND_DESCRIPTIONS[k] ?? ""}</span>
-                  </label>
-                </li>
-              {/each}
-            </ul>
-            <div class="settings-note">
-              Files of disabled kinds are left alone on disk — Minion will log
-              them as skipped. Re-enable and restart the sidecar to pick them up.
-            </div>
-          {/if}
-        </div>
-      </div>
-    </div>
-  </div>
-{/if}
-
-{#if showContents}
-  <div class="modal-overlay" role="button" tabindex="-1" onclick={() => (showContents = false)} onkeydown={(e) => e.key === "Escape" && (showContents = false)}>
-    <div class="modal" role="dialog" tabindex="-1" aria-modal="true" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
-      <header class="modal-head">
-        <img src="/minion.png" alt="" class="modal-avatar" aria-hidden="true" />
-        <h2>Contents</h2>
-        <div class="modal-meta">
-          {sources.length} source{sources.length === 1 ? "" : "s"}
-          · {status?.counts.chunks ?? 0} chunks
-        </div>
-        <button class="ghost" onclick={() => (showContents = false)}>Close</button>
-      </header>
-
-      <div class="modal-search">
-        <input
-          placeholder="Ask your memory anything…"
-          bind:value={queryText}
-          onkeydown={(e) => e.key === "Enter" && runSearch()}
-        />
-        <button onclick={runSearch} disabled={searching}>{searching ? "…" : "Search"}</button>
-      </div>
-
-      {#if searchResults.length}
-        <div class="modal-section">
-          <div class="section-title small">Results</div>
-          {#each searchResults as hit}
-            <article class="hit">
-              <header>
-                <span class="score">{hit.score.toFixed(3)}</span>
-                <span class="kind kind-{hit.kind}">{KIND_LABELS[hit.kind] ?? hit.kind}</span>
-                <span class="path" title={hit.path}>{hit.path.split("/").pop()}</span>
-              </header>
-              <p>{hit.text}</p>
-            </article>
-          {/each}
-        </div>
-      {/if}
-
-      <div class="modal-section">
-        <div class="section-title small">
-          In memory
-          <div class="chips">
-            <button class:chip-active={!filterKind} onclick={() => { filterKind = ""; refreshSources(); }}>All</button>
-            {#each kinds() as k}
-              <button class:chip-active={filterKind === k} onclick={() => { filterKind = k; refreshSources(); }}>
-                {KIND_LABELS[k] ?? k} <span class="count">{grouped()[k].length}</span>
-              </button>
-            {/each}
-          </div>
-        </div>
-        {#if sources.length === 0}
-          <div class="empty">Nothing here yet. Drop a file to get started.</div>
-        {:else}
-          <ul class="source-list">
-            {#each sources as s}
-              <li>
-                <div class="file-main">
-                  <span class="kind kind-{s.kind}">{KIND_LABELS[s.kind] ?? s.kind}</span>
-                  <span class="path" title={s.path}>{s.path.split("/").pop()}</span>
-                  <span class="meta">{prettyBytes(s.bytes)} · {prettyTime(s.mtime)}</span>
-                </div>
-                <div class="file-actions">
-                  <button class="ghost" onclick={() => revealInFinder(s.path)}>Reveal</button>
-                  <button class="ghost danger" onclick={() => removeSource(s)}>Forget</button>
-                </div>
-              </li>
-            {/each}
-          </ul>
-        {/if}
       </div>
     </div>
   </div>
@@ -1463,12 +1465,26 @@
     color: var(--ink);
   }
 
-  header {
+  header.app-header-min {
     display: flex;
     align-items: center;
     justify-content: space-between;
     padding-bottom: 12px;
     border-bottom: 1px solid var(--border);
+  }
+  .btn-settings-main {
+    background: var(--accent);
+    color: #fff;
+    border: 1px solid var(--accent);
+    padding: 8px 18px;
+    font-size: 13px;
+    font-weight: 600;
+    border-radius: 999px;
+    box-shadow: var(--shadow-s);
+  }
+  .btn-settings-main:hover {
+    background: var(--accent-2);
+    border-color: var(--accent-2);
   }
   .brand {
     display: flex;
@@ -1507,77 +1523,6 @@
               drop-shadow(0 0 12px color-mix(in srgb, var(--accent) 50%, transparent));
     }
   }
-  .header-right {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 4px;
-    min-width: 0;
-  }
-  .sidecar-data-path {
-    max-width: min(520px, 56vw);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-family: var(--num-font);
-    font-size: 10px;
-    color: var(--muted);
-    line-height: 1.2;
-  }
-  .sidecar-data-path.mismatch {
-    color: #b45309;
-  }
-  .counts {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    font-family: var(--num-font);
-    font-size: 11.5px;
-    color: var(--muted);
-    font-feature-settings: "tnum";
-  }
-  .counts strong { color: var(--ink); font-weight: 600; }
-
-  /* Watcher + status indicator: soft pills, pill-shaped. */
-  .watcher,
-  .status-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 10px;
-    border: 1px solid var(--border);
-    background: var(--panel);
-    font-family: var(--num-font);
-    font-size: 10.5px;
-    font-weight: 500;
-    letter-spacing: 0.02em;
-    color: var(--muted);
-    border-radius: 999px;
-  }
-  .watcher.live { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
-  .status-dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: currentColor;
-  }
-  .status-open    { color: var(--accent);  border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); background: color-mix(in srgb, var(--accent) 6%, var(--panel)); }
-  .status-connecting { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 35%, var(--border)); }
-  .status-closed  { color: var(--warn);  border-color: color-mix(in srgb, var(--warn) 35%, var(--border)); }
-  .status-unreachable { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); background: color-mix(in srgb, var(--danger) 6%, var(--panel)); }
-  .status-open .status-dot       { background: var(--accent); animation: statuspulse 2.4s ease-in-out infinite; }
-  .status-connecting .status-dot { background: var(--warn); animation: blink 0.9s ease-in-out infinite; }
-  .status-closed .status-dot     { background: var(--warn); animation: blink 0.9s ease-in-out infinite; }
-  .status-unreachable .status-dot { background: var(--danger); }
-  @keyframes statuspulse {
-    0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent); }
-    50%      { box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 0%, transparent); }
-  }
-  @keyframes blink {
-    0%, 100% { opacity: 1; }
-    50%      { opacity: 0.3; }
-  }
-
   .toast {
     background: color-mix(in srgb, var(--accent) 8%, var(--panel));
     border: 1px solid color-mix(in srgb, var(--accent) 25%, var(--border));
@@ -1607,24 +1552,6 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
     font-size: 10px;
-  }
-
-  .setup-reminder {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 10px 12px;
-    padding: 10px 12px;
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    font-family: var(--ui-font);
-    font-size: 12px;
-    line-height: 1.4;
-    color: var(--ink);
-  }
-  .setup-reminder span {
-    flex: 1 1 200px;
   }
 
   .bootstrap-overlay {
@@ -1884,57 +1811,44 @@
     outline: 2px solid var(--accent);
     outline-offset: 2px;
   }
-  .drop-brackets {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 18px;
-    max-width: 520px;
-    margin: 0 auto;
-  }
-  .bracket {
-    font-family: var(--serif-font);
-    font-size: 52px;
-    font-weight: 400;
-    line-height: 1;
-    color: color-mix(in srgb, var(--accent) 45%, var(--dim));
-    user-select: none;
-    transition: color 200ms ease, transform 200ms ease;
-  }
-  .drop:hover .bracket { color: var(--accent); }
-  .drop.active .bracket,
-  .app.dragging .bracket {
-    color: var(--accent);
-    transform: scale(1.06);
-  }
-  .drop-body {
-    flex: 0 1 auto;
+  .drop-inner {
+    position: relative;
+    z-index: 1;
     text-align: center;
-    min-width: 0;
+    max-width: 420px;
+    margin: 0 auto;
+    padding: 8px 12px 12px;
   }
   .drop-title {
     font-family: var(--display-font);
-    font-size: 22px;
-    font-weight: 400;
-    letter-spacing: 0;
+    font-size: 1.35rem;
+    font-weight: 500;
+    letter-spacing: -0.02em;
     color: var(--heading);
-    text-transform: none;
-    line-height: 1.2;
+    line-height: 1.25;
   }
   .drop-hint {
-    margin-top: 6px;
-    font-family: var(--ui-font);
-    font-size: 11.5px;
-    color: var(--muted);
-    line-height: 1.35;
-  }
-  .drop-sub {
     margin-top: 8px;
+    font-family: var(--ui-font);
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.45;
+  }
+  .drop-actions {
+    margin-top: 14px;
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 6px 10px;
     font-family: var(--ui-font);
     font-size: 12.5px;
     color: var(--muted);
   }
-  .drop-sub .divider { margin: 0 8px; color: var(--dim); }
+  .drop-actions-sep {
+    opacity: 0.45;
+    user-select: none;
+  }
 
   /* Minion peeking from the drop zone's corner. Low-key when idle, alert
    * when the user drags a file toward him. */
@@ -2021,40 +1935,25 @@
   .term-glyph.spin { animation: pulse 1.1s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity: 0.55; } 50% { opacity: 1; } }
 
-  /* Gum/Bubble Tea-style box chrome around the activity stream. */
-  .term-head, .term-foot {
+  .activity-head {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 6px 14px;
-    font-family: var(--num-font);
-    font-size: 10.5px;
-    color: var(--muted);
-    letter-spacing: 0.02em;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    background: color-mix(in srgb, var(--panel-2) 88%, var(--accent));
+    font-family: var(--ui-font);
     user-select: none;
-    background: color-mix(in srgb, var(--accent) 3%, var(--panel-2));
   }
-  .term-head  { border-bottom: 1px dashed var(--border); }
-  .term-foot  { border-top: 1px dashed var(--border); }
-  .term-corner { color: color-mix(in srgb, var(--accent) 45%, var(--border-strong)); }
-  .term-title {
-    color: var(--accent);
-    text-transform: uppercase;
+  .activity-title {
+    font-size: 12px;
     font-weight: 600;
-    letter-spacing: 0.16em;
-    padding: 2px 8px;
-    background: color-mix(in srgb, var(--accent) 10%, var(--panel));
-    border: 1px solid color-mix(in srgb, var(--accent) 20%, var(--border));
-    border-radius: 999px;
-    font-size: 10px;
+    color: var(--ink);
+    letter-spacing: 0.01em;
   }
-  .term-rule {
-    flex: 1;
-    border-top: 1px dashed var(--border-strong);
-    align-self: center;
-    margin-top: 1px;
-  }
-  .term-count {
+  .activity-count {
+    font-size: 11px;
     color: var(--muted);
     font-variant-numeric: tabular-nums;
   }
@@ -2134,6 +2033,256 @@
     z-index: 100;
     overflow-y: auto;
   }
+  .settings-overlay {
+    align-items: center;
+  }
+  .settings-hub {
+    max-width: 1000px;
+    width: 100%;
+    max-height: calc(100vh - 48px);
+    display: flex;
+    flex-direction: row;
+    padding: 0;
+    overflow: hidden;
+    border-radius: var(--radius-lg);
+  }
+  .settings-sidebar {
+    width: 208px;
+    flex-shrink: 0;
+    border-right: 1px solid var(--border);
+    background: color-mix(in srgb, var(--panel-2) 55%, var(--panel));
+    display: flex;
+    flex-direction: column;
+  }
+  .settings-sidebar-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .settings-sidebar-head .modal-avatar {
+    width: 28px;
+    height: 28px;
+  }
+  .settings-sidebar-title {
+    font-family: var(--ui-font);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink);
+    line-height: 1.2;
+  }
+  .settings-sidebar-sub {
+    font-size: 10.5px;
+    color: var(--muted);
+    line-height: 1.2;
+    margin-top: 1px;
+  }
+  .settings-nav-list {
+    display: flex;
+    flex-direction: column;
+    padding: 8px;
+    gap: 2px;
+    flex: 1;
+    overflow-y: auto;
+  }
+  .settings-nav-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    color: var(--ink);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+    font-family: var(--ui-font);
+    font-size: 12.5px;
+    font-weight: 500;
+    cursor: pointer;
+    box-shadow: none;
+    transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+  }
+  .settings-nav-item:hover {
+    background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 15%, transparent);
+  }
+  .settings-nav-item.active {
+    background: color-mix(in srgb, var(--accent) 14%, var(--panel));
+    color: var(--accent-2);
+    border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+  }
+  .settings-nav-item-muted {
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .settings-pane {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--panel);
+  }
+  .settings-pane-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 18px;
+    border-bottom: 1px solid var(--border);
+    background: color-mix(in srgb, var(--accent) 5%, var(--panel-2));
+    flex-shrink: 0;
+  }
+  .settings-pane-h2 {
+    margin: 0;
+    font-family: var(--ui-font);
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--heading);
+    letter-spacing: -0.01em;
+  }
+  .settings-pane-body {
+    padding: 18px 20px 22px;
+    overflow-y: auto;
+    flex: 1;
+    min-height: 0;
+  }
+  .settings-section-flush {
+    padding: 0;
+    margin: 0;
+    border: none;
+    background: transparent;
+    box-shadow: none;
+  }
+  .status-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+    margin-bottom: 18px;
+  }
+  @media (max-width: 720px) {
+    .status-summary-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .settings-hub {
+      flex-direction: column;
+      max-height: calc(100vh - 32px);
+    }
+    .settings-sidebar {
+      width: 100%;
+      border-right: none;
+      border-bottom: 1px solid var(--border);
+      max-height: 40vh;
+    }
+    .settings-nav-list {
+      flex-direction: row;
+      flex-wrap: wrap;
+    }
+    .settings-nav-item {
+      width: auto;
+      flex: 1 1 auto;
+    }
+  }
+  .status-card {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    background: var(--panel-2);
+  }
+  .status-card-k {
+    font-size: 9.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+  }
+  .status-card-v {
+    margin-top: 6px;
+    font-size: 1.25rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    line-height: 1.15;
+  }
+  .status-card-v.live {
+    color: var(--accent);
+  }
+  .settings-spaced {
+    margin-top: 16px;
+  }
+  .setup-inline {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 14px;
+    padding: 12px 14px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .setup-inline-text {
+    flex: 1 1 220px;
+    font-family: var(--ui-font);
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--ink);
+  }
+  .setup-inline-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .detail-block {
+    margin-top: 18px;
+    padding: 12px 14px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .detail-block-title {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }
+  .detail-row {
+    display: grid;
+    grid-template-columns: 92px 1fr;
+    gap: 6px 12px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+    line-height: 1.35;
+  }
+  .detail-row:last-child {
+    border-bottom: none;
+    padding-bottom: 0;
+  }
+  .detail-k {
+    color: var(--dim);
+    font-weight: 500;
+  }
+  .detail-v {
+    color: var(--ink);
+    word-break: break-word;
+  }
+  .library-search {
+    margin-bottom: 4px;
+  }
+  .library-results {
+    margin-bottom: 18px;
+  }
+  .library-sources-head {
+    margin-top: 4px;
+  }
+  .identity-toolbar {
+    margin-bottom: 14px;
+  }
+  .ingest-types-head {
+    margin-top: 6px;
+  }
   .modal {
     width: 100%;
     max-width: 860px;
@@ -2146,15 +2295,10 @@
     overflow: hidden;
     box-shadow: var(--shadow-m);
   }
-  .settings-modal .settings-body {
-    overflow-y: auto;
-    min-height: 0;
-  }
-  /* In Settings, avoid nested “scroll within scroll” which feels crunched. */
-  .settings-modal .modal-section {
-    max-height: none;
-    overflow: visible;
-    flex: 0 0 auto;
+  .modal.settings-hub {
+    max-width: 1000px;
+    flex-direction: row;
+    padding: 0;
   }
   .modal-head {
     display: flex;
@@ -2163,16 +2307,6 @@
     padding: 16px 22px;
     border-bottom: 1px solid var(--border);
     background: color-mix(in srgb, var(--accent) 4%, var(--panel-2));
-  }
-  .modal-head h2 {
-    margin: 0;
-    font-family: var(--display-font);
-    font-size: 22px;
-    font-weight: 400;
-    letter-spacing: -0.005em;
-    color: var(--heading);
-    text-transform: none;
-    line-height: 1;
   }
   .modal-avatar {
     width: 30px;
@@ -2215,6 +2349,11 @@
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
   }
   .modal-search button { border-radius: var(--radius-sm); padding: 8px 16px; }
+  .library-search.modal-search {
+    padding: 0;
+    border-bottom: none;
+    background: transparent;
+  }
 
   .modal-section {
     padding: 16px 20px;
@@ -2421,6 +2560,81 @@
     white-space: pre-wrap;
   }
 
+  .settings-advanced-card {
+    background: color-mix(in srgb, var(--danger) 6%, var(--panel));
+    border: 1px solid color-mix(in srgb, var(--danger) 22%, var(--border));
+    border-radius: var(--radius-md);
+    padding: 14px 16px 16px;
+  }
+  .settings-section-danger .section-title {
+    color: color-mix(in srgb, var(--danger) 55%, var(--muted));
+  }
+  .setting-meta {
+    margin-top: 6px;
+    font-size: 10.5px;
+    color: var(--dim);
+    word-break: break-all;
+    line-height: 1.35;
+  }
+  .path-one-line {
+    margin-top: 8px;
+    padding: 8px 10px;
+    border-radius: var(--radius-sm);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    font-size: 10.5px;
+    color: var(--ink);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+  }
+  .setting-tip {
+    font-weight: 600;
+    color: var(--ink);
+    border-bottom: 1px dotted color-mix(in srgb, var(--muted) 70%, transparent);
+    cursor: help;
+  }
+  .setting-callout {
+    margin-top: 10px;
+    padding: 8px 11px;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--ink);
+    background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+    border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  }
+  .setting-callout-warn {
+    background: color-mix(in srgb, var(--danger) 8%, var(--panel));
+    border-color: color-mix(in srgb, var(--danger) 28%, var(--border));
+    color: color-mix(in srgb, var(--danger) 92%, var(--ink));
+  }
+  .setting-row-stack {
+    align-items: flex-start;
+  }
+  .setting-row-stack .setting-main {
+    flex: 1 1 220px;
+  }
+  .settings-error-box {
+    padding: 14px 16px;
+    border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--danger) 6%, var(--panel));
+    text-align: left;
+  }
+  .settings-error-box p {
+    margin: 0 0 8px;
+    font-family: var(--ui-font);
+    font-size: 13px;
+    color: var(--ink);
+  }
+  .settings-error-detail {
+    font-size: 12px !important;
+    color: var(--muted) !important;
+    word-break: break-word;
+    margin-bottom: 12px !important;
+  }
   /* Settings modal: roomy rows, plain-language toggles. */
   .settings-section .section-hint {
     font-family: var(--ui-font);
@@ -2432,17 +2646,26 @@
   }
   .setting-row {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
-    gap: 16px;
-    padding: 12px 14px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--panel);
-    margin-bottom: 8px;
+    gap: 14px;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 0;
+  }
+  .setting-row:last-child {
+    border-bottom: none;
+    padding-bottom: 0;
   }
   .setting-row:last-child { margin-bottom: 0; }
   .setting-main { min-width: 0; flex: 1; }
+  .setting-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    flex-shrink: 0;
+  }
   .setting-label {
     font-family: var(--ui-font);
     font-size: 13px;

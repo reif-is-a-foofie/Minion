@@ -69,7 +69,7 @@ export type Status = {
   supported_extensions: string[];
   counts: { sources: number; chunks: number };
   active: Active;
-  watcher: { running: boolean };
+  watcher: { running: boolean; mode?: string };
 };
 
 export type EventMsg =
@@ -286,6 +286,14 @@ export async function rebuildPreferenceClusters(body: {
   return apiFetch("/identity/clusters/rebuild", {
     method: "POST",
     body: JSON.stringify(body),
+  });
+}
+
+/** Full inbox scan → DB. Use `force: true` to re-embed even when sha unchanged (slow). */
+export async function reconcileInbox(body: { force?: boolean } = {}): Promise<{ started: boolean; force: boolean }> {
+  return apiFetch("/reconcile", {
+    method: "POST",
+    body: JSON.stringify({ force: body.force ?? false }),
   });
 }
 

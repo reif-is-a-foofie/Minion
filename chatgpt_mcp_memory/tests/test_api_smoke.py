@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -39,6 +40,19 @@ def test_status_ready(sidecar) -> None:
         assert required in exts, f"missing {required} in supported_extensions: {exts}"
     # Watcher is disabled in tests.
     assert body["watcher"]["running"] is False
+    assert body["watcher"]["mode"] == "disabled"
+
+
+def test_reconcile_picks_up_inbox_files(sidecar, staged_note: Path) -> None:
+    """POST /reconcile should ingest files already on disk when the watcher is off."""
+    dest = sidecar.inbox / "already-here.md"
+    shutil.copy2(staged_note, dest)
+    r = sidecar.post("/reconcile", {"force": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["started"] is True
+    sources = sidecar.wait_for_sources(1, timeout=45.0)
+    assert len(sources) == 1
+    assert sources[0]["path"].endswith("already-here.md")
 
 
 # ---------------------------------------------------------------------------

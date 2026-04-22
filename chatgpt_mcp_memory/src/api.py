@@ -24,6 +24,7 @@ Endpoints:
   GET  /chunks/{chunk_id}           -> one chunk for evidence drill-down
   GET  /capabilities                -> stable feature flags for local agent integrations
   POST /ingest                      -> body: {"path": "..."}  (copies path into inbox if outside)
+  POST /reconcile                   -> body: {"force": bool}  rescan inbox → DB (optional re-embed all)
   WS   /events                      -> push ingest + heartbeat (see handler for `type` values)
 
 Run:
@@ -167,6 +168,78 @@ def _schedule_broadcast(event: Dict[str, Any]) -> None:
     asyncio.run_coroutine_threadsafe(_broadcast(event), loop)
 
 
+def _watcher_event_bridge(kind: str, payload: Dict[str, Any]) -> None:
+    """Translate watcher/reconcile events into the WebSocket schema the UI expects."""
+    if kind == "batch_started":
+        with State.active_lock:
+            State.active = {
+                "root": "watcher",
+                "total": int(payload.get("total", 0)),
+                "done": 0,
+                "added": 0,
+                "skipped": 0,
+            }
+        _schedule_broadcast({
+            "type": "ingest_started",
+            "source": "watcher",
+            "count": payload.get("total", 0),
+            "active": dict(State.active),
+        })
+    elif kind == "file_started":
+        _schedule_broadcast({
+            "type": "ingest_progress",
+            "path": payload.get("path"),
+            "index": payload.get("index"),
+            "total": payload.get("total"),
+        })
+    elif kind == "file_progress":
+        _schedule_broadcast({
+            "type": "file_progress",
+            **{k: v for k, v in payload.items() if k != "type"},
+        })
+    elif kind == "file_done":
+        skipped = bool(payload.get("skipped"))
+        with State.active_lock:
+            State.active["done"] = int(payload.get("index", State.active["done"]))
+            if skipped:
+                State.active["skipped"] += 1
+            elif payload.get("source_id"):
+                State.active["added"] += 1
+        _schedule_broadcast({
+            "type": "ingest_skipped" if skipped else "source_updated",
+            "result": payload,
+            "counts": _counts(),
+            "active": dict(State.active),
+        })
+    elif kind == "file_failed":
+        with State.active_lock:
+            State.active["done"] = int(payload.get("index", State.active["done"]))
+            State.active["skipped"] += 1
+        _schedule_broadcast({
+            "type": "ingest_failed",
+            "path": payload.get("path"),
+            "active": dict(State.active),
+        })
+    elif kind == "batch_done":
+        snap = None
+        with State.active_lock:
+            snap = dict(State.active)
+            State.active = {"root": None, "total": 0, "done": 0, "added": 0, "skipped": 0}
+        _schedule_broadcast({
+            "type": "tree_done",
+            "root": "watcher",
+            "added": snap.get("added", 0),
+            "skipped": snap.get("skipped", 0),
+            "counts": _counts(),
+        })
+    elif kind == "removed":
+        _schedule_broadcast({
+            "type": "source_removed",
+            "key": payload.get("path"),
+            "counts": _counts(),
+        })
+
+
 # ---------------------------------------------------------------------------
 # Watcher integration — start the same watcher the MCP uses, but wire its
 # per-file events into our websocket fanout so the UI updates live.
@@ -175,90 +248,20 @@ def _schedule_broadcast(event: Dict[str, Any]) -> None:
 
 _watcher_thread: Optional[threading.Thread] = None
 _heartbeat_thread: Optional[threading.Thread] = None
+_watcher_mode: str = "disabled"
+_manual_reconcile_lock = threading.Lock()
 
 
 def _start_watcher() -> None:
+    global _watcher_thread, _heartbeat_thread, _watcher_mode
+    _watcher_mode = "disabled"
     if os.environ.get("MINION_DISABLE_WATCHER") in ("1", "true", "TRUE"):
         return
     try:
-        from watcher import reconcile_once, start_background
+        from watcher import reconcile_once, start_background, start_polling_watcher
 
         def _factory() -> sqlite3.Connection:
             return connect(State.db_path)
-
-        def _on_watcher_event(kind: str, payload: Dict[str, Any]) -> None:
-            # Translate watcher events into the same schema the UI already
-            # consumes from /ingest so the feed and progress bar light up
-            # regardless of whether a drop came via HTTP or the file system.
-            if kind == "batch_started":
-                with State.active_lock:
-                    State.active = {
-                        "root": "watcher",
-                        "total": int(payload.get("total", 0)),
-                        "done": 0,
-                        "added": 0,
-                        "skipped": 0,
-                    }
-                _schedule_broadcast({
-                    "type": "ingest_started",
-                    "source": "watcher",
-                    "count": payload.get("total", 0),
-                    "active": dict(State.active),
-                })
-            elif kind == "file_started":
-                _schedule_broadcast({
-                    "type": "ingest_progress",
-                    "path": payload.get("path"),
-                    "index": payload.get("index"),
-                    "total": payload.get("total"),
-                })
-            elif kind == "file_progress":
-                # Forward parser/embed stage events verbatim; UI formats them.
-                _schedule_broadcast({
-                    "type": "file_progress",
-                    **{k: v for k, v in payload.items() if k != "type"},
-                })
-            elif kind == "file_done":
-                skipped = bool(payload.get("skipped"))
-                with State.active_lock:
-                    State.active["done"] = int(payload.get("index", State.active["done"]))
-                    if skipped:
-                        State.active["skipped"] += 1
-                    elif payload.get("source_id"):
-                        State.active["added"] += 1
-                _schedule_broadcast({
-                    "type": "ingest_skipped" if skipped else "source_updated",
-                    "result": payload,
-                    "counts": _counts(),
-                    "active": dict(State.active),
-                })
-            elif kind == "file_failed":
-                with State.active_lock:
-                    State.active["done"] = int(payload.get("index", State.active["done"]))
-                    State.active["skipped"] += 1
-                _schedule_broadcast({
-                    "type": "ingest_failed",
-                    "path": payload.get("path"),
-                    "active": dict(State.active),
-                })
-            elif kind == "batch_done":
-                snap = None
-                with State.active_lock:
-                    snap = dict(State.active)
-                    State.active = {"root": None, "total": 0, "done": 0, "added": 0, "skipped": 0}
-                _schedule_broadcast({
-                    "type": "tree_done",
-                    "root": "watcher",
-                    "added": snap.get("added", 0),
-                    "skipped": snap.get("skipped", 0),
-                    "counts": _counts(),
-                })
-            elif kind == "removed":
-                _schedule_broadcast({
-                    "type": "source_removed",
-                    "key": payload.get("path"),
-                    "counts": _counts(),
-                })
 
         # Reconcile in a background thread so lifespan startup finishes
         # immediately -- a large pre-existing inbox shouldn't block the
@@ -267,7 +270,7 @@ def _start_watcher() -> None:
             try:
                 bg_conn = connect(State.db_path)
                 try:
-                    reconcile_once(bg_conn, State.inbox, on_event=_on_watcher_event)
+                    reconcile_once(bg_conn, State.inbox, on_event=_watcher_event_bridge)
                 finally:
                     bg_conn.close()
                 _schedule_broadcast({"type": "ready", "counts": _counts()})
@@ -278,10 +281,16 @@ def _start_watcher() -> None:
             target=_reconcile_bg, name="minion-api-reconcile", daemon=True
         ).start()
 
-        global _watcher_thread, _heartbeat_thread
         _watcher_thread = start_background(
-            _factory, State.inbox, on_event=_on_watcher_event
+            _factory, State.inbox, on_event=_watcher_event_bridge
         )
+        if _watcher_thread is not None:
+            _watcher_mode = "watchdog"
+        else:
+            _watcher_thread = start_polling_watcher(
+                _factory, State.inbox, on_event=_watcher_event_bridge
+            )
+            _watcher_mode = "polling"
 
         # Even with watchdog, we emit periodic heartbeats so the UI can show
         # a live count without polling the HTTP API.
@@ -299,6 +308,7 @@ def _start_watcher() -> None:
         _heartbeat_thread.start()
     except Exception:
         log.exception("failed to start watcher")
+        _watcher_mode = "disabled"
 
 
 def _counts() -> Dict[str, Any]:
@@ -421,6 +431,10 @@ class ConnectBody(BaseModel):
 
 class SettingsBody(BaseModel):
     disabled_kinds: Optional[List[str]] = None
+
+
+class ReconcileBody(BaseModel):
+    force: bool = False
 
 
 class IdentityProposeBody(BaseModel):
@@ -557,6 +571,36 @@ def update_settings(body: SettingsBody) -> Dict[str, Any]:
     return {"settings": saved, "all_kinds": list(ALL_KINDS)}
 
 
+@app.post("/reconcile")
+def reconcile_endpoint(body: ReconcileBody) -> Dict[str, Any]:
+    """Full inbox scan → DB (and optional force re-embed). Runs in the background."""
+    if not _manual_reconcile_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="reconcile already running")
+    force = body.force
+
+    def _run() -> None:
+        try:
+            from watcher import reconcile_once
+
+            conn = connect(State.db_path)
+            try:
+                reconcile_once(
+                    conn,
+                    State.inbox,
+                    force=force,
+                    on_event=_watcher_event_bridge,
+                )
+            finally:
+                conn.close()
+        except Exception:
+            log.exception("manual reconcile failed")
+        finally:
+            _manual_reconcile_lock.release()
+
+    threading.Thread(target=_run, name="minion-api-reconcile-manual", daemon=True).start()
+    return {"started": True, "force": force}
+
+
 @app.get("/status")
 def status() -> Dict[str, Any]:
     with State.active_lock:
@@ -572,6 +616,7 @@ def status() -> Dict[str, Any]:
             "running": _watcher_thread is not None and _watcher_thread.is_alive()
             if _watcher_thread
             else False,
+            "mode": _watcher_mode,
         },
     }
 
@@ -598,6 +643,7 @@ def capabilities() -> Dict[str, Any]:
             "search": "POST /search",
             "search_stream": "GET /search/stream",
             "ingest": "POST /ingest",
+            "reconcile": "POST /reconcile",
             "events_ws": "WS /events",
             "identity_claims": "GET /identity/claims",
             "identity_propose": "POST /identity/claims/propose",

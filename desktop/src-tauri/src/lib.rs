@@ -216,28 +216,37 @@ fn resolve_sidecar_src_dir(app: &AppHandle) -> Option<PathBuf> {
     None
 }
 
-/// Locate the requirements file bundled alongside the sidecar source. Looks
-/// in the same Resources tree as [`resolve_sidecar_src_dir`]; returns `None`
-/// in dev if not staged (caller falls back to the repo's requirements.txt).
+/// Prefer `requirements-docs.txt` when bundled (PDF/DOCX/HTML — it already
+/// `-r requirements.txt`). Fall back to `requirements.txt` only if docs file
+/// is missing (old bundles).
+fn pick_sidecar_requirements_in(dir: &Path) -> Option<PathBuf> {
+    let docs = dir.join("requirements-docs.txt");
+    if docs.exists() {
+        return Some(docs);
+    }
+    let core = dir.join("requirements.txt");
+    if core.exists() {
+        return Some(core);
+    }
+    None
+}
+
+/// Locate the requirements file bundled alongside the sidecar source.
 fn resolve_sidecar_requirements(app: &AppHandle, src_dir: &Path) -> Option<PathBuf> {
-    // Shipped layout: <Resources>/sidecar/requirements.txt (sibling of src/)
+    // Layout: <sidecar>/requirements-docs.txt sibling of <sidecar>/src/
     if let Some(parent) = src_dir.parent() {
-        let r = parent.join("requirements.txt");
-        if r.exists() {
-            return Some(r);
+        if let Some(p) = pick_sidecar_requirements_in(parent) {
+            return Some(p);
         }
     }
     if let Ok(res_dir) = app.path().resource_dir() {
-        let r = res_dir.join("sidecar").join("requirements.txt");
-        if r.exists() {
-            return Some(r);
+        if let Some(p) = pick_sidecar_requirements_in(&res_dir.join("sidecar")) {
+            return Some(p);
         }
     }
-    // Dev fallback: <repo>/chatgpt_mcp_memory/requirements.txt
     if let Some(grand) = src_dir.parent().and_then(Path::parent) {
-        let r = grand.join("requirements.txt");
-        if r.exists() {
-            return Some(r);
+        if let Some(p) = pick_sidecar_requirements_in(grand) {
+            return Some(p);
         }
     }
     None
@@ -455,7 +464,7 @@ fn bootstrap_venv(
 
     emit(
         "installing",
-        "Installing dependencies (first launch, ~2 min)…",
+        "Installing dependencies — core stack + PDF, Word, HTML parsers (first launch, ~2–4 min)…",
     );
     dbg("bootstrap", serde_json::json!({"state": "pip_start", "requirements": requirements}));
     let status = Command::new(&py)
@@ -478,11 +487,15 @@ fn bootstrap_venv(
     Ok(py)
 }
 
-/// Quick sanity check: does this venv already have our core deps imported?
-/// Avoids a ~2min pip re-run on every launch even though the venv exists.
+/// Quick sanity check: core HTTP/embed stack plus document parsers shipped with
+/// the desktop app (PDF/DOCX/HTML). If this fails, `bootstrap_venv` re-runs
+/// pip so upgrades pick up `requirements-docs.txt`.
 fn venv_has_core(py: &Path) -> bool {
     Command::new(py)
-        .args(["-c", "import fastapi, uvicorn, fastembed, watchdog, numpy"])
+        .args([
+            "-c",
+            "import fastapi, uvicorn, fastembed, watchdog, numpy; import pypdf; import trafilatura; import docx",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -1663,7 +1676,7 @@ pub fn run() {
                             "sidecar://status",
                             serde_json::json!({
                                 "state": "error",
-                                "message": "Bundled requirements.txt missing. Reinstall the app.",
+                                "message": "Bundled Python requirements missing. Reinstall the app.",
                             }),
                         );
                         return;

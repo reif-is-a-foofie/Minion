@@ -511,6 +511,39 @@ def start_background(
     return t
 
 
+def start_polling_watcher(
+    conn_factory: Callable[[], sqlite3.Connection],
+    inbox: Path,
+    *,
+    interval_sec: float = 30.0,
+    on_event: Optional[Callable[[str, Dict[str, object]], None]] = None,
+) -> threading.Thread:
+    """Scan the inbox on a fixed interval when live filesystem watching is unavailable."""
+    inbox = Path(inbox).expanduser().resolve()
+    inbox.mkdir(parents=True, exist_ok=True)
+
+    def _run() -> None:
+        log.warning(
+            "watchdog unavailable; polling inbox %s every %.0fs",
+            inbox,
+            interval_sec,
+        )
+        while True:
+            try:
+                conn = conn_factory()
+                try:
+                    reconcile_once(conn, inbox, on_event=on_event)
+                finally:
+                    conn.close()
+            except Exception:
+                log.exception("polling reconcile failed")
+            time.sleep(interval_sec)
+
+    t = threading.Thread(target=_run, name="minion-poll-watcher", daemon=True)
+    t.start()
+    return t
+
+
 # ---------------------------------------------------------------------------
 # CLI entrypoint (also used by `minion watch`)
 # ---------------------------------------------------------------------------
