@@ -15,6 +15,7 @@
     fetchSources,
     fetchStatus,
     getConfig,
+    invalidateConfigCache,
     nukeDb,
     onSidecarStatus,
     openEvents,
@@ -178,12 +179,23 @@
     pushFeed("sidecar", "restart requested");
     try {
       const r = await restartSidecar();
+      invalidateConfigCache();
+      config = await getConfig();
       pushFeed("sidecar", `restarted (pid ${r.pid})`);
     } catch (e: any) {
       pushFeed("sidecar", `restart failed: ${e?.message ?? e}`);
     } finally {
       // WS will auto-reconnect; watch for the next "open" before clearing.
       setTimeout(() => (restarting = false), 1500);
+    }
+  }
+
+  async function revealDataFolder() {
+    if (!config?.data_dir) return;
+    try {
+      await revealInFinder(config.data_dir);
+    } catch (e: any) {
+      pushFeed("settings", `could not open folder: ${e?.message ?? e}`);
     }
   }
 
@@ -992,6 +1004,19 @@
               title="Kill and respawn the Python sidecar"
             >
               {restarting ? "restarting…" : "Restart"}
+            </button>
+          </div>
+          <div class="setting-row">
+            <div class="setting-main">
+              <div class="setting-label">Data folder</div>
+              <div class="setting-desc">
+                <span class="mono">{config?.data_dir ?? "…"}</span>
+                · per macOS user under Library/Application Support unless <span class="mono">MINION_DATA_DIR</span> is set.
+                Shared Mac: each login has its own folder; the app picks a free API port so you are not talking to another user’s sidecar on <span class="mono">127.0.0.1</span>.
+              </div>
+            </div>
+            <button class="ghost" onclick={revealDataFolder} disabled={!config?.data_dir} title="Show Minion data in Finder">
+              Reveal
             </button>
           </div>
           <div class="setting-row">

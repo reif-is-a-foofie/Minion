@@ -16,7 +16,8 @@
 // `copy_into_inbox`.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -529,6 +530,156 @@ fn wait_for_port_free(api_port: u16, timeout_ms: u64) -> bool {
     find_port_listeners(api_port).is_empty()
 }
 
+#[cfg(unix)]
+fn pid_is_current_user(pid: u32) -> bool {
+    let out = match Command::new("ps")
+        .args(["-o", "uid=", "-p", &pid.to_string()])
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return false,
+    };
+    let their: u32 = match String::from_utf8_lossy(&out).trim().parse() {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    let me_out = match Command::new("id").arg("-u").output() {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return false,
+    };
+    let me: u32 = match String::from_utf8_lossy(&me_out).trim().parse() {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    their == me
+}
+
+#[cfg(not(unix))]
+fn pid_is_current_user(_pid: u32) -> bool {
+    true
+}
+
+fn http_get_body(port: u16, path: &str, timeout_ms: u64) -> Option<String> {
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().ok()?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(timeout_ms)).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(timeout_ms)));
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > 2_000_000 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    if let Some(idx) = text.find("\r\n\r\n") {
+        return Some(text[idx + 4..].to_string());
+    }
+    text.find("\n\n").map(|idx| text[idx + 2..].to_string())
+}
+
+fn listener_is_minion_with_nuke(port: u16) -> bool {
+    let body = match http_get_body(port, "/openapi.json", 800) {
+        Some(b) if b.trim_start().starts_with('{') => b,
+        _ => return false,
+    };
+    body.contains("\"/nuke\"")
+}
+
+/// Ask the OS for a free loopback port (bind `127.0.0.1:0`, read port, release).
+/// Used when the preferred range is crowded so we still get a listener slot.
+fn propose_ephemeral_loopback_port() -> Option<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+    listener.local_addr().ok().map(|a| a.port())
+}
+
+/// Pick a localhost port for the sidecar: prefer `preferred`, but if something
+/// else is listening (another user, an old Minion without `/nuke`, or any
+/// foreign service), advance until we find a free port or reclaim one from
+/// our own stale processes.
+fn resolve_sidecar_port(preferred: u16) -> u16 {
+    const MAX_TRIES: u32 = 64;
+    let pref = u32::from(preferred);
+    for i in 0..MAX_TRIES {
+        let port_u32 = pref + i;
+        if port_u32 > u32::from(u16::MAX) {
+            break;
+        }
+        let port = port_u32 as u16;
+        let listeners = find_port_listeners(port);
+        if listeners.is_empty() {
+            dbg(
+                "resolve_sidecar_port",
+                serde_json::json!({"picked": port, "reason": "free"}),
+            );
+            return port;
+        }
+        let all_mine = listeners.iter().all(|p| pid_is_current_user(*p));
+        if !all_mine {
+            dbg(
+                "resolve_sidecar_port",
+                serde_json::json!({"skip": port, "reason": "foreign_uid"}),
+            );
+            continue;
+        }
+        let sidecars = find_sidecar_pids(port);
+        let is_minion = listener_is_minion_with_nuke(port);
+        let our_sidecar_listening = listeners.iter().any(|p| sidecars.contains(p));
+        if is_minion || our_sidecar_listening {
+            for pid in find_sidecar_pids(port) {
+                kill_pid_graceful(pid);
+            }
+            for pid in &listeners {
+                kill_pid_graceful(*pid);
+            }
+            let _ = wait_for_port_free(port, 3_000);
+            if find_port_listeners(port).is_empty() {
+                dbg(
+                    "resolve_sidecar_port",
+                    serde_json::json!({"picked": port, "reason": "reclaimed"}),
+                );
+                return port;
+            }
+            continue;
+        }
+        dbg(
+            "resolve_sidecar_port",
+            serde_json::json!({"skip": port, "reason": "other_service"}),
+        );
+    }
+    // Dense multi-user machines: linear scan from `preferred` may hit only
+    // foreign listeners. Grab an ephemeral free port instead of returning
+    // `preferred` (often still held by another account's sidecar).
+    for attempt in 0..24 {
+        if let Some(port) = propose_ephemeral_loopback_port() {
+            if find_port_listeners(port).is_empty() && !tcp_port_open("127.0.0.1", port, Duration::from_millis(80))
+            {
+                dbg(
+                    "resolve_sidecar_port",
+                    serde_json::json!({"picked": port, "reason": "ephemeral", "attempt": attempt}),
+                );
+                return port;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    dbg(
+        "resolve_sidecar_port",
+        serde_json::json!({"picked": preferred, "reason": "fallback_busy"}),
+    );
+    preferred
+}
+
 fn spawn_sidecar(
     python: &Path,
     src_dir: &Path,
@@ -1010,6 +1161,9 @@ fn restart_sidecar(state: tauri::State<AppState>) -> Result<serde_json::Value, S
     }
     let swept = victims.len();
     for pid in &victims {
+        if !pid_is_current_user(*pid) {
+            continue;
+        }
         kill_pid_graceful(*pid);
     }
 
@@ -1260,10 +1414,11 @@ pub fn run() {
     let inbox = resolve_inbox(&data_dir);
     let _ = fs::create_dir_all(&data_dir);
     let _ = fs::create_dir_all(&inbox);
-    let api_port: u16 = std::env::var("MINION_API_PORT")
+    let api_port_preferred: u16 = std::env::var("MINION_API_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8765);
+    let api_port = resolve_sidecar_port(api_port_preferred);
 
     // Start ollama so the Python sidecar can be spawned with the vision env
     // already populated when the model is present.

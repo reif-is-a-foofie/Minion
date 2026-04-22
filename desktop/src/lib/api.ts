@@ -85,6 +85,11 @@ export type EventMsg =
 
 let cachedConfig: AppConfig | null = null;
 
+/** Drop cached port/api_base (e.g. after sidecar restart). */
+export function invalidateConfigCache(): void {
+  cachedConfig = null;
+}
+
 export async function getConfig(): Promise<AppConfig> {
   if (cachedConfig) return cachedConfig;
   cachedConfig = (await invoke("app_config")) as AppConfig;
