@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import {
     connectClaudeDesktop,
     copyIntoInbox,
@@ -75,22 +76,56 @@
   let clusterBusy = $state(false);
   let exportBusy = $state(false);
 
-  const ONBOARD_KEY = "minion_onboarding_v1_done";
+  const SETUP_CHECKLIST_KEY = "minion_setup_checklist_done";
+  const LEGACY_ONBOARD_KEY = "minion_onboarding_v1_done";
+  const CLAUDE_MCP_KEY = "minion_claude_mcp_added";
+  const CONNECT_BANNER_DISMISS_KEY = "minion_connect_banner_dismissed";
+  const CHATGPT_EXPORT_HELP_URL =
+    "https://help.openai.com/en/articles/7260999-how-do-i-export-my-chatgpt-history-and-data";
+
   let showOnboarding = $state(false);
   let onboardingStep = $state(0);
+  let claudeMcpAdded = $state(false);
+  let connectBannerDismissed = $state(false);
 
-  function dismissOnboarding() {
-    showOnboarding = false;
+  function readSetupFlags() {
     try {
-      if (typeof localStorage !== "undefined") localStorage.setItem(ONBOARD_KEY, "1");
+      if (typeof localStorage === "undefined") return;
+      if (localStorage.getItem(LEGACY_ONBOARD_KEY)) {
+        localStorage.setItem(SETUP_CHECKLIST_KEY, "1");
+      }
+      claudeMcpAdded = localStorage.getItem(CLAUDE_MCP_KEY) === "1";
+      connectBannerDismissed = localStorage.getItem(CONNECT_BANNER_DISMISS_KEY) === "1";
     } catch {
       /* ignore */
     }
   }
 
-  function finishOnboardingOpenIdentity() {
-    dismissOnboarding();
-    void openIdentity();
+  function markClaudeMcpAdded() {
+    try {
+      if (typeof localStorage !== "undefined") localStorage.setItem(CLAUDE_MCP_KEY, "1");
+    } catch {
+      /* ignore */
+    }
+    claudeMcpAdded = true;
+  }
+
+  function dismissConnectBanner() {
+    try {
+      if (typeof localStorage !== "undefined") localStorage.setItem(CONNECT_BANNER_DISMISS_KEY, "1");
+    } catch {
+      /* ignore */
+    }
+    connectBannerDismissed = true;
+  }
+
+  function dismissOnboarding() {
+    showOnboarding = false;
+    try {
+      if (typeof localStorage !== "undefined") localStorage.setItem(SETUP_CHECKLIST_KEY, "1");
+    } catch {
+      /* ignore */
+    }
   }
 
   async function refreshIdentity() {
@@ -256,12 +291,14 @@
     }
   }
 
-  async function runConnect() {
+  async function runConnect(): Promise<boolean> {
     connecting = true;
     connectMsg = "";
+    let ok = false;
     try {
       const res = await connectClaudeDesktop({});
       connectMsg = `Added to ${res.config_path.split("/").pop()}. Restart Claude Desktop to load.`;
+      ok = true;
     } catch (e) {
       const msg = (e as Error).message ?? String(e);
       // If the sidecar can't write the default path (common on locked-down setups),
@@ -277,6 +314,7 @@
           if (typeof picked === "string" && picked) {
             const res = await connectClaudeDesktop({ config_path: picked });
             connectMsg = `Added to ${res.config_path.split("/").pop()}. Restart Claude Desktop to load.`;
+            ok = true;
           } else {
             connectMsg = `Failed: ${msg}`;
           }
@@ -289,6 +327,8 @@
     } finally {
       connecting = false;
     }
+    if (ok) markClaudeMcpAdded();
+    return ok;
   }
 
   const KIND_DESCRIPTIONS: Record<string, string> = {
@@ -618,9 +658,10 @@
       if (config.sidecar_bootstrapped && config.sidecar_running) {
         sidecar = { state: "ready" };
       }
+      readSetupFlags();
       try {
         showOnboarding =
-          typeof localStorage !== "undefined" && !localStorage.getItem(ONBOARD_KEY);
+          typeof localStorage !== "undefined" && !localStorage.getItem(SETUP_CHECKLIST_KEY);
       } catch {
         showOnboarding = false;
       }
@@ -637,7 +678,12 @@
         // If we're receiving messages the socket is obviously open, even
         // if the onopen hook was missed (race during sidecar restart).
         if (conn !== "open") conn = "open";
-        if (msg.type === "heartbeat" || msg.type === "ready" || msg.type === "snapshot") {
+        if (msg.type === "snapshot" || msg.type === "ready") {
+          // Re-fetch /status so counts and data_dir/db_path stay one snapshot (avoids
+          // merged WS counts against stale paths after port/sidecar changes).
+          await refreshStatus();
+          if (msg.active) active = msg.active;
+        } else if (msg.type === "heartbeat") {
           if (status) status = { ...status, counts: msg.counts };
           if (msg.active) active = msg.active;
         } else if (msg.type === "ingest_started") {
@@ -678,6 +724,7 @@
           const r = msg.result as { path?: string; chunk_count?: number };
           if (r.path) endLine(r.path, `ingested · ${r.chunk_count ?? 0} chunks`);
           await refreshSources();
+          await refreshStatus();
         } else if (msg.type === "ingest_skipped") {
           if (msg.active) active = msg.active;
           const r = msg.result as { path?: string; reason?: string };
@@ -687,10 +734,12 @@
           endLine(msg.path, "failed");
         } else if (msg.type === "source_removed") {
           await refreshSources();
+          await refreshStatus();
         } else if (msg.type === "tree_done") {
           active = { root: null, total: 0, done: 0, added: 0, skipped: 0 };
           pushFeed(msg.root, `done · +${msg.added} ${msg.skipped ? `· ⊘${msg.skipped}` : ""}`);
           await refreshSources();
+          await refreshStatus();
         }
         },
         (s) => {
@@ -750,6 +799,14 @@
     return g;
   });
   const kinds = $derived(() => Object.keys(grouped()).sort());
+
+  /** True when HTTP /status is served by a different data_dir than the Tauri shell (wrong listener). */
+  const dataDirMismatch = $derived(() => {
+    if (!status?.data_dir || !config?.data_dir) return false;
+    const sn = status.data_dir.replace(/\/+$/, "");
+    const cn = config.data_dir.replace(/\/+$/, "");
+    return sn !== cn;
+  });
 </script>
 
 <svelte:head>
@@ -778,7 +835,7 @@
       <span
         class="status-pill status-{conn}"
         title={conn === "open"
-          ? `Sidecar ready · ${config?.api_base ?? ""}`
+          ? `Sidecar ready · ${config?.api_base ?? ""}${status?.db_path ? `\nDB: ${status.db_path}` : ""}${status?.data_dir ? `\nData: ${status.data_dir}` : ""}`
           : conn === "connecting"
             ? "Connecting to sidecar…"
             : conn === "unreachable"
@@ -810,6 +867,27 @@
     <div class="toast">{connectMsg}</div>
   {/if}
 
+  {#if dataDirMismatch()}
+    <div class="toast toast-warn" role="status">
+      Sidecar <strong>data folder</strong> does not match this app — you may be hitting another Minion on the same port. Use
+      <strong>Settings → Restart</strong>.
+      <div class="mismatch-paths"><span class="label">App</span><span class="mono">{config?.data_dir}</span></div>
+      <div class="mismatch-paths"><span class="label">Sidecar</span><span class="mono">{status?.data_dir}</span></div>
+    </div>
+  {/if}
+
+  {#if sidecar?.state === "ready" && status && status.counts.sources > 0 && !claudeMcpAdded && !connectBannerDismissed}
+    <div class="setup-reminder" role="status">
+      <span
+        >Indexed {status.counts.sources} source{status.counts.sources === 1 ? "" : "s"}. Add Minion to Claude Desktop (MCP), then restart Claude.</span
+      >
+      <button type="button" class="ghost" disabled={connecting} onclick={() => void runConnect()}>
+        {connecting ? "…" : "Add MCP"}
+      </button>
+      <button type="button" class="ghost" onclick={dismissConnectBanner}>Dismiss</button>
+    </div>
+  {/if}
+
   {#if sidecar && sidecar.state !== "ready"}
     <div class="bootstrap-overlay" class:error={sidecar.state === "error"}>
       <div class="bootstrap-card">
@@ -826,9 +904,7 @@
           {/if}
         </div>
         {#if sidecar.state !== "error"}
-          <p class="bootstrap-tagline">
-            Hey — I'm Minion. I'm getting ready so I can remember the files you drop here.
-          </p>
+          <p class="bootstrap-tagline">Preparing the local indexer (first launch only).</p>
         {/if}
         <div class="bootstrap-msg">
           {sidecar.message ?? "Working…"}
@@ -846,39 +922,61 @@
   {#if showOnboarding && sidecar?.state === "ready"}
     <div class="onboarding-overlay">
       <div class="onboarding-card">
-        <h2 class="onboarding-title">Welcome to Minion</h2>
+        <h2 class="onboarding-title">Setup · step {onboardingStep + 1} of 3</h2>
         {#if onboardingStep === 0}
           <p class="onboarding-body">
-            Drop a ChatGPT export, notes, or PDFs on the zone below (or use Browse). Everything stays on this machine — Minion copies into your inbox and indexes it for search and identity.
-          </p>
-          <button type="button" onclick={() => (onboardingStep = 1)}>Next</button>
-        {:else if onboardingStep === 1}
-          <p class="onboarding-body">
-            After you have memories indexed, run <strong>Rebuild clusters</strong> in Identity so Minion can infer preference themes. That gently shapes retrieval toward what matters to you.
+            In ChatGPT: open <strong>Settings</strong> → <strong>Data controls</strong> → request an <strong>Export</strong>. You get a zip when it’s ready.
           </p>
           <div class="onboarding-row">
-            <button type="button" class="ghost" onclick={() => (onboardingStep = 2)}>Skip for now</button>
             <button
               type="button"
-              disabled={clusterBusy}
-              onclick={async () => {
-                await runClusterRebuild();
-                onboardingStep = 2;
+              class="ghost"
+              onclick={() => {
+                void openUrl(CHATGPT_EXPORT_HELP_URL);
               }}
             >
-              Rebuild clusters
+              Open ChatGPT export help
             </button>
+            <button type="button" onclick={() => (onboardingStep = 1)}>Next</button>
           </div>
-        {:else}
+        {:else if onboardingStep === 1}
           <p class="onboarding-body">
-            Open <strong>Identity</strong> to review proposed claims (it’s fine if the list is empty). You can always get back from the header.
+            Add the export (zip or folder) or any files you want indexed. You can drag onto the main window or pick here.
           </p>
           <div class="onboarding-row">
+            <button type="button" class="ghost" onclick={(e) => { e.stopPropagation(); browseForFiles(); }}>Select files…</button>
+            <button type="button" class="ghost" onclick={(e) => { e.stopPropagation(); browseForFolder(); }}>Select folder…</button>
+          </div>
+          <div class="onboarding-row">
+            <button type="button" class="ghost" onclick={() => (onboardingStep = 0)}>Back</button>
+            <button
+              type="button"
+              disabled={(status?.counts.sources ?? 0) < 1}
+              title={(status?.counts.sources ?? 0) < 1 ? "Add at least one file first" : ""}
+              onclick={() => (onboardingStep = 2)}
+            >
+              Next
+            </button>
+          </div>
+          {#if (status?.counts.sources ?? 0) < 1}
+            <p class="onboarding-hint">Waiting for at least one indexed source…</p>
+          {/if}
+        {:else}
+          <p class="onboarding-body">
+            Register Minion in Claude Desktop’s MCP config, then fully quit and reopen Claude.
+          </p>
+          {#if connectMsg}
+            <p class="onboarding-msg">{connectMsg}</p>
+          {/if}
+          <div class="onboarding-row">
+            <button type="button" class="ghost" onclick={() => (onboardingStep = 1)}>Back</button>
+            <button type="button" disabled={connecting} onclick={() => void runConnect()}>
+              {connecting ? "…" : "Add to Claude Desktop"}
+            </button>
             <button type="button" class="ghost" onclick={dismissOnboarding}>Done</button>
-            <button type="button" onclick={finishOnboardingOpenIdentity}>Open Identity</button>
           </div>
         {/if}
-        <button type="button" class="onboarding-dismiss ghost" onclick={dismissOnboarding}>Skip tour</button>
+        <button type="button" class="onboarding-dismiss ghost" onclick={dismissOnboarding}>Skip setup</button>
       </div>
     </div>
   {/if}
@@ -889,6 +987,7 @@
       <span class="bracket">[</span>
       <div class="drop-body">
         <div class="drop-title">DROP FILES OR FOLDERS</div>
+        <div class="drop-hint">ChatGPT export zip · folder · other documents</div>
         <div class="drop-sub">
           &gt;&nbsp;
           <button class="linklike" onclick={(e) => { e.stopPropagation(); browseForFiles(); }}>select files</button>
@@ -1086,16 +1185,17 @@
             <div class="setting-main">
               <div class="setting-label">Claude Desktop</div>
               <div class="setting-desc">
-                {connectMsg || "Register Minion in Claude Desktop's mcpServers."}
+                {connectMsg ||
+                  "Writes a Minion entry into Claude Desktop’s MCP config. Restart Claude after it succeeds."}
               </div>
             </div>
             <button
               class="ghost"
-              onclick={runConnect}
+              onclick={() => void runConnect()}
               disabled={connecting}
-              title="Add Minion to Claude Desktop's mcpServers"
+              title="Merge Minion into claude_desktop_config.json"
             >
-              {connecting ? "connecting…" : "Connect"}
+              {connecting ? "…" : "Add to Claude Desktop"}
             </button>
           </div>
         </div>
@@ -1431,6 +1531,43 @@
     border-radius: var(--radius-sm);
     box-shadow: var(--shadow-s);
   }
+  .toast-warn {
+    border-left-color: #c45c26;
+    background: color-mix(in srgb, #c45c26 10%, var(--panel));
+  }
+  .mismatch-paths {
+    display: grid;
+    grid-template-columns: 5rem 1fr;
+    gap: 4px 10px;
+    margin-top: 8px;
+    font-size: 11px;
+    line-height: 1.35;
+    color: var(--muted);
+  }
+  .mismatch-paths .label {
+    color: var(--dim);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 10px;
+  }
+
+  .setup-reminder {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 12px;
+    padding: 10px 12px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-family: var(--ui-font);
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--ink);
+  }
+  .setup-reminder span {
+    flex: 1 1 200px;
+  }
 
   .bootstrap-overlay {
     position: fixed;
@@ -1550,6 +1687,22 @@
     margin: 12px auto 0;
     font-size: 11px !important;
     opacity: 0.85;
+  }
+  .onboarding-hint {
+    font-family: var(--ui-font);
+    font-size: 11.5px;
+    color: var(--muted);
+    margin: 0 0 8px;
+  }
+  .onboarding-msg {
+    font-family: var(--ui-font);
+    font-size: 12px;
+    color: var(--ink);
+    margin: 0 0 12px;
+    padding: 8px 10px;
+    background: color-mix(in srgb, var(--accent) 6%, var(--panel));
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
   }
 
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -1691,6 +1844,13 @@
     color: var(--heading);
     text-transform: none;
     line-height: 1.2;
+  }
+  .drop-hint {
+    margin-top: 6px;
+    font-family: var(--ui-font);
+    font-size: 11.5px;
+    color: var(--muted);
+    line-height: 1.35;
   }
   .drop-sub {
     margin-top: 8px;
