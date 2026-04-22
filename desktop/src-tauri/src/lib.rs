@@ -440,6 +440,9 @@ fn spawn_sidecar(
 
     let mut cmd = Command::new(python);
     // cwd = src_dir so `from ingest import ...` sibling imports resolve.
+    let logs_dir = data_dir.join("logs");
+    let _ = fs::create_dir_all(&logs_dir);
+    let sidecar_log = logs_dir.join("sidecar.log");
     cmd.current_dir(src_dir)
         .arg(api.file_name().unwrap_or_else(|| std::ffi::OsStr::new("api.py")))
         .arg("--port")
@@ -447,6 +450,7 @@ fn spawn_sidecar(
         .env("MINION_DATA_DIR", data_dir)
         .env("MINION_INBOX", inbox)
         .env("MINION_API_PORT", api_port.to_string())
+        .env("MINION_LOG_FILE", sidecar_log.to_string_lossy().to_string())
         .env("PYTHONUNBUFFERED", "1")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());

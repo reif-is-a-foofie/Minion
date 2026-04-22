@@ -1089,9 +1089,32 @@ def main() -> int:
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
 
+    # Default: log to stderr. If MINION_LOG_FILE is set (desktop app), also
+    # write to a rotating file so users can debug first-launch issues.
+    handlers: List[logging.Handler] = [logging.StreamHandler()]
+    log_path = os.environ.get("MINION_LOG_FILE", "").strip()
+    if log_path:
+        try:
+            from logging.handlers import RotatingFileHandler
+
+            Path(log_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+            handlers.append(
+                RotatingFileHandler(
+                    filename=str(Path(log_path).expanduser()),
+                    maxBytes=10 * 1024 * 1024,
+                    backupCount=2,
+                    encoding="utf-8",
+                )
+            )
+        except Exception:
+            # Never crash startup due to logging.
+            pass
+
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers,
+        force=True,
     )
 
     import uvicorn
