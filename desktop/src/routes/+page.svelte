@@ -27,6 +27,7 @@
     revealInFinder,
     search,
     updateSettings,
+    waitForHealthySidecar,
     isNotFoundError,
     type Active,
     type AppConfig,
@@ -289,8 +290,8 @@
       pushFeed("settings", `db wiped: ${res.db_path.split("/").pop()}`);
       // Restart sidecar so it recreates the DB cleanly and reconnects watchers.
       await handleRestart();
-      // Refresh UI state after restart.
-      status = await fetchStatus();
+      // HTTP listener can lag the process — avoid WebKit "Load failed" on immediate /status.
+      status = await waitForHealthySidecar();
       await refreshSources();
     } catch (e: any) {
       pushFeed("settings", `db wipe failed: ${e?.message ?? e}`);
@@ -307,7 +308,7 @@
       const res = await factoryReset();
       pushFeed("settings", `reset complete: ${res.db_path.split("/").pop()}`);
       await handleRestart();
-      status = await fetchStatus();
+      status = await waitForHealthySidecar();
       await refreshSources();
     } catch (e: any) {
       const msg = e?.message ?? e;
