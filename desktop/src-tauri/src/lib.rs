@@ -401,7 +401,13 @@ fn bootstrap_venv(
     // Already bootstrapped AND core deps importable? Fast-path return.
     if py.exists() && venv_has_core(&py) {
         dbg("bootstrap", serde_json::json!({"state": "cached", "python": py}));
-        let _ = app.emit("sidecar://status", serde_json::json!({"state": "ready"}));
+        let _ = app.emit(
+            "sidecar://status",
+            serde_json::json!({
+                "state": "bootstrapping",
+                "message": "Python environment ready (cached). Launching indexer…",
+            }),
+        );
         return Ok(py);
     }
 
@@ -465,7 +471,10 @@ fn bootstrap_venv(
     }
     dbg("bootstrap", serde_json::json!({"state": "pip_done"}));
 
-    emit("ready", "Minion is ready.");
+    emit(
+        "bootstrapping",
+        "Dependencies installed. Launching indexer…",
+    );
     Ok(py)
 }
 
@@ -635,6 +644,28 @@ fn http_get_body(port: u16, path: &str, timeout_ms: u64) -> Option<String> {
         return Some(text[idx + 4..].to_string());
     }
     text.find("\n\n").map(|idx| text[idx + 2..].to_string())
+}
+
+/// True when `GET /status` returns a JSON body that looks like Minion's status.
+fn sidecar_status_responds(port: u16, per_try_timeout_ms: u64) -> bool {
+    let Some(body) = http_get_body(port, "/status", per_try_timeout_ms) else {
+        return false;
+    };
+    let t = body.trim_start();
+    t.starts_with('{') && t.contains("\"counts\"") && t.contains("\"db_path\"")
+}
+
+/// Poll until the sidecar answers `/status` or `timeout_ms` elapses (cold start
+/// can take tens of seconds while Python imports load).
+fn wait_for_sidecar_http_ready(port: u16, timeout_ms: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while Instant::now() < deadline {
+        if sidecar_status_responds(port, 900) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
 
 fn listener_is_minion_with_nuke(port: u16) -> bool {
@@ -1617,6 +1648,13 @@ pub fn run() {
                 if let Ok(mut g) = state.sidecar_src_dir.lock() {
                     *g = Some(src_dir.clone());
                 }
+                let _ = handle.emit(
+                    "sidecar://status",
+                    serde_json::json!({
+                        "state": "starting",
+                        "message": format!("Sidecar source: {}", src_dir.display()),
+                    }),
+                );
 
                 let requirements = match resolve_sidecar_requirements(&handle, &src_dir) {
                     Some(r) => r,
@@ -1635,13 +1673,25 @@ pub fn run() {
                 let python = match bootstrap_venv(&handle, &data_dir_bg, &requirements) {
                     Ok(p) => p,
                     Err(e) => {
-                        dbg("setup", serde_json::json!({"state": "bootstrap_err", "error": e}));
+                        dbg("setup", serde_json::json!({"state": "bootstrap_err", "error": &e}));
+                        let _ = handle.emit(
+                            "sidecar://status",
+                            serde_json::json!({"state": "error", "message": e}),
+                        );
                         return;
                     }
                 };
                 if let Ok(mut g) = state.sidecar_python.lock() {
                     *g = Some(python.clone());
                 }
+
+                let _ = handle.emit(
+                    "sidecar://status",
+                    serde_json::json!({
+                        "state": "starting",
+                        "message": format!("Spawning sidecar on port {}…", port_bg),
+                    }),
+                );
 
                 let child = spawn_sidecar(
                     &python,
@@ -1655,6 +1705,38 @@ pub fn run() {
                 if let Some(c) = child {
                     if let Ok(mut g) = state.sidecar.lock() {
                         *g = Some(c);
+                    }
+                    let _ = handle.emit(
+                        "sidecar://status",
+                        serde_json::json!({
+                            "state": "starting",
+                            "message": format!(
+                                "Waiting for indexer HTTP on 127.0.0.1:{} (first start can take a minute)…",
+                                port_bg
+                            ),
+                        }),
+                    );
+                    // Do not tell the UI we're ready until `/status` actually works — otherwise
+                    // the webview races fetches against a process still importing deps.
+                    if !wait_for_sidecar_http_ready(port_bg, 120_000) {
+                        if let Ok(mut g) = state.sidecar.lock() {
+                            if let Some(mut ch) = g.take() {
+                                let _ = ch.kill();
+                                let _ = ch.wait();
+                            }
+                        }
+                        let log_hint = data_dir_bg.join("logs").join("sidecar.log");
+                        let _ = handle.emit(
+                            "sidecar://status",
+                            serde_json::json!({
+                                "state": "error",
+                                "message": format!(
+                                    "Sidecar started but never answered /status. See {}",
+                                    log_hint.display()
+                                ),
+                            }),
+                        );
+                        return;
                     }
                     let _ = handle.emit(
                         "sidecar://status",

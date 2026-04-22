@@ -67,6 +67,8 @@
   // overlay hides; any other non-null state shows a full-screen progress
   // card so the window isn't a silent void while pip runs for ~2 minutes.
   let sidecar = $state<SidecarStatus | null>(null);
+  /** Scrollable lines for bootstrap (Rust `sidecar://status` + local notes). */
+  let bootstrapLog = $state<string[]>([]);
 
   let showIdentity = $state(false);
   let identityClaims = $state<IdentityClaim[]>([]);
@@ -650,9 +652,22 @@
 
     (async () => {
       // Default: show a bootstrap overlay until we learn the sidecar is ready.
-      // This covers the case where Rust emits early bootstrap events before
-      // the frontend has registered its event listener.
       sidecar = { state: "starting", message: "Starting Minion…" };
+      bootstrapLog = [];
+      const pushBoot = (line: string) => {
+        const t = new Date().toLocaleTimeString(undefined, { hour12: false });
+        bootstrapLog = [...bootstrapLog.slice(-39), `[${t}] ${line}`];
+      };
+      pushBoot("Listening for setup progress…");
+
+      // Subscribe *before* any HTTP to the sidecar. Otherwise `fetch(/status)`
+      // can block until the browser gives up while pip runs, and we'd miss
+      // every `sidecar://status` line and stay frozen on "Starting Minion…".
+      const unlistenSidecar = await onSidecarStatus((s) => {
+        sidecar = s;
+        pushBoot(s.message ? `${s.state}: ${s.message}` : s.state);
+      });
+      unlistens.push(unlistenSidecar);
 
       config = await getConfig();
       if (config.sidecar_bootstrapped && config.sidecar_running) {
@@ -666,7 +681,21 @@
         showOnboarding = false;
       }
       onboardingStep = 0;
-      await Promise.all([refreshStatus(), refreshSources()]);
+
+      try {
+        const sig =
+          typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+            ? AbortSignal.timeout(20_000)
+            : undefined;
+        const [st, sr] = await Promise.all([
+          sig ? fetchStatus({ signal: sig }) : fetchStatus(),
+          sig ? fetchSources({ limit: 500 }, { signal: sig }) : fetchSources({ limit: 500 }),
+        ]);
+        status = st;
+        sources = sr.sources;
+      } catch {
+        pushBoot("Sidecar HTTP not ready yet (normal during first launch). Will load when the indexer is up.");
+      }
 
       // Hydrate active snapshot from /status (in case we started mid-run).
       if (status?.active) active = status.active;
@@ -773,12 +802,7 @@
           else logLine("vision", line);
         },
       );
-      // Sidecar bootstrap (first-launch venv + pip) progress. Show overlay
-      // until state==="ready"; "error" leaves the overlay up with the msg.
-      const unlistenSidecar = await onSidecarStatus((s) => {
-        sidecar = s;
-      });
-      unlistens.push(() => unlistenDrop(), () => unlistenEnter(), () => unlistenLeave(), () => unlistenVision(), unlistenSidecar);
+      unlistens.push(() => unlistenDrop(), () => unlistenEnter(), () => unlistenLeave(), () => unlistenVision());
     })();
 
     // Braille spinner tick for in-flight rows. 10 fps is smooth without thrash.
@@ -920,6 +944,9 @@
         <div class="bootstrap-msg">
           {sidecar.message ?? "Working…"}
         </div>
+        {#if bootstrapLog.length}
+          <pre class="bootstrap-log" aria-label="Setup log">{bootstrapLog.join("\n")}</pre>
+        {/if}
         {#if sidecar.state !== "error"}
           <div class="bootstrap-spinner"></div>
           <div class="bootstrap-hint">First launch only — this won't happen again.</div>
@@ -1647,8 +1674,26 @@
     font-family: var(--ui-font);
     font-size: 13px;
     color: var(--ink-dim);
-    margin-bottom: 16px;
+    margin-bottom: 12px;
     white-space: pre-wrap;
+  }
+  .bootstrap-log {
+    width: 100%;
+    max-height: 140px;
+    overflow-y: auto;
+    margin: 0 0 16px;
+    padding: 10px 12px;
+    box-sizing: border-box;
+    text-align: left;
+    font-family: var(--num-font);
+    font-size: 10.5px;
+    line-height: 1.45;
+    color: var(--ink-dim);
+    background: color-mix(in srgb, var(--panel) 92%, var(--border));
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
   .bootstrap-spinner {
     width: 28px;

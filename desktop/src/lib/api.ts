@@ -148,23 +148,44 @@ export function isNotFoundError(e: unknown): boolean {
   return msg.includes("404") || msg.includes("Not Found");
 }
 
-export async function fetchStatus(): Promise<Status> {
-  return apiFetch<Status>("/status");
+export async function fetchStatus(init?: RequestInit): Promise<Status> {
+  const cfg = await getConfig();
+  const res = await fetch(`${cfg.api_base}/status`, {
+    ...init,
+    headers: authHeaders(cfg, init?.headers as HeadersInit | undefined),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`${res.status} ${res.statusText}: ${body}`);
+  }
+  return (await res.json()) as Status;
 }
 
-export async function fetchSources(params: {
-  kind?: string;
-  path_glob?: string;
-  since?: number;
-  limit?: number;
-} = {}): Promise<{ sources: Source[]; counts: { sources: number; chunks: number } }> {
+export async function fetchSources(
+  params: {
+    kind?: string;
+    path_glob?: string;
+    since?: number;
+    limit?: number;
+  } = {},
+  init?: RequestInit,
+): Promise<{ sources: Source[]; counts: { sources: number; chunks: number } }> {
   const q = new URLSearchParams();
   if (params.kind) q.set("kind", params.kind);
   if (params.path_glob) q.set("path_glob", params.path_glob);
   if (params.since) q.set("since", String(params.since));
   if (params.limit) q.set("limit", String(params.limit));
   const qs = q.toString();
-  return apiFetch(`/sources${qs ? `?${qs}` : ""}`);
+  const cfg = await getConfig();
+  const res = await fetch(`${cfg.api_base}/sources${qs ? `?${qs}` : ""}`, {
+    ...init,
+    headers: authHeaders(cfg, init?.headers as HeadersInit | undefined),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`${res.status} ${res.statusText}: ${body}`);
+  }
+  return (await res.json()) as { sources: Source[]; counts: { sources: number; chunks: number } };
 }
 
 export async function search(body: {
