@@ -35,6 +35,9 @@ Endpoints:
   POST /reconcile                   -> body: {"force": bool}  rescan inbox → DB (optional re-embed all)
   WS   /events                      -> push ingest + heartbeat (see handler for `type` values)
 
+Optional env:
+  MINION_ANALYTICS_URL — HTTPS URL for opt-in anonymous analytics (see ``analytics_remote``).
+
 Run:
   python src/api.py --host 127.0.0.1 --port 8765
   # or
@@ -393,6 +396,12 @@ async def _lifespan(app: FastAPI):
     # whenever the MCP-relevant sources have changed since last launch. No-op
     # if Claude's config file doesn't exist (user hasn't opted in yet).
     _refresh_mcp_on_launch()
+    try:
+        import analytics_remote
+
+        analytics_remote.emit_session_if_ready()
+    except Exception:
+        pass
     yield
 
 
@@ -500,6 +509,7 @@ class ConnectBody(BaseModel):
 
 class SettingsBody(BaseModel):
     disabled_kinds: Optional[List[str]] = None
+    analytics_opt_in: Optional[bool] = None
 
 
 class ReconcileBody(BaseModel):
@@ -635,6 +645,8 @@ def update_settings(body: SettingsBody) -> Dict[str, Any]:
     current = load_settings(State.data_dir)
     if body.disabled_kinds is not None:
         current["disabled_kinds"] = body.disabled_kinds
+    if body.analytics_opt_in is not None:
+        current["analytics_opt_in"] = bool(body.analytics_opt_in)
     saved = save_settings(State.data_dir, current)
     apply_settings(saved)
     return {"settings": saved, "all_kinds": list(ALL_KINDS)}
@@ -710,6 +722,14 @@ def capabilities() -> Dict[str, Any]:
         "retrieval": {
             "identity_bias": True,
             "rrf_fusion": True,
+        },
+        "analytics": {
+            "url_configured": bool(os.environ.get("MINION_ANALYTICS_URL", "").strip()),
+            "opt_in_setting": "analytics_opt_in in settings.json (PUT /settings)",
+            "note": (
+                "POST bodies omit queries, paths, and secrets. Your HTTP server still sees "
+                "client IP, User-Agent, and TLS metadata like any public endpoint — disclose that."
+            ),
         },
         "endpoints": {
             "search": "POST /search",

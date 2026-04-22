@@ -19,6 +19,7 @@
     fetchDiagnosticsLogAtBase,
     fetchDiagnosticsLogTextAtBase,
     fetchDiagnosticsPeers,
+    fetchCapabilities,
     fetchStatus,
     getConfig,
     ingestPath,
@@ -99,6 +100,9 @@
   let evidencePopup = $state<{ path: string; text: string } | null>(null);
   let clusterBusy = $state(false);
   let exportBusy = $state(false);
+  let analyticsOptIn = $state(false);
+  /** From GET /capabilities — whether the sidecar has MINION_ANALYTICS_URL set. */
+  let analyticsUrlConfigured = $state(false);
 
   let supportAbout = $state<DiagnosticsAbout | null>(null);
   let supportPeers = $state<DiagnosticsPeersResponse | null>(null);
@@ -164,12 +168,16 @@
     try {
       const cfg = await getConfig();
       supportLogBase = cfg.api_base;
-      const [about, peers] = await Promise.all([
+      const [about, peers, cap, setRes] = await Promise.all([
         fetchDiagnosticsAbout(cfg.api_base),
         fetchDiagnosticsPeers(cfg.api_base),
+        fetchCapabilities(),
+        fetchSettings(),
       ]);
       supportAbout = about;
       supportPeers = peers;
+      analyticsUrlConfigured = Boolean(cap.analytics?.url_configured);
+      analyticsOptIn = Boolean(setRes.settings.analytics_opt_in);
       await refreshSupportSnapshot();
       startSupportLogStream(supportLogBase);
     } catch (e) {
@@ -197,6 +205,20 @@
       pushFeed("settings", "copied redacted sidecar log");
     } catch (e) {
       pushFeed("settings", `copy failed: ${(e as Error).message}`);
+    }
+  }
+
+  async function toggleAnalyticsOptIn() {
+    if (!analyticsUrlConfigured) return;
+    savingSettings = true;
+    try {
+      const res = await updateSettings({ analytics_opt_in: !analyticsOptIn });
+      analyticsOptIn = Boolean(res.settings.analytics_opt_in);
+      pushFeed("settings", analyticsOptIn ? "anonymous analytics on" : "anonymous analytics off");
+    } catch (e) {
+      pushFeed("settings", `analytics save failed: ${(e as Error).message}`);
+    } finally {
+      savingSettings = false;
     }
   }
 
@@ -442,6 +464,7 @@
       const res = await fetchSettings();
       allKinds = res.all_kinds;
       disabledKinds = new Set(res.settings.disabled_kinds ?? []);
+      analyticsOptIn = Boolean(res.settings.analytics_opt_in);
       settingsLoaded = true;
     } catch (e) {
       const msg = formatHttpErrorMessage((e as Error).message);
@@ -1458,6 +1481,30 @@
                   <p class="support-home">
                     <a href={supportAbout.homepage} target="_blank" rel="noopener noreferrer">{supportAbout.homepage}</a>
                     <span class="mono"> · {supportAbout.license}</span>
+                  </p>
+                {/if}
+
+                <div class="section-title small support-mt">Anonymous analytics</div>
+                <p class="setting-desc">
+                  Optional. When enabled, this install may <strong>POST small JSON summaries</strong> to the HTTPS URL
+                  configured for your build (<span class="mono">MINION_ANALYTICS_URL</span> on the sidecar). Payloads omit
+                  queries, paths, and secrets; they can include coarse ingest/search counters and skip-reason <em>classes</em>.
+                  Your browser (or TLS stack) still reveals IP and User-Agent to that server, the same as visiting any website — say so in your privacy policy.
+                </p>
+                {#if analyticsUrlConfigured}
+                  <label class="support-analytics-row">
+                    <input
+                      type="checkbox"
+                      checked={analyticsOptIn}
+                      onchange={() => void toggleAnalyticsOptIn()}
+                      disabled={savingSettings}
+                    />
+                    <span>Send anonymous usage &amp; failure summaries to the configured endpoint</span>
+                  </label>
+                {:else}
+                  <p class="setting-desc subtle">
+                    This build has no analytics URL (empty <span class="mono">MINION_ANALYTICS_URL</span>). Distributors set
+                    that env on the sidecar process; users then opt in here.
                   </p>
                 {/if}
 
@@ -2707,6 +2754,20 @@
     flex-wrap: wrap;
     gap: 8px;
     margin-top: 10px;
+  }
+  .support-analytics-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    margin-top: 10px;
+    font-size: 13px;
+    line-height: 1.45;
+    cursor: pointer;
+    user-select: none;
+  }
+  .support-analytics-row input {
+    margin-top: 3px;
+    flex-shrink: 0;
   }
   .subtle {
     color: var(--muted);

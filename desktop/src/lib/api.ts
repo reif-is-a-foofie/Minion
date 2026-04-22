@@ -541,6 +541,8 @@ export async function restartSidecar(): Promise<{ pid: number; api_port: number 
 
 export type Settings = {
   disabled_kinds: string[];
+  /** When true and ``MINION_ANALYTICS_URL`` is set on the sidecar, send anonymous aggregates. */
+  analytics_opt_in?: boolean;
 };
 
 export type SettingsResponse = {
@@ -566,6 +568,21 @@ export async function reloadParserExtensions(): Promise<{ reloaded: number; mani
 
 export async function fetchSettings(): Promise<SettingsResponse> {
   return apiFetch<SettingsResponse>("/settings");
+}
+
+export type CapabilitiesResponse = {
+  service?: string;
+  product?: string;
+  version?: string;
+  analytics?: {
+    url_configured: boolean;
+    opt_in_setting?: string;
+    note?: string;
+  };
+};
+
+export async function fetchCapabilities(): Promise<CapabilitiesResponse> {
+  return apiFetch<CapabilitiesResponse>("/capabilities");
 }
 
 export async function updateSettings(body: Partial<Settings>): Promise<SettingsResponse> {

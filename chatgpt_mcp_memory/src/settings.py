@@ -55,7 +55,7 @@ def apply_settings(data: Dict[str, Any]) -> None:
 
 
 def _default() -> Dict[str, Any]:
-    return {"disabled_kinds": []}
+    return {"disabled_kinds": [], "analytics_opt_in": False}
 
 
 def _normalize(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -73,4 +73,6 @@ def _normalize(data: Dict[str, Any]) -> Dict[str, Any]:
             cleaned.append(k)
             seen.add(k)
     out["disabled_kinds"] = cleaned
+    v = out.get("analytics_opt_in")
+    out["analytics_opt_in"] = bool(v) if v is not None else False
     return out

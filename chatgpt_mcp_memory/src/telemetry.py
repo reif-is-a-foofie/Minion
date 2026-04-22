@@ -72,6 +72,11 @@ def _path() -> Optional[Path]:
     return d / TELEMETRY_FILENAME
 
 
+def data_dir() -> Optional[Path]:
+    """Resolved data directory for telemetry, or None if not configured yet."""
+    return _resolve_dir()
+
+
 def _maybe_rotate(p: Path) -> None:
     try:
         if p.exists() and p.stat().st_size > MAX_BYTES:
@@ -103,6 +108,12 @@ def log_event(kind: str, **fields: Any) -> None:
             _maybe_rotate(p)
             with p.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
+        try:
+            import analytics_remote
+
+            analytics_remote.on_telemetry_logged(kind, fields)
+        except Exception:
+            pass
     except Exception:
         log.exception("telemetry write failed")
 

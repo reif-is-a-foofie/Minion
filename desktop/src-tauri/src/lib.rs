@@ -897,6 +897,13 @@ fn spawn_sidecar(
     if !api_token.is_empty() {
         cmd.env("MINION_API_TOKEN", api_token);
     }
+    // Optional: forward distributor analytics endpoint (see chatgpt_mcp_memory analytics_remote).
+    if let Ok(u) = std::env::var("MINION_ANALYTICS_URL") {
+        let t = u.trim();
+        if !t.is_empty() {
+            cmd.env("MINION_ANALYTICS_URL", t);
+        }
+    }
 
     match cmd.spawn() {
         Ok(child) => {

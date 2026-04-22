@@ -71,6 +71,10 @@ Dev quirks:
 - Override data location with `MINION_DATA_DIR=/path`.
 - Disable the background watcher with `MINION_DISABLE_WATCHER=1` (useful
   when iterating on ingest logic).
+- **Optional anonymous analytics:** export `MINION_ANALYTICS_URL` to an HTTPS
+  endpoint before launching the app; the Rust shell forwards it to the
+  sidecar. Users still must opt in under **Settings → Support**. Payloads are
+  coarse counters only (see `chatgpt_mcp_memory/src/analytics_remote.py`).
 
 ## Release zips: Intel vs Apple Silicon
 
