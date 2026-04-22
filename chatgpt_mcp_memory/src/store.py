@@ -230,7 +230,43 @@ def _journal_mode_from_env() -> Optional[str]:
     return None
 
 
-def _apply_journal_mode(conn: sqlite3.Connection, db_path: Path) -> str:
+def _wal_shm_paths(db_path: Path) -> tuple[Path, Path]:
+    """Sidecar files SQLite uses with WAL (same directory, `-wal` / `-shm` suffix)."""
+    parent = db_path.parent
+    name = db_path.name
+    return (parent / f"{name}-wal", parent / f"{name}-shm")
+
+
+def _safe_unlink_wal_shm(db_path: Path) -> list[str]:
+    """Remove WAL companions when the main DB is closed. Returns removed paths for logs."""
+    removed: list[str] = []
+    for p in _wal_shm_paths(db_path):
+        try:
+            if p.is_file():
+                p.unlink()
+                removed.append(str(p))
+        except OSError as e:
+            log.warning("could not remove %s: %s", p, e)
+    return removed
+
+
+def _rotate_corrupt_database(db_path: Path) -> Path:
+    """Rename the main DB aside so the next open creates a fresh file. Returns backup path."""
+    backup = db_path.with_name(f"{db_path.name}.corrupt.{int(time.time())}.bak")
+    if db_path.exists():
+        try:
+            shutil.move(str(db_path), str(backup))
+        except OSError as e:
+            raise sqlite3.OperationalError(
+                f"Could not move aside corrupt database {db_path}: {e}"
+            ) from e
+    _safe_unlink_wal_shm(db_path)
+    return backup
+
+
+def _apply_journal_mode(
+    conn: sqlite3.Connection, db_path: Path, *, wal_first: bool = True
+) -> str:
     """Pick WAL or DELETE journal; WAL may be unsupported on some volumes."""
     forced = _journal_mode_from_env()
     if forced == "delete":
@@ -239,6 +275,18 @@ def _apply_journal_mode(conn: sqlite3.Connection, db_path: Path) -> str:
     if forced == "wal":
         row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
         return str(row[0]) if row else "wal"
+
+    if not wal_first:
+        try:
+            row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+            return str(row[0]) if row else "delete"
+        except sqlite3.OperationalError as e2:
+            hint = (
+                f"SQLite cannot set DELETE journal at {db_path}: {e2}. "
+                "Check free disk space; avoid iCloud or network-backed paths; "
+                "set MINION_DATA_DIR to a local folder."
+            )
+            raise sqlite3.OperationalError(hint) from e2
 
     try:
         row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
@@ -265,24 +313,18 @@ def _apply_journal_mode(conn: sqlite3.Connection, db_path: Path) -> str:
             raise sqlite3.OperationalError(hint) from e2
 
 
-def connect(db_path: Path, *, embed_dim: int = DEFAULT_EMBED_DIM) -> sqlite3.Connection:
-    """
-    Open (creating if needed) the memory DB, load sqlite-vec, apply schema.
+def _verify_connection(conn: sqlite3.Connection) -> None:
+    """Fail closed if the DB file is not actually usable (quick_check + ping)."""
+    conn.execute("SELECT 1").fetchone()
+    row = conn.execute("PRAGMA quick_check").fetchone()
+    if row is None:
+        raise sqlite3.OperationalError("PRAGMA quick_check returned no row")
+    result = str(row[0]).lower()
+    if result != "ok":
+        raise sqlite3.OperationalError(f"PRAGMA quick_check: {row[0]}")
 
-    `embed_dim` is only used when creating vec_chunks for the first time; once
-    set, the DB is locked to that dimension until dropped/recreated.
-    """
-    db_path = Path(db_path).expanduser().resolve()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    _load_vec_extension(conn)
-
-    _apply_journal_mode(conn, db_path)
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA synchronous=NORMAL")
-
+def _bootstrap_schema(conn: sqlite3.Connection, embed_dim: int) -> None:
     conn.executescript(_SCHEMA_SQL)
     _ensure_vec_table(conn, embed_dim)
     _ensure_fts_table(conn)
@@ -293,7 +335,133 @@ def connect(db_path: Path, *, embed_dim: int = DEFAULT_EMBED_DIM) -> sqlite3.Con
             "INSERT INTO meta(key, value) VALUES (?, ?)", ("embed_dim", str(embed_dim))
         )
         conn.commit()
-    return conn
+
+
+def _open_and_prepare(
+    db_path: Path,
+    embed_dim: int,
+    *,
+    wal_first: bool,
+    synchronous: str,
+) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        try:
+            conn.execute("PRAGMA busy_timeout=8000")
+        except sqlite3.OperationalError:
+            pass
+        _load_vec_extension(conn)
+        _apply_journal_mode(conn, db_path, wal_first=wal_first)
+        conn.execute("PRAGMA foreign_keys=ON")
+        if synchronous.upper() == "FULL":
+            conn.execute("PRAGMA synchronous=FULL")
+        else:
+            conn.execute("PRAGMA synchronous=NORMAL")
+        _bootstrap_schema(conn, embed_dim)
+        _verify_connection(conn)
+        return conn
+    except BaseException:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
+
+
+def connect(db_path: Path, *, embed_dim: int = DEFAULT_EMBED_DIM) -> sqlite3.Connection:
+    """
+    Open (creating if needed) the memory DB, load sqlite-vec, apply schema.
+
+    On ``OperationalError`` (common: disk I/O, stale WAL), runs a short ordered
+    self-recovery sequence (remove ``-wal``/``-shm``, force DELETE journal,
+    stricter sync, then rotate a corrupt DB aside) and re-verifies with
+    ``PRAGMA quick_check`` after each successful open.
+
+    `embed_dim` is only used when creating vec_chunks for the first time; once
+    set, the DB is locked to that dimension until dropped/recreated.
+    """
+    db_path = Path(db_path).expanduser().resolve()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # (wal_first, synchronous, pre_action) — pre_action runs before this attempt.
+    # Ordered most-likely fix first; each successful open ends with quick_check.
+    recovery_plan: list[tuple[bool, str, Optional[str]]] = [
+        (True, "NORMAL", None),
+        (True, "NORMAL", "unlink_wal_shm"),
+        (False, "NORMAL", "unlink_wal_shm"),
+        (False, "FULL", "unlink_wal_shm"),
+        (True, "NORMAL", "rotate_db"),
+    ]
+
+    last_err: Optional[BaseException] = None
+    for pass_i, (wal_first, sync_mode, pre) in enumerate(recovery_plan):
+        if pre == "unlink_wal_shm":
+            removed = _safe_unlink_wal_shm(db_path)
+            if removed:
+                log.warning(
+                    "SQLite recovery pass %s: removed WAL side files %s",
+                    pass_i,
+                    removed,
+                )
+        elif pre == "rotate_db":
+            err_s = (str(last_err) if last_err else "").lower()
+            if any(
+                x in err_s
+                for x in ("disk full", "no space left", "enospc", "sqlite_full", "database or disk is full")
+            ):
+                log.error("Skipping corrupt-database rotate (likely disk full): %s", last_err)
+                break
+            if db_path.exists():
+                backup = _rotate_corrupt_database(db_path)
+                log.error(
+                    "SQLite recovery pass %s: moved unreadable DB aside to %s "
+                    "(fresh empty database created; re-index from inbox/exports)",
+                    pass_i,
+                    backup,
+                )
+            else:
+                _safe_unlink_wal_shm(db_path)
+
+        try:
+            conn = _open_and_prepare(
+                db_path, embed_dim, wal_first=wal_first, synchronous=sync_mode
+            )
+            if pass_i > 0:
+                log.warning(
+                    "SQLite connect succeeded for %s after recovery pass %s "
+                    "(wal_first=%s sync=%s pre=%s)",
+                    db_path,
+                    pass_i,
+                    wal_first,
+                    sync_mode,
+                    pre,
+                )
+            return conn
+        except RuntimeError:
+            raise
+        except sqlite3.OperationalError as e:
+            last_err = e
+            log.warning(
+                "SQLite open failed pass %s (%s wal_first=%s sync=%s pre=%s): %s",
+                pass_i,
+                db_path,
+                wal_first,
+                sync_mode,
+                pre,
+                e,
+            )
+        except OSError as e:
+            last_err = e
+            log.warning(
+                "SQLite open failed pass %s (OSError) for %s: %s",
+                pass_i,
+                db_path,
+                e,
+            )
+
+    assert last_err is not None
+    raise last_err
 
 
 def _ensure_fts_table(conn: sqlite3.Connection) -> None:

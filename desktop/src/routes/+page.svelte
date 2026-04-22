@@ -875,7 +875,7 @@
     <div class="db-error-banner" role="alert">
       <strong>Database error</strong>
       <span class="db-error-msg">{status.database.error ?? "SQLite unavailable"}</span>
-      <span class="db-error-hint">Check disk space; avoid iCloud or network-backed folders; set MINION_DATA_DIR to a local path; quit Minion and remove stale memory.db-wal / memory.db-shm if needed.</span>
+      <span class="db-error-hint">Minion already tried automatic recovery (WAL cleanup, DELETE journal, stricter sync, then moving a corrupt DB aside). Check disk space and use a local MINION_DATA_DIR if this persists.</span>
     </div>
   {/if}
 
