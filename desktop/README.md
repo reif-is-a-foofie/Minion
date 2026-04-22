@@ -71,10 +71,11 @@ Dev quirks:
 - Override data location with `MINION_DATA_DIR=/path`.
 - Disable the background watcher with `MINION_DISABLE_WATCHER=1` (useful
   when iterating on ingest logic).
-- **Optional anonymous analytics:** export `MINION_ANALYTICS_URL` to an HTTPS
-  endpoint before launching the app; the Rust shell forwards it to the
-  sidecar. Users still must opt in under **Settings → Support**. Payloads are
-  coarse counters only (see `chatgpt_mcp_memory/src/analytics_remote.py`).
+- **Anonymous telemetry (opt-out):** the shell forwards a default HTTPS collector
+  URL to the sidecar (see `DEFAULT_MINION_ANALYTICS_URL` in `src-tauri/src/lib.rs`).
+  Override with `MINION_ANALYTICS_URL`, or disable entirely with
+  `MINION_DISABLE_REMOTE_ANALYTICS=1`. Users turn off sending under **Settings → Support**.
+  Payloads are coarse counters only (`chatgpt_mcp_memory/src/analytics_remote.py`).
 
 ## Release zips: Intel vs Apple Silicon
 

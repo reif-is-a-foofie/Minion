@@ -100,9 +100,10 @@
   let evidencePopup = $state<{ path: string; text: string } | null>(null);
   let clusterBusy = $state(false);
   let exportBusy = $state(false);
-  let analyticsOptIn = $state(false);
-  /** From GET /capabilities — whether the sidecar has MINION_ANALYTICS_URL set. */
-  let analyticsUrlConfigured = $state(false);
+  /** When true, user has opted out of anonymized remote telemetry. */
+  let telemetryOptOut = $state(false);
+  /** From GET /capabilities — collector URL is available (not air-gapped / disabled). */
+  let analyticsUrlConfigured = $state(true);
   let updaterBusy = $state(false);
 
   let supportAbout = $state<DiagnosticsAbout | null>(null);
@@ -178,7 +179,7 @@
       supportAbout = about;
       supportPeers = peers;
       analyticsUrlConfigured = Boolean(cap.analytics?.url_configured);
-      analyticsOptIn = Boolean(setRes.settings.analytics_opt_in);
+      telemetryOptOut = Boolean(setRes.settings.telemetry_opt_out);
       await refreshSupportSnapshot();
       startSupportLogStream(supportLogBase);
     } catch (e) {
@@ -251,15 +252,14 @@
     }
   }
 
-  async function toggleAnalyticsOptIn() {
-    if (!analyticsUrlConfigured) return;
+  async function toggleTelemetrySend(sendEnabled: boolean) {
     savingSettings = true;
     try {
-      const res = await updateSettings({ analytics_opt_in: !analyticsOptIn });
-      analyticsOptIn = Boolean(res.settings.analytics_opt_in);
-      pushFeed("settings", analyticsOptIn ? "anonymous analytics on" : "anonymous analytics off");
+      const res = await updateSettings({ telemetry_opt_out: !sendEnabled });
+      telemetryOptOut = Boolean(res.settings.telemetry_opt_out);
+      pushFeed("settings", sendEnabled ? "anonymous telemetry on" : "anonymous telemetry off");
     } catch (e) {
-      pushFeed("settings", `analytics save failed: ${(e as Error).message}`);
+      pushFeed("settings", `telemetry save failed: ${(e as Error).message}`);
     } finally {
       savingSettings = false;
     }
@@ -507,7 +507,7 @@
       const res = await fetchSettings();
       allKinds = res.all_kinds;
       disabledKinds = new Set(res.settings.disabled_kinds ?? []);
-      analyticsOptIn = Boolean(res.settings.analytics_opt_in);
+      telemetryOptOut = Boolean(res.settings.telemetry_opt_out);
       settingsLoaded = true;
     } catch (e) {
       const msg = formatHttpErrorMessage((e as Error).message);
@@ -1550,27 +1550,25 @@
                   </p>
                 {/if}
 
-                <div class="section-title small support-mt">Anonymous analytics</div>
+                <div class="section-title small support-mt">Anonymous telemetry</div>
                 <p class="setting-desc">
-                  Optional. When enabled, this install may <strong>POST small JSON summaries</strong> to the HTTPS URL
-                  configured for your build (<span class="mono">MINION_ANALYTICS_URL</span> on the sidecar). Payloads omit
-                  queries, paths, and secrets; they can include coarse ingest/search counters and skip-reason <em>classes</em>.
-                  Your browser (or TLS stack) still reveals IP and User-Agent to that server, the same as visiting any website — say so in your privacy policy.
+                  <strong>On by default.</strong> Minion POSTs small JSON summaries (session + coarse search/ingest counters) to the
+                  bundled HTTPS collector, or to <span class="mono">MINION_ANALYTICS_URL</span> if your distributor overrides it.
+                  Payloads omit queries, paths, and secrets. Uncheck below to opt out. Your IP and User-Agent still reach the server like any HTTPS client — disclose that in your privacy policy.
                 </p>
                 {#if analyticsUrlConfigured}
                   <label class="support-analytics-row">
                     <input
                       type="checkbox"
-                      checked={analyticsOptIn}
-                      onchange={() => void toggleAnalyticsOptIn()}
+                      checked={!telemetryOptOut}
+                      onchange={(e) => void toggleTelemetrySend((e.currentTarget as HTMLInputElement).checked)}
                       disabled={savingSettings}
                     />
-                    <span>Send anonymous usage &amp; failure summaries to the configured endpoint</span>
+                    <span>Send anonymous usage &amp; failure summaries</span>
                   </label>
                 {:else}
                   <p class="setting-desc subtle">
-                    This build has no analytics URL (empty <span class="mono">MINION_ANALYTICS_URL</span>). Distributors set
-                    that env on the sidecar process; users then opt in here.
+                    Remote telemetry is disabled for this build (<span class="mono">MINION_DISABLE_REMOTE_ANALYTICS=1</span> or no collector URL).
                   </p>
                 {/if}
 

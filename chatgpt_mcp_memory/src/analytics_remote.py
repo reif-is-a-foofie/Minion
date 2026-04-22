@@ -1,8 +1,12 @@
-"""Optional, opt-in HTTP analytics — anonymous aggregates only.
+"""Opt-out HTTP analytics — anonymous aggregates only.
 
-Requires **both**:
-  - ``MINION_ANALYTICS_URL`` — HTTPS POST endpoint you operate (or empty → disabled)
-  - ``analytics_opt_in: true`` in ``<data_dir>/settings.json`` (user toggle in the app)
+Telemetry is **on by default**. Users disable it with ``telemetry_opt_out: true``
+in ``<data_dir>/settings.json`` (Settings → Support).
+
+The sidecar posts to ``MINION_ANALYTICS_URL`` when set; otherwise the **bundled
+default URL** (must stay in sync with ``DEFAULT_MINION_ANALYTICS_URL`` in
+``desktop/src-tauri/src/lib.rs``). Set ``MINION_DISABLE_REMOTE_ANALYTICS=1`` on
+the host to ship a build that never sets the URL.
 
 The JSON body never includes search queries, file paths, chunk text, or tokens.
 Your server still receives normal HTTP metadata (IP, User-Agent, TLS timing) the
@@ -28,11 +32,24 @@ from version import __version__
 
 log = logging.getLogger("minion.analytics_remote")
 
+# Sync with desktop/src-tauri/src/lib.rs DEFAULT_MINION_ANALYTICS_URL.
+_BUNDLED_ANALYTICS_URL = "https://minion-telemetry.reify.workers.dev/v1/collect"
+
 _SCHEMA = 1
 _session_sent = False
 _hour_bucket: int = 0
 _hour_count: int = 0
 _lock = threading.Lock()
+
+
+def effective_analytics_url() -> str:
+    """Resolved POST target (may be empty when remote analytics are fully disabled)."""
+    if os.environ.get("MINION_DISABLE_REMOTE_ANALYTICS", "").strip() == "1":
+        return ""
+    raw = os.environ.get("MINION_ANALYTICS_URL", "").strip()
+    if raw:
+        return raw
+    return _BUNDLED_ANALYTICS_URL
 
 
 def _install_id(root: Path) -> str:
@@ -53,11 +70,11 @@ def _install_id(root: Path) -> str:
 
 
 def _remote_enabled(root: Path) -> tuple[bool, str]:
-    url = os.environ.get("MINION_ANALYTICS_URL", "").strip()
+    url = effective_analytics_url().strip()
     if not url:
         return False, ""
     try:
-        if not load_settings(root).get("analytics_opt_in"):
+        if load_settings(root).get("telemetry_opt_out"):
             return False, ""
     except Exception:
         return False, ""
@@ -102,7 +119,7 @@ def _post(url: str, body: Dict[str, Any]) -> None:
 
 
 def emit_session_if_ready() -> None:
-    """Fire once per sidecar process when opt-in + URL are set."""
+    """Fire once per sidecar process when telemetry is allowed + URL is set."""
     global _session_sent
     root = telemetry_data_dir()
     if root is None:

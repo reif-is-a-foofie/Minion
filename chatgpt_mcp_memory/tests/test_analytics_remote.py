@@ -1,15 +1,43 @@
 import pytest
 
 
-def test_settings_analytics_default(tmp_path):
+def test_settings_telemetry_default_opt_in(tmp_path):
     from settings import load_settings, save_settings
 
     s = load_settings(tmp_path)
-    assert s.get("analytics_opt_in") is False
+    assert s.get("telemetry_opt_out") is False
     merged = dict(s)
-    merged["analytics_opt_in"] = True
+    merged["telemetry_opt_out"] = True
     save_settings(tmp_path, merged)
-    assert load_settings(tmp_path).get("analytics_opt_in") is True
+    assert load_settings(tmp_path).get("telemetry_opt_out") is True
+
+
+def test_settings_legacy_analytics_opt_in_dropped(tmp_path):
+    from pathlib import Path
+
+    from settings import load_settings
+
+    p = Path(tmp_path) / "settings.json"
+    p.write_text('{"disabled_kinds": [], "analytics_opt_in": true}\n', encoding="utf-8")
+    s = load_settings(tmp_path)
+    assert "analytics_opt_in" not in s
+    assert s.get("telemetry_opt_out") is False
+
+
+def test_remote_disabled_when_opt_out(tmp_path, monkeypatch):
+    monkeypatch.setenv("MINION_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MINION_ANALYTICS_URL", "https://example.invalid/collect")
+    from pathlib import Path
+
+    from settings import save_settings
+    import telemetry
+
+    telemetry.configure(tmp_path)
+    save_settings(tmp_path, {"disabled_kinds": [], "telemetry_opt_out": True})
+    from analytics_remote import _remote_enabled
+
+    ok, _ = _remote_enabled(Path(tmp_path))
+    assert ok is False
 
 
 def test_sanitize_search_strips_query():

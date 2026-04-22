@@ -541,8 +541,8 @@ export async function restartSidecar(): Promise<{ pid: number; api_port: number 
 
 export type Settings = {
   disabled_kinds: string[];
-  /** When true and ``MINION_ANALYTICS_URL`` is set on the sidecar, send anonymous aggregates. */
-  analytics_opt_in?: boolean;
+  /** When true, do not POST anonymized telemetry to the configured collector. */
+  telemetry_opt_out?: boolean;
 };
 
 export type SettingsResponse = {
@@ -576,7 +576,8 @@ export type CapabilitiesResponse = {
   version?: string;
   analytics?: {
     url_configured: boolean;
-    opt_in_setting?: string;
+    telemetry_opt_out?: boolean;
+    opt_out_setting?: string;
     note?: string;
   };
 };

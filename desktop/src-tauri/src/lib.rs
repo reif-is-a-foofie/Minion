@@ -110,6 +110,11 @@ struct AppState {
 const DEFAULT_VISION_MODEL: &str = "moondream";
 const OLLAMA_PORT: u16 = 11434;
 
+/// Default HTTPS collector for anonymized Minion telemetry (search/ingest/session counters).
+/// Override with host env `MINION_ANALYTICS_URL`, or disable entirely with `MINION_DISABLE_REMOTE_ANALYTICS=1`.
+/// **Keep in sync** with `_BUNDLED_ANALYTICS_URL` in `chatgpt_mcp_memory/src/analytics_remote.py`.
+const DEFAULT_MINION_ANALYTICS_URL: &str = "https://minion-telemetry.reify.workers.dev/v1/collect";
+
 /// Official Ollama macOS zip (fat/universal). Update tag + SHA together when bumping.
 /// https://github.com/ollama/ollama/releases
 const MANAGED_OLLAMA_TAG: &str = "v0.21.1";
@@ -897,12 +902,19 @@ fn spawn_sidecar(
     if !api_token.is_empty() {
         cmd.env("MINION_API_TOKEN", api_token);
     }
-    // Optional: forward distributor analytics endpoint (see chatgpt_mcp_memory analytics_remote).
-    if let Ok(u) = std::env::var("MINION_ANALYTICS_URL") {
-        let t = u.trim();
-        if !t.is_empty() {
-            cmd.env("MINION_ANALYTICS_URL", t);
-        }
+    if std::env::var("MINION_DISABLE_REMOTE_ANALYTICS").ok().as_deref() != Some("1") {
+        let url = match std::env::var("MINION_ANALYTICS_URL") {
+            Ok(u) => {
+                let t = u.trim();
+                if t.is_empty() {
+                    DEFAULT_MINION_ANALYTICS_URL.to_string()
+                } else {
+                    t.to_string()
+                }
+            }
+            Err(_) => DEFAULT_MINION_ANALYTICS_URL.to_string(),
+        };
+        cmd.env("MINION_ANALYTICS_URL", url);
     }
 
     match cmd.spawn() {

@@ -36,7 +36,8 @@ Endpoints:
   WS   /events                      -> push ingest + heartbeat (see handler for `type` values)
 
 Optional env:
-  MINION_ANALYTICS_URL — HTTPS URL for opt-in anonymous analytics (see ``analytics_remote``).
+  MINION_ANALYTICS_URL — HTTPS URL for anonymous analytics (overrides bundled default).
+  MINION_DISABLE_REMOTE_ANALYTICS=1 — do not set a collector URL (fork / air-gapped builds).
 
 Run:
   python src/api.py --host 127.0.0.1 --port 8765
@@ -69,6 +70,7 @@ from ingest import ingest_file, ingest_webhook_payload, _looks_like_chatgpt_expo
 from parser_extensions import manifest_path
 from parsers import ALL_KINDS, load_user_extensions, supported_extensions, user_extension_mappings
 from settings import apply_settings, load_settings, save_settings
+import analytics_remote
 import diagnostics
 import telemetry
 import identity
@@ -397,8 +399,6 @@ async def _lifespan(app: FastAPI):
     # if Claude's config file doesn't exist (user hasn't opted in yet).
     _refresh_mcp_on_launch()
     try:
-        import analytics_remote
-
         analytics_remote.emit_session_if_ready()
     except Exception:
         pass
@@ -509,7 +509,7 @@ class ConnectBody(BaseModel):
 
 class SettingsBody(BaseModel):
     disabled_kinds: Optional[List[str]] = None
-    analytics_opt_in: Optional[bool] = None
+    telemetry_opt_out: Optional[bool] = None
 
 
 class ReconcileBody(BaseModel):
@@ -645,8 +645,8 @@ def update_settings(body: SettingsBody) -> Dict[str, Any]:
     current = load_settings(State.data_dir)
     if body.disabled_kinds is not None:
         current["disabled_kinds"] = body.disabled_kinds
-    if body.analytics_opt_in is not None:
-        current["analytics_opt_in"] = bool(body.analytics_opt_in)
+    if body.telemetry_opt_out is not None:
+        current["telemetry_opt_out"] = bool(body.telemetry_opt_out)
     saved = save_settings(State.data_dir, current)
     apply_settings(saved)
     return {"settings": saved, "all_kinds": list(ALL_KINDS)}
@@ -724,8 +724,9 @@ def capabilities() -> Dict[str, Any]:
             "rrf_fusion": True,
         },
         "analytics": {
-            "url_configured": bool(os.environ.get("MINION_ANALYTICS_URL", "").strip()),
-            "opt_in_setting": "analytics_opt_in in settings.json (PUT /settings)",
+            "url_configured": bool(analytics_remote.effective_analytics_url().strip()),
+            "telemetry_opt_out": bool(load_settings(State.data_dir).get("telemetry_opt_out")),
+            "opt_out_setting": "telemetry_opt_out in settings.json (PUT /settings); default false = sends anonymized summaries.",
             "note": (
                 "POST bodies omit queries, paths, and secrets. Your HTTP server still sees "
                 "client IP, User-Agent, and TLS metadata like any public endpoint — disclose that."
