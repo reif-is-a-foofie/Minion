@@ -18,6 +18,7 @@
     revealInFinder,
     search,
     updateSettings,
+    isNotFoundError,
     type Active,
     type AppConfig,
     type ConnState,
@@ -119,7 +120,12 @@
       status = await fetchStatus();
       await refreshSources();
     } catch (e: any) {
-      pushFeed("settings", `factory reset failed: ${e?.message ?? e}`);
+      const msg = e?.message ?? e;
+      if (isNotFoundError(e)) {
+        pushFeed("settings", "factory reset failed: your sidecar is out of date. Update Minion and click Restart.");
+      } else {
+        pushFeed("settings", `factory reset failed: ${msg}`);
+      }
     }
   }
 

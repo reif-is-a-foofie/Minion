@@ -182,6 +182,36 @@ def test_connect_claude_desktop_merges_existing(sidecar) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 7. POST /factory-reset and /nuke exist + work
+# ---------------------------------------------------------------------------
+
+
+def test_nuke_and_factory_reset_exist(sidecar, staged_note: Path) -> None:
+    # Ingest one file so we know the DB and inbox are non-empty.
+    sidecar.post("/ingest", {"path": str(staged_note)}).raise_for_status()
+    sidecar.wait_for_sources(1, timeout=45.0)
+    assert any(sidecar.inbox.iterdir()), "expected inbox to have at least one file after ingest"
+
+    # /nuke should exist.
+    r = sidecar.post("/nuke", {})
+    assert r.status_code == 200, r.text
+
+    # DB should be empty after nuke.
+    after = sidecar.get("/sources").json()
+    assert after["counts"]["sources"] == 0
+    assert after["counts"]["chunks"] == 0
+
+    # /factory-reset should exist and should clear the inbox too.
+    sidecar.post("/ingest", {"path": str(staged_note)}).raise_for_status()
+    sidecar.wait_for_sources(1, timeout=45.0)
+    assert any(sidecar.inbox.iterdir()), "expected inbox to be non-empty before factory reset"
+
+    r2 = sidecar.post("/factory-reset", {})
+    assert r2.status_code == 200, r2.text
+    assert not any(sidecar.inbox.iterdir()), "expected inbox to be empty after factory reset"
+
+
+# ---------------------------------------------------------------------------
 # 7. WebSocket /events streams ingest lifecycle
 # ---------------------------------------------------------------------------
 

@@ -102,6 +102,11 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+export function isNotFoundError(e: unknown): boolean {
+  const msg = (e as any)?.message ? String((e as any).message) : String(e);
+  return msg.includes("404") || msg.includes("Not Found");
+}
+
 export async function fetchStatus(): Promise<Status> {
   return apiFetch<Status>("/status");
 }

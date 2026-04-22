@@ -94,8 +94,16 @@ def _resolve_paths() -> None:
     if env:
         State.data_dir = Path(env).expanduser().resolve()
     else:
-        here = Path(__file__).resolve()
-        State.data_dir = here.parents[1] / "data" / "derived"
+        # Default to a user-level data directory.
+        # The desktop shell always sets MINION_DATA_DIR, but this keeps the
+        # sidecar consistent when run standalone.
+        if sys.platform == "darwin":
+            State.data_dir = Path.home() / "Library" / "Application Support" / "Minion" / "data"
+        elif sys.platform == "win32":
+            appdata = os.environ.get("APPDATA", "")
+            State.data_dir = Path(appdata) / "Minion" / "data" if appdata else Path.home() / ".minion" / "data"
+        else:
+            State.data_dir = Path.home() / ".minion" / "data"
     State.data_dir.mkdir(parents=True, exist_ok=True)
 
     inbox_env = os.environ.get("MINION_INBOX")
