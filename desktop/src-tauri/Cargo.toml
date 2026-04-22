@@ -1,6 +1,6 @@
 [package]
 name = "minion-desktop"
-version = "0.3.19"
+version = "1.0.0"
 description = "Minion desktop: drop-zone memory for your agents"
 authors = ["Minion"]
 edition = "2021"

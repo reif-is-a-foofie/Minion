@@ -69,6 +69,8 @@ export type DatabaseStatus = {
 };
 
 export type Status = {
+  /** Sidecar semver (GET /status); present on 1.0.0+ builds. */
+  version?: string;
   data_dir: string;
   inbox: string;
   db_path: string;

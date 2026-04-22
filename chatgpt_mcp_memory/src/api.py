@@ -63,6 +63,7 @@ from parsers import ALL_KINDS, load_user_extensions, supported_extensions, user_
 from settings import apply_settings, load_settings, save_settings
 import telemetry
 import identity
+from version import __version__
 from export_bundle import write_identity_export_zip
 from preference_cluster import run_preference_clustering
 from retrieval_bias import apply_identity_rerank, rrf_fuse
@@ -389,7 +390,7 @@ async def _lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Minion Local API", version="0.1.0", lifespan=_lifespan)
+app = FastAPI(title="Minion Local API", version=__version__, lifespan=_lifespan)
 # Allow Vite dev server (different port) to hit the API.
 app.add_middleware(
     CORSMiddleware,
@@ -668,6 +669,7 @@ def status() -> Dict[str, Any]:
     with State.active_lock:
         active = dict(State.active)
     return {
+        "version": __version__,
         "data_dir": str(State.data_dir),
         "inbox": str(State.inbox),
         "db_path": str(State.db_path),
@@ -690,7 +692,7 @@ def capabilities() -> Dict[str, Any]:
     tok_on = bool(os.environ.get("MINION_API_TOKEN", "").strip())
     return {
         "service": "minion-api",
-        "version": "0.2.0",
+        "version": __version__,
         "schema_version": 1,
         "auth": {
             "mutation_bearer": tok_on,

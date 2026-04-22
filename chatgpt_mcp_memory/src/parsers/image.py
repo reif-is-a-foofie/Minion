@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from ollama_limits import acquire_ollama_inference, merged_ollama_options
+
 from . import ParsedChunk, ParseResult
 from ._common import chunk_text
 
@@ -255,7 +257,12 @@ def _caption_ollama(path: Path, model: str) -> Tuple[Optional[str], Optional[str
     last_err: Optional[str] = None
     for attempt in range(2):
         try:
-            resp = ollama.chat(model=model, messages=messages)
+            with acquire_ollama_inference():
+                resp = ollama.chat(
+                    model=model,
+                    messages=messages,
+                    options=merged_ollama_options(None),
+                )
             text = (resp.get("message") or {}).get("content")
             return (text or None), None
         except Exception as e:

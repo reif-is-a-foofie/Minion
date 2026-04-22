@@ -40,6 +40,7 @@ from store import (
 )
 import telemetry
 import identity
+from version import __version__
 from retrieval_bias import apply_identity_rerank, rrf_fuse
 from build_voice import (
     AUTO_DRAFT_SENTINEL,
@@ -1387,7 +1388,7 @@ def _handle_initialize(req: Dict[str, Any]) -> Dict[str, Any]:
         {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "minion", "title": APP_NAME, "version": "0.2.0"},
+            "serverInfo": {"name": "minion", "title": APP_NAME, "version": __version__},
             "instructions": instructions,
         },
     )

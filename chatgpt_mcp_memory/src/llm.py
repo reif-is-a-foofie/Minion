@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from ollama_limits import acquire_ollama_inference, merged_ollama_options
+
 
 @dataclass(frozen=True)
 class LlmResponse:
@@ -36,15 +38,17 @@ def chat(
     if timeout_seconds is not None:
         client_kwargs["timeout"] = float(timeout_seconds)
 
-    resp = ollama.chat(  # type: ignore
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        options=options or {},
-        **client_kwargs,
-    )
+    opts = merged_ollama_options(options)
+    with acquire_ollama_inference():
+        resp = ollama.chat(  # type: ignore
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            options=opts,
+            **client_kwargs,
+        )
 
     content = (resp.get("message") or {}).get("content")
     if not isinstance(content, str) or not content.strip():
