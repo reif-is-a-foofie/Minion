@@ -23,6 +23,8 @@ export type AppConfig = {
   inbox: string;
   api_port: number;
   api_base: string;
+  /** Empty when sidecar runs without MINION_API_TOKEN. */
+  api_token: string;
   sidecar_bootstrapped: boolean;
   sidecar_running: boolean;
 };
@@ -83,24 +85,56 @@ export type EventMsg =
   | { type: "source_removed"; key: string; counts: any }
   | { type: "tree_done"; root: string; added: number; skipped: number; counts: any };
 
-let cachedConfig: AppConfig | null = null;
-
-/** Drop cached port/api_base (e.g. after sidecar restart). */
-export function invalidateConfigCache(): void {
-  cachedConfig = null;
+/** Always ask the Rust shell — never cache. Stale `api_base` after a port
+ * change or sidecar restart caused POST /nuke to hit the wrong listener (404). */
+export async function getConfig(): Promise<AppConfig> {
+  return (await invoke("app_config")) as AppConfig;
 }
 
-export async function getConfig(): Promise<AppConfig> {
-  if (cachedConfig) return cachedConfig;
-  cachedConfig = (await invoke("app_config")) as AppConfig;
-  return cachedConfig;
+async function assertSidecarHasNukeRoute(apiBase: string): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetch(`${apiBase}/openapi.json`, { headers: { accept: "application/json" } });
+  } catch (e) {
+    throw new Error(
+      `Cannot reach sidecar at ${apiBase}: ${(e as Error).message ?? e}. Try Settings → Restart.`,
+    );
+  }
+  if (!res.ok) {
+    throw new Error(`Sidecar at ${apiBase} returned ${res.status}. Try Settings → Restart or update Minion.`);
+  }
+  const text = await res.text();
+  if (!text.includes('"/nuke"')) {
+    throw new Error(
+      `The server at ${apiBase} is not this Minion build (missing /nuke — often another user or app on the same port). Click Restart in Settings.`,
+    );
+  }
+}
+
+function authHeaders(cfg: AppConfig, extra?: HeadersInit): Record<string, string> {
+  const h: Record<string, string> = { "content-type": "application/json" };
+  if (extra) {
+    if (extra instanceof Headers) {
+      extra.forEach((v, k) => {
+        h[k] = v;
+      });
+    } else if (Array.isArray(extra)) {
+      for (const [k, v] of extra) h[k] = v;
+    } else {
+      Object.assign(h, extra as Record<string, string>);
+    }
+  }
+  if (cfg.api_token) {
+    h["authorization"] = `Bearer ${cfg.api_token}`;
+  }
+  return h;
 }
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const cfg = await getConfig();
   const res = await fetch(`${cfg.api_base}${path}`, {
-    headers: { "content-type": "application/json" },
     ...init,
+    headers: authHeaders(cfg, init?.headers as HeadersInit | undefined),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -256,7 +290,9 @@ export function openSearchStream(
     if (opts.max_chars != null) q.set("max_chars", String(opts.max_chars));
     const url = `${cfg.api_base}/search/stream?${q}`;
     try {
-      const res = await fetch(url);
+      const res = await fetch(url, {
+        headers: cfg.api_token ? { authorization: `Bearer ${cfg.api_token}` } : undefined,
+      });
       if (!res.ok || !res.body) {
         handlers.onError?.(`${res.status} ${res.statusText}`);
         return;
@@ -340,6 +376,8 @@ export async function deleteSource(body: { path?: string; source_id?: string }):
 }
 
 export async function nukeDb(): Promise<{ removed: string[]; missing: string[]; db_path: string }> {
+  const cfg = await getConfig();
+  await assertSidecarHasNukeRoute(cfg.api_base);
   return apiFetch("/nuke", { method: "POST" });
 }
 
@@ -351,6 +389,8 @@ export async function factoryReset(): Promise<{
   inbox_removed: string[];
   inbox_missing: string[];
 }> {
+  const cfg = await getConfig();
+  await assertSidecarHasNukeRoute(cfg.api_base);
   return apiFetch("/factory-reset", { method: "POST" });
 }
 

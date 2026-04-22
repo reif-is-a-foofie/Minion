@@ -15,7 +15,6 @@
     fetchSources,
     fetchStatus,
     getConfig,
-    invalidateConfigCache,
     nukeDb,
     onSidecarStatus,
     openEvents,
@@ -75,6 +74,24 @@
   let evidencePopup = $state<{ path: string; text: string } | null>(null);
   let clusterBusy = $state(false);
   let exportBusy = $state(false);
+
+  const ONBOARD_KEY = "minion_onboarding_v1_done";
+  let showOnboarding = $state(false);
+  let onboardingStep = $state(0);
+
+  function dismissOnboarding() {
+    showOnboarding = false;
+    try {
+      if (typeof localStorage !== "undefined") localStorage.setItem(ONBOARD_KEY, "1");
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function finishOnboardingOpenIdentity() {
+    dismissOnboarding();
+    void openIdentity();
+  }
 
   async function refreshIdentity() {
     identityLoading = true;
@@ -179,9 +196,8 @@
     pushFeed("sidecar", "restart requested");
     try {
       const r = await restartSidecar();
-      invalidateConfigCache();
       config = await getConfig();
-      pushFeed("sidecar", `restarted (pid ${r.pid})`);
+      pushFeed("sidecar", `restarted (pid ${r.pid}) · ${config.api_base}`);
     } catch (e: any) {
       pushFeed("sidecar", `restart failed: ${e?.message ?? e}`);
     } finally {
@@ -602,6 +618,13 @@
       if (config.sidecar_bootstrapped && config.sidecar_running) {
         sidecar = { state: "ready" };
       }
+      try {
+        showOnboarding =
+          typeof localStorage !== "undefined" && !localStorage.getItem(ONBOARD_KEY);
+      } catch {
+        showOnboarding = false;
+      }
+      onboardingStep = 0;
       await Promise.all([refreshStatus(), refreshSources()]);
 
       // Hydrate active snapshot from /status (in case we started mid-run).
@@ -816,6 +839,46 @@
         {:else}
           <button class="ghost" onclick={() => (sidecar = null)}>Dismiss</button>
         {/if}
+      </div>
+    </div>
+  {/if}
+
+  {#if showOnboarding && sidecar?.state === "ready"}
+    <div class="onboarding-overlay">
+      <div class="onboarding-card">
+        <h2 class="onboarding-title">Welcome to Minion</h2>
+        {#if onboardingStep === 0}
+          <p class="onboarding-body">
+            Drop a ChatGPT export, notes, or PDFs on the zone below (or use Browse). Everything stays on this machine — Minion copies into your inbox and indexes it for search and identity.
+          </p>
+          <button type="button" onclick={() => (onboardingStep = 1)}>Next</button>
+        {:else if onboardingStep === 1}
+          <p class="onboarding-body">
+            After you have memories indexed, run <strong>Rebuild clusters</strong> in Identity so Minion can infer preference themes. That gently shapes retrieval toward what matters to you.
+          </p>
+          <div class="onboarding-row">
+            <button type="button" class="ghost" onclick={() => (onboardingStep = 2)}>Skip for now</button>
+            <button
+              type="button"
+              disabled={clusterBusy}
+              onclick={async () => {
+                await runClusterRebuild();
+                onboardingStep = 2;
+              }}
+            >
+              Rebuild clusters
+            </button>
+          </div>
+        {:else}
+          <p class="onboarding-body">
+            Open <strong>Identity</strong> to review proposed claims (it’s fine if the list is empty). You can always get back from the header.
+          </p>
+          <div class="onboarding-row">
+            <button type="button" class="ghost" onclick={dismissOnboarding}>Done</button>
+            <button type="button" onclick={finishOnboardingOpenIdentity}>Open Identity</button>
+          </div>
+        {/if}
+        <button type="button" class="onboarding-dismiss ghost" onclick={dismissOnboarding}>Skip tour</button>
       </div>
     </div>
   {/if}
@@ -1440,6 +1503,55 @@
   .bootstrap-overlay.error .bootstrap-title {
     color: var(--danger);
   }
+
+  .onboarding-overlay {
+    position: fixed;
+    inset: 0;
+    background: color-mix(in srgb, var(--panel) 88%, transparent);
+    backdrop-filter: blur(4px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 40;
+    padding: 24px;
+  }
+  .onboarding-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 24px 26px 18px;
+    max-width: 460px;
+    box-shadow: var(--shadow-m);
+    position: relative;
+  }
+  .onboarding-title {
+    font-family: var(--ui-font);
+    font-size: 17px;
+    font-weight: 600;
+    margin: 0 0 12px;
+    color: var(--ink);
+  }
+  .onboarding-body {
+    font-family: var(--ui-font);
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--muted);
+    margin: 0 0 16px;
+  }
+  .onboarding-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    justify-content: flex-end;
+    margin-bottom: 8px;
+  }
+  .onboarding-dismiss {
+    display: block;
+    margin: 12px auto 0;
+    font-size: 11px !important;
+    opacity: 0.85;
+  }
+
   @keyframes spin { to { transform: rotate(360deg); } }
 
   /* Buttons: warm, soft, friendly. Teal primary, ghost for secondary. */
@@ -1544,9 +1656,9 @@
     outline-offset: 2px;
   }
   .drop-brackets {
-    display: grid;
-    grid-template-columns: auto 1fr auto;
+    display: flex;
     align-items: center;
+    justify-content: center;
     gap: 18px;
     max-width: 520px;
     margin: 0 auto;
@@ -1566,7 +1678,11 @@
     color: var(--accent);
     transform: scale(1.06);
   }
-  .drop-body { text-align: center; }
+  .drop-body {
+    flex: 0 1 auto;
+    text-align: center;
+    min-width: 0;
+  }
   .drop-title {
     font-family: var(--display-font);
     font-size: 22px;

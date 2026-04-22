@@ -91,6 +91,8 @@ struct AppState {
     data_dir: PathBuf,
     inbox: PathBuf,
     api_port: u16,
+    /// Shared with the Python sidecar when set (HTTP mutation auth).
+    api_token: String,
     /// Directory containing api.py (bundled resource in prod, dev checkout
     /// otherwise). Set once by setup(); used by every sidecar respawn.
     sidecar_src_dir: Mutex<Option<PathBuf>>,
@@ -123,6 +125,36 @@ fn resolve_inbox(data_dir: &Path) -> PathBuf {
         return PathBuf::from(p);
     }
     data_dir.join("inbox")
+}
+
+fn ensure_api_token_file(data_dir: &Path) -> String {
+    let p = data_dir.join(".minion_api_token");
+    if let Ok(s) = fs::read_to_string(&p) {
+        let t = s.trim().to_string();
+        if !t.is_empty() {
+            return t;
+        }
+    }
+    let mut buf = [0u8; 32];
+    let tok = if getrandom::getrandom(&mut buf).is_ok() {
+        buf.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    } else {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("minion-{nanos:x}")
+    };
+    let _ = fs::write(&p, &tok);
+    tok
+}
+
+/// Token forwarded to the sidecar as `MINION_API_TOKEN` for mutation auth.
+fn sidecar_api_token(data_dir: &Path) -> String {
+    match std::env::var("MINION_API_TOKEN") {
+        Ok(t) => t.trim().to_string(),
+        Err(_) => ensure_api_token_file(data_dir),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -687,6 +719,7 @@ fn spawn_sidecar(
     inbox: &Path,
     api_port: u16,
     vision_model: Option<&str>,
+    api_token: &str,
 ) -> Option<Child> {
     let api = src_dir.join("api.py");
     if !api.exists() {
@@ -712,6 +745,9 @@ fn spawn_sidecar(
         .stderr(Stdio::inherit());
     if let Some(model) = vision_model {
         cmd.env("MINION_VISION_MODEL", model);
+    }
+    if !api_token.is_empty() {
+        cmd.env("MINION_API_TOKEN", api_token);
     }
 
     match cmd.spawn() {
@@ -856,6 +892,7 @@ fn app_config(state: tauri::State<AppState>) -> serde_json::Value {
         "inbox": state.inbox.to_string_lossy(),
         "api_port": state.api_port,
         "api_base": format!("http://127.0.0.1:{}", state.api_port),
+        "api_token": state.api_token,
         "sidecar_bootstrapped": sidecar_bootstrapped,
         "sidecar_running": sidecar_running,
     })
@@ -1197,6 +1234,7 @@ fn restart_sidecar(state: tauri::State<AppState>) -> Result<serde_json::Value, S
         &state.inbox,
         port,
         current_model.as_deref(),
+        &state.api_token,
     )
     .ok_or_else(|| "failed to respawn sidecar".to_string())?;
     let pid = new_child.id();
@@ -1342,6 +1380,7 @@ fn ensure_vision_model(
             &state.inbox,
             state.api_port,
             Some(&model),
+            &state.api_token,
         )
         .ok_or_else(|| "failed to respawn sidecar".to_string())?;
         *guard = Some(new_child);
@@ -1419,6 +1458,7 @@ pub fn run() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8765);
     let api_port = resolve_sidecar_port(api_port_preferred);
+    let api_token = sidecar_api_token(&data_dir);
 
     // Start ollama so the Python sidecar can be spawned with the vision env
     // already populated when the model is present.
@@ -1451,11 +1491,13 @@ pub fn run() {
         data_dir: data_dir.clone(),
         inbox: inbox.clone(),
         api_port,
+        api_token: api_token.clone(),
         sidecar_src_dir: Mutex::new(None),
         sidecar_python: Mutex::new(None),
     };
 
     let initial_vision_model = vision_model.clone();
+    let api_token_bg = api_token.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1522,8 +1564,15 @@ pub fn run() {
                     *g = Some(python.clone());
                 }
 
-                let child =
-                    spawn_sidecar(&python, &src_dir, &data_dir_bg, &inbox_bg, port_bg, vm_bg.as_deref());
+                let child = spawn_sidecar(
+                    &python,
+                    &src_dir,
+                    &data_dir_bg,
+                    &inbox_bg,
+                    port_bg,
+                    vm_bg.as_deref(),
+                    &api_token_bg,
+                );
                 if let Some(c) = child {
                     if let Ok(mut g) = state.sidecar.lock() {
                         *g = Some(c);
