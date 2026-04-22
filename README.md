@@ -48,14 +48,14 @@ On `tauri build`, **`desktop/src-tauri/scripts/sync_sidecar.sh`** copies `chatgp
 
 ### 1. Pick the right download (Intel vs Apple Silicon)
 
-GitHub Releases ship **two** macOS zips. The name tells you the CPU architecture—choose the one that matches the Mac.
+On [**GitHub Releases**](https://github.com/reif-is-a-foofie/Minion/releases) there are **two** macOS downloads. **Read the file name**—it says which kind of Mac it is for (no “arm64” / “x64” jargon):
 
-| Release file | Your Mac | How to tell |
-|--------------|----------|-------------|
-| **`Minion-*-macos-arm64.zip`** | **Apple Silicon** (M1, M2, M3, M4, …) | Apple menu → **About This Mac** shows a line **Chip:** “Apple M2” (etc.). |
-| **`Minion-*-macos-x64.zip`** | **Intel** (Core i5/i7/i9, Xeon, …) | About This Mac shows **Processor:** with “Intel” in the name, and no **Chip** line (older layout). |
+| Download file name contains… | Use for | How to tell on the Mac |
+|------------------------------|---------|---------------------------|
+| **`…-macOS-Apple-Silicon.zip`** | **Apple Silicon** — M1, M2, M3, M4, … | Apple menu → **About This Mac** → **Chip:** “Apple M2” (or any Apple M…). |
+| **`…-macOS-Intel.zip`** | **Intel** — Core i5 / i7 / i9, Xeon, … | **About This Mac** → **Processor:** line includes **Intel**. |
 
-If you pick the wrong zip, macOS may refuse to open the app or show a “damaged” / architecture message. Delete it, download the **other** zip, unzip again, and drag **Minion.app** to **Applications**.
+If you pick the wrong one, macOS may refuse to open the app or show an architecture error. Delete **Minion.app**, download the **other** zip, unzip, and drag **Minion.app** to **Applications** again.
 
 ### 2. Install and run
 

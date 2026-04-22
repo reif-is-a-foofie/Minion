@@ -71,14 +71,14 @@ Dev quirks:
 
 ## Release zips: Intel vs Apple Silicon
 
-End users get two downloads on [**GitHub Releases**](https://github.com/reif-is-a-foofie/Minion/releases). Names are intentional:
+[**GitHub Releases**](https://github.com/reif-is-a-foofie/Minion/releases) ship two zips per version. File names spell out the hardware in plain language (users should not need “arm64” / “x64”):
 
-| Zip suffix | CPU | Typical Macs |
-|------------|-----|----------------|
-| **`macos-arm64`** | **Apple Silicon** (aarch64) | M1, M2, M3, M4, … — About This Mac shows **Chip:** Apple M… |
-| **`macos-x64`** | **Intel** (x86_64) | Older Macs — About This Mac shows **Processor:** Intel … |
+| Filename contains | CPU | Typical Macs |
+|-------------------|-----|----------------|
+| **`macOS-Apple-Silicon`** | Apple Silicon | M1, M2, M3, M4, … — **About This Mac** shows **Chip:** Apple M… |
+| **`macOS-Intel`** | Intel | **About This Mac** shows **Processor:** … **Intel** … |
 
-**Prep for clients:** send the table above (or link to the repo README install section) so they match **Chip** to **arm64** and **Intel** to **x64**.
+**Prep for clients:** “If you see **Chip** in About This Mac, get the zip with **Apple-Silicon** in the name. If you see an **Intel** processor, get the zip with **Intel** in the name.”
 
 ## Build
 
