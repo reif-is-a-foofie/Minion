@@ -1,87 +1,77 @@
-# What the heck is this thing and why should I care about it?
+# Minion
 
-Well, like me, you are probably realizing by now that you have wasted a lot of your life reading slop from ChatGPT when you could have been making progress with Claude.
+**Minion** is a macOS desktop app that turns your machine into **private, searchable long-term memory** for AI assistants. Drop exports, PDFs, notes, media, and code into one inbox; everything is chunked, embedded, and stored locally in SQLite. **Claude Desktop** (and any other MCP client) can call Minion over stdio to search that archive, browse conversations, and maintain an evolving **voice** profile—without sending your corpus to a hosted service.
 
-I made my move to Claude recently and I realized, well, I have my whole life on GPT. That thing knows more about me than my doctor, my shrink, and Siri combined times 6. And Claude doesn't know me from Adam other than it knows I'm not Adam. At least, most likely not Adam.
+---
 
-OpenAI lets you export all of your chats (takes a few days). Then I needed to push that context back into Claude. But how?? I can't just load 30 million messages into Claude (real message count BTW, wild). And given Claude spends more tokens than a kid at nickel-mania who just drank his first Red Bull, loading the whole thing was off the table.
+## Screenshots
 
-So we go the encoding + semantic search route. Hook it up to an MCP that runs locally, so at run time Claude can query my personal data and ONLY take in the context that matters.
+| Main window — drop zone and ingest | Activity — live parse / embed log |
+|:---:|:---:|
+| ![Minion main window: drop files or folders, supported types, Settings](docs/readme/main-window.png) | ![Activity log showing ingested markdown files and chunk counts](docs/readme/activity-log.png) |
 
-It's alpha. Stretch alpha hard enough and bad things could happen. But at least I am committed to using my own software on my own personal setup.
+| Claude Desktop — Minion MCP in a real thread | macOS — Minion in Launchpad |
+|:---:|:---:|
+| ![Claude using Minion tools to answer from indexed memory](docs/readme/claude-desktop-memory.png) | ![Minion app icon in the macOS Launchpad grid](docs/readme/macos-launchpad.png) |
 
-Ping me with questions,
+**Preferences** — Status (sources, chunks, sidecar, paths), **Claude (MCP)** one-click config, and **Ingest & file types**:
 
-Reif
+| Status | Claude (MCP) | Ingest & types |
+|:---:|:---:|:---:|
+| ![Preferences: Status tab with sources, chunks, inbox watch, sidecar](docs/readme/preferences-status.png) | ![Preferences: Claude MCP tab with Add to Claude and success message](docs/readme/preferences-claude-mcp.png) | ![Preferences: Ingest and file types with toggles per format](docs/readme/preferences-ingest.png) |
 
--reif@thegoodproject.net
+---
 
-## What Claude actually gets
+## What you get
 
-Two things, automatically, on every session:
+- **Local index** — One `memory.db` (plus vectors) under `~/Library/Application Support/Minion/data` by default. Override with `MINION_DATA_DIR` if needed.
+- **Drop zone + watcher** — Drag files or folders onto the app (or use **Choose files…**). The sidecar ingests in the background; the **Activity** list shows progress and chunk counts.
+- **MCP tools for Claude** — Semantic / keyword / temporal **`ask_minion`**, **`get_chunk`**, conversation helpers, **`index_info`**, voice tools (`commit_voice` / `append_to_voice`), and identity helpers where enabled. Claude chooses when to call them.
+- **Settings hub** — Restart the Python sidecar, inspect API and DB paths, tune which file kinds are ingested, and **Add to Claude** to merge Minion into `claude_desktop_config.json`.
 
-1. **Retrieval**. An MCP server (this repo) that lets Claude search your chat history and any file you drop into the inbox. It exposes 8 tools: `ask_minion` (semantic, keyword, and temporal search), `get_chunk`, `browse_conversations`, `conversation_chunks`, `list_sources`, `index_info`, plus the voice tools below. Claude decides when to call them.
-2. **Voice**. A durable `voice.md` profile (preferences, nevers, style rules, writers you want emulated) that gets injected into Claude's system prompt every session. You don't write it. On first run, Claude reads your chat history, figures out how you actually write, and commits the profile. From then on, if you state a new rule mid-conversation ("actually, I hate bullet lists"), Claude confirms and appends it via `append_to_voice`. The profile evolves from the chats, not from a text editor.
+For tool tables, parsers, env flags, and CLI-only workflows, see **[`chatgpt_mcp_memory/README.md`](./chatgpt_mcp_memory/README.md)**. For Tauri architecture and `tauri dev` / `tauri build`, see **[`desktop/README.md`](./desktop/README.md)**.
 
-The voice tool (`commit_voice` on first run, `append_to_voice` after) is what turns "Claude knows me" from a one-time paste into something that actually stays current.
+---
 
-## Install
+## Install (macOS app)
 
-Clone it, set up Python, done. Homebrew formula is dormant for now, running from the repo is the path.
+1. Download the latest **Minion** build from [**GitHub Releases**](https://github.com/reif-is-a-foofie/Minion/releases) (or build from source — below).
+2. Open the `.app` and, when macOS prompts you, move it to **Applications** (avoid running forever from the disk image or a translocated copy; that can confuse paths and file access).
+3. **First launch** can take a few minutes while Minion prepares its embedded Python environment and starts the sidecar. Later launches are quick.
+4. In Minion, open **Settings → Claude (MCP)** and click **Add to Claude**. Then **fully quit and reopen Claude Desktop** so it loads the new MCP entry.
+5. Optional: import a **ChatGPT export** (zip or folder) via the drop zone so the index has history on day one.
 
-Prereqs: Python 3.10+, [Ollama](https://ollama.com) running with whatever model you want for the profile generator (default `mistral:7b`), Claude Desktop installed.
+---
 
-```bash
-git clone https://github.com/reif-is-a-foofie/minion.git
-cd minion/chatgpt_mcp_memory
-
-# uv is the cleanest way, works even if your system Python is a mess
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv python install 3.11
-uv venv --python 3.11
-uv pip install -r requirements-all.txt
-
-# put bin/minion on your PATH or just alias it
-alias minion="$PWD/../bin/minion"
-minion doctor
-```
-
-Classic venv works too if you already have a Python 3.10+ you trust. See `chatgpt_mcp_memory/README.md` for the minimal requirements split (core vs PDFs vs images vs audio vs code).
-
-## Run it
-
-Type `minion`, hit enter. That's the whole interface. It asks you for the path to your ChatGPT export zip, unpacks it, builds the index, pulls persona evidence, writes `core_profile.md`, and merges the MCP entry into Claude Desktop's config (with a backup). One command, one pipeline.
-
-Non-interactive version for scripts:
+## Build from source (developers)
 
 ```bash
-minion setup /path/to/chatgpt-export.zip
-```
+git clone https://github.com/reif-is-a-foofie/Minion.git
+cd Minion/chatgpt_mcp_memory
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 
-After it finishes: **quit and reopen Claude Desktop** so it picks up the MCP server. First session with the new config does the voice bootstrap silently in the background. Ask Claude something like "what do you know about me?" and it will call `ask_minion` and tell you.
-
-Paste `core_profile.md` and `retrieval_policy.md` from your run folder into Claude's Custom Instructions if you want the strategic layer pinned. Optional but recommended.
-
-## Drop stuff in
-
-There's a desktop app (Tauri + SvelteKit, same SQLite + sqlite-vec store as the CLI). Drop any file onto the window, PDF, image, audio, markdown, code, and every MCP-speaking agent (Claude Desktop, Cursor, whatever) can read it.
-
-```bash
-cd desktop
+cd ../desktop
 npm install
 npm run tauri dev
 ```
 
-Without the app, drop files into `data/inbox/`. The watcher inside `minion mcp` reconciles on startup and then live-watches. CRUD commands: `minion add`, `minion ls`, `minion rm`, `minion watch`.
+The Rust shell prefers `../chatgpt_mcp_memory/.venv/bin/python`. Release builds produce `desktop/src-tauri/target/release/bundle/macos/Minion.app`; bundling details may evolve — see `desktop/README.md` and `desktop/src-tauri/` notes.
 
-See [`desktop/README.md`](./desktop/README.md) for the app, [`chatgpt_mcp_memory/README.md`](./chatgpt_mcp_memory/README.md) for everything else (parsers, tool surface table, voice internals, env knobs).
+---
+
+## CLI (`minion` command)
+
+For a **terminal-first** setup (export path, `minion doctor`, `minion setup`, inbox CRUD without the GUI), use the launcher in **`bin/minion`** and the instructions in **`chatgpt_mcp_memory/README.md`**. The desktop app and the CLI share the same store and MCP server code.
+
+---
 
 ## Privacy
 
-Nothing leaves the machine. The index is a single SQLite file (`memory.db`) with sqlite-vec for KNN. MCP runs over stdio, no network ports. The only network-adjacent thing is optional Ollama image captioning, off unless `MINION_VISION_MODEL` is set. Keep your raw export and derived artifacts outside the repo (I use a sibling `minion_private/` folder).
+Indexing and search run **on your machine**. MCP speaks **stdio** to Claude Desktop by default—no cloud “memory service” in the loop for your chunks. Optional components (for example **Ollama** for voice synthesis, or **HF Hub** for some embedding downloads) only touch the network if you configure them; keep exports and large corpora **outside** the git tree if you prefer (e.g. a sibling folder).
 
-## What you actually get out of this
+---
 
-A useful "you" profile rebuilt from your own writing, not a personality you hand-authored. An assistant that stays consistent over time without you restuffing history into every chat. Real "how you said it" evidence when you're writing or deciding or delegating. A voice that sharpens itself session over session instead of drifting.
+## Credits
 
-Auditable all the way down: every profile is generated from quotes, every voice directive ties back to a chunk, every build writes a manifest.
+Built and dogfooded by **Reif** — questions: [reif@thegoodproject.net](mailto:reif@thegoodproject.net).
