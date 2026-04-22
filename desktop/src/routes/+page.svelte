@@ -2,7 +2,6 @@
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import { openUrl } from "@tauri-apps/plugin-opener";
   import {
     connectClaudeDesktop,
     copyIntoInbox,
@@ -27,6 +26,7 @@
     revealInFinder,
     search,
     updateSettings,
+    waitForHealthySidecar,
     isNotFoundError,
     type Active,
     type AppConfig,
@@ -88,58 +88,6 @@
   let evidencePopup = $state<{ path: string; text: string } | null>(null);
   let clusterBusy = $state(false);
   let exportBusy = $state(false);
-
-  const SETUP_CHECKLIST_KEY = "minion_setup_checklist_done";
-  const LEGACY_ONBOARD_KEY = "minion_onboarding_v1_done";
-  const CLAUDE_MCP_KEY = "minion_claude_mcp_added";
-  const CONNECT_BANNER_DISMISS_KEY = "minion_connect_banner_dismissed";
-  const CHATGPT_EXPORT_HELP_URL =
-    "https://help.openai.com/en/articles/7260999-how-do-i-export-my-chatgpt-history-and-data";
-
-  let showOnboarding = $state(false);
-  let onboardingStep = $state(0);
-  let claudeMcpAdded = $state(false);
-  let connectBannerDismissed = $state(false);
-
-  function readSetupFlags() {
-    try {
-      if (typeof localStorage === "undefined") return;
-      if (localStorage.getItem(LEGACY_ONBOARD_KEY)) {
-        localStorage.setItem(SETUP_CHECKLIST_KEY, "1");
-      }
-      claudeMcpAdded = localStorage.getItem(CLAUDE_MCP_KEY) === "1";
-      connectBannerDismissed = localStorage.getItem(CONNECT_BANNER_DISMISS_KEY) === "1";
-    } catch {
-      /* ignore */
-    }
-  }
-
-  function markClaudeMcpAdded() {
-    try {
-      if (typeof localStorage !== "undefined") localStorage.setItem(CLAUDE_MCP_KEY, "1");
-    } catch {
-      /* ignore */
-    }
-    claudeMcpAdded = true;
-  }
-
-  function dismissConnectBanner() {
-    try {
-      if (typeof localStorage !== "undefined") localStorage.setItem(CONNECT_BANNER_DISMISS_KEY, "1");
-    } catch {
-      /* ignore */
-    }
-    connectBannerDismissed = true;
-  }
-
-  function dismissOnboarding() {
-    showOnboarding = false;
-    try {
-      if (typeof localStorage !== "undefined") localStorage.setItem(SETUP_CHECKLIST_KEY, "1");
-    } catch {
-      /* ignore */
-    }
-  }
 
   async function refreshIdentity() {
     identityLoading = true;
@@ -289,8 +237,8 @@
       pushFeed("settings", `db wiped: ${res.db_path.split("/").pop()}`);
       // Restart sidecar so it recreates the DB cleanly and reconnects watchers.
       await handleRestart();
-      // Refresh UI state after restart.
-      status = await fetchStatus();
+      // HTTP listener can lag the process — avoid WebKit "Load failed" on immediate /status.
+      status = await waitForHealthySidecar();
       await refreshSources();
     } catch (e: any) {
       pushFeed("settings", `db wipe failed: ${e?.message ?? e}`);
@@ -307,7 +255,7 @@
       const res = await factoryReset();
       pushFeed("settings", `reset complete: ${res.db_path.split("/").pop()}`);
       await handleRestart();
-      status = await fetchStatus();
+      status = await waitForHealthySidecar();
       await refreshSources();
     } catch (e: any) {
       const msg = e?.message ?? e;
@@ -356,7 +304,6 @@
     } finally {
       connecting = false;
     }
-    if (ok) markClaudeMcpAdded();
     return ok;
   }
 
@@ -570,12 +517,13 @@
   function fileKind(path: string, status: string): { label: string; cls: string } {
     const p = (path || "").toLowerCase();
     const name = fileName(p);
-    if (!name || /^(drop|sidecar|vision|watcher|settings|identity)$/.test(name)) {
+    if (!name || /^(drop|sidecar|vision|watcher|settings|identity|database)$/.test(name)) {
       if (name === "sidecar")  return { label: "SYS", cls: "sys" };
       if (name === "vision")   return { label: "VIS", cls: "vis" };
       if (name === "watcher")  return { label: "WCH", cls: "sys" };
       if (name === "settings") return { label: "SET", cls: "sys" };
       if (name === "identity") return { label: "ID", cls: "sys" };
+      if (name === "database") return { label: "DB", cls: "sys" };
       return { label: "···", cls: "dflt" };
     }
     // Folder drop results come back as the folder path.
@@ -748,15 +696,6 @@
       if (config.sidecar_bootstrapped && config.sidecar_running) {
         sidecar = { state: "ready" };
       }
-      readSetupFlags();
-      try {
-        showOnboarding =
-          typeof localStorage !== "undefined" && !localStorage.getItem(SETUP_CHECKLIST_KEY);
-      } catch {
-        showOnboarding = false;
-      }
-      onboardingStep = 0;
-
       try {
         const sig =
           typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
@@ -844,6 +783,9 @@
           pushFeed(msg.root, `done · +${msg.added} ${msg.skipped ? `· ⊘${msg.skipped}` : ""}`);
           await refreshSources();
           await refreshStatus();
+        } else if (msg.type === "db_error") {
+          pushFeed("database", msg.message);
+          await refreshStatus();
         }
         },
         (s) => {
@@ -929,6 +871,14 @@
     </button>
   </header>
 
+  {#if status?.database?.ok === false}
+    <div class="db-error-banner" role="alert">
+      <strong>Database error</strong>
+      <span class="db-error-msg">{status.database.error ?? "SQLite unavailable"}</span>
+      <span class="db-error-hint">Check disk space; avoid iCloud or network-backed folders; set MINION_DATA_DIR to a local path; quit Minion and remove stale memory.db-wal / memory.db-shm if needed.</span>
+    </div>
+  {/if}
+
   {#if sidecar && sidecar.state !== "ready"}
     <div class="bootstrap-overlay" class:error={sidecar.state === "error"}>
       <div class="bootstrap-card">
@@ -959,68 +909,6 @@
         {:else}
           <button class="ghost" onclick={() => (sidecar = null)}>Dismiss</button>
         {/if}
-      </div>
-    </div>
-  {/if}
-
-  {#if showOnboarding && sidecar?.state === "ready"}
-    <div class="onboarding-overlay">
-      <div class="onboarding-card">
-        <h2 class="onboarding-title">Setup · step {onboardingStep + 1} of 3</h2>
-        {#if onboardingStep === 0}
-          <p class="onboarding-body">
-            In ChatGPT: open <strong>Settings</strong> → <strong>Data controls</strong> → request an <strong>Export</strong>. You get a zip when it’s ready.
-          </p>
-          <div class="onboarding-row">
-            <button
-              type="button"
-              class="ghost"
-              onclick={() => {
-                void openUrl(CHATGPT_EXPORT_HELP_URL);
-              }}
-            >
-              Open ChatGPT export help
-            </button>
-            <button type="button" onclick={() => (onboardingStep = 1)}>Next</button>
-          </div>
-        {:else if onboardingStep === 1}
-          <p class="onboarding-body">
-            Add the export (zip or folder) or any files you want indexed. You can drag onto the main window or pick here.
-          </p>
-          <div class="onboarding-row">
-            <button type="button" class="ghost" onclick={(e) => { e.stopPropagation(); browseForFiles(); }}>Select files…</button>
-            <button type="button" class="ghost" onclick={(e) => { e.stopPropagation(); browseForFolder(); }}>Select folder…</button>
-          </div>
-          <div class="onboarding-row">
-            <button type="button" class="ghost" onclick={() => (onboardingStep = 0)}>Back</button>
-            <button
-              type="button"
-              disabled={(status?.counts.sources ?? 0) < 1}
-              title={(status?.counts.sources ?? 0) < 1 ? "Add at least one file first" : ""}
-              onclick={() => (onboardingStep = 2)}
-            >
-              Next
-            </button>
-          </div>
-          {#if (status?.counts.sources ?? 0) < 1}
-            <p class="onboarding-hint">Waiting for at least one indexed source…</p>
-          {/if}
-        {:else}
-          <p class="onboarding-body">
-            Register Minion in Claude Desktop’s MCP config, then fully quit and reopen Claude.
-          </p>
-          {#if connectMsg}
-            <p class="onboarding-msg">{connectMsg}</p>
-          {/if}
-          <div class="onboarding-row">
-            <button type="button" class="ghost" onclick={() => (onboardingStep = 1)}>Back</button>
-            <button type="button" disabled={connecting} onclick={() => void runConnect()}>
-              {connecting ? "…" : "Add to Claude Desktop"}
-            </button>
-            <button type="button" class="ghost" onclick={dismissOnboarding}>Done</button>
-          </div>
-        {/if}
-        <button type="button" class="onboarding-dismiss ghost" onclick={dismissOnboarding}>Skip setup</button>
       </div>
     </div>
   {/if}
@@ -1147,18 +1035,6 @@
                 </div>
               {/if}
 
-              {#if sidecar?.state === "ready" && status && status.counts.sources > 0 && !claudeMcpAdded && !connectBannerDismissed}
-                <div class="setup-inline settings-spaced" role="status">
-                  <div class="setup-inline-text">
-                    You have indexed {status.counts.sources} source{status.counts.sources === 1 ? "" : "s"}. Add Minion to Claude Desktop (MCP), then restart Claude.
-                  </div>
-                  <div class="setup-inline-actions">
-                    <button type="button" class="ghost" disabled={connecting} onclick={() => void runConnect()}>{connecting ? "…" : "Add MCP"}</button>
-                    <button type="button" class="ghost" onclick={dismissConnectBanner}>Dismiss</button>
-                  </div>
-                </div>
-              {/if}
-
               <div class="setting-row">
                 <div class="setting-main">
                   <div class="setting-label">Restart sidecar</div>
@@ -1174,6 +1050,11 @@
                 {/if}
                 {#if status?.db_path}
                   <div class="detail-row"><span class="detail-k">Database</span><span class="detail-v mono">{status.db_path}</span></div>
+                {/if}
+                {#if status?.database?.journal_mode}
+                  <div class="detail-row">
+                    <span class="detail-k">SQLite journal</span><span class="detail-v">{status.database.journal_mode}</span>
+                  </div>
                 {/if}
                 {#if config?.data_dir}
                   <div class="detail-row"><span class="detail-k">Data</span><span class="detail-v mono">{config.data_dir}</span></div>
@@ -1465,6 +1346,34 @@
     color: var(--ink);
   }
 
+  .db-error-banner {
+    margin: 0 1rem 0.75rem;
+    padding: 0.65rem 0.85rem;
+    border-radius: 10px;
+    background: rgba(180, 40, 40, 0.14);
+    border: 1px solid rgba(220, 80, 80, 0.45);
+    color: var(--text, #e8e4dc);
+    font-size: 0.82rem;
+    line-height: 1.45;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .db-error-banner strong {
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  .db-error-msg {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.78rem;
+    opacity: 0.95;
+    word-break: break-word;
+  }
+  .db-error-hint {
+    font-size: 0.76rem;
+    opacity: 0.85;
+  }
+
   header.app-header-min {
     display: flex;
     align-items: center;
@@ -1642,70 +1551,6 @@
   }
   .bootstrap-overlay.error .bootstrap-title {
     color: var(--danger);
-  }
-
-  .onboarding-overlay {
-    position: fixed;
-    inset: 0;
-    background: color-mix(in srgb, var(--panel) 88%, transparent);
-    backdrop-filter: blur(4px);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 40;
-    padding: 24px;
-  }
-  .onboarding-card {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 24px 26px 18px;
-    max-width: 460px;
-    box-shadow: var(--shadow-m);
-    position: relative;
-  }
-  .onboarding-title {
-    font-family: var(--ui-font);
-    font-size: 17px;
-    font-weight: 600;
-    margin: 0 0 12px;
-    color: var(--ink);
-  }
-  .onboarding-body {
-    font-family: var(--ui-font);
-    font-size: 13px;
-    line-height: 1.5;
-    color: var(--muted);
-    margin: 0 0 16px;
-  }
-  .onboarding-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-    justify-content: flex-end;
-    margin-bottom: 8px;
-  }
-  .onboarding-dismiss {
-    display: block;
-    margin: 12px auto 0;
-    font-size: 11px !important;
-    opacity: 0.85;
-  }
-  .onboarding-hint {
-    font-family: var(--ui-font);
-    font-size: 11.5px;
-    color: var(--muted);
-    margin: 0 0 8px;
-  }
-  .onboarding-msg {
-    font-family: var(--ui-font);
-    font-size: 12px;
-    color: var(--ink);
-    margin: 0 0 12px;
-    padding: 8px 10px;
-    background: color-mix(in srgb, var(--accent) 6%, var(--panel));
-    border-radius: var(--radius-sm);
-    border: 1px solid var(--border);
   }
 
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -2209,28 +2054,6 @@
   }
   .settings-spaced {
     margin-top: 16px;
-  }
-  .setup-inline {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 10px 14px;
-    padding: 12px 14px;
-    background: var(--panel-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-  }
-  .setup-inline-text {
-    flex: 1 1 220px;
-    font-family: var(--ui-font);
-    font-size: 12px;
-    line-height: 1.45;
-    color: var(--ink);
-  }
-  .setup-inline-actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
   }
   .detail-block {
     margin-top: 18px;

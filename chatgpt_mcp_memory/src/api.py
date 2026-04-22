@@ -103,6 +103,8 @@ class State:
     # Active-ingest snapshot (for UI progress card) + lock guarding it.
     active: Dict[str, Any] = {"root": None, "total": 0, "done": 0, "added": 0, "skipped": 0}
     active_lock: threading.Lock = threading.Lock()
+    # Set when connect/query fails; cleared on successful /status probe.
+    db_error: Optional[str] = None
 
     @classmethod
     def conn(cls) -> sqlite3.Connection:
@@ -238,6 +240,12 @@ def _watcher_event_bridge(kind: str, payload: Dict[str, Any]) -> None:
             "key": payload.get("path"),
             "counts": _counts(),
         })
+    elif kind == "error":
+        msg = str(payload.get("message") or "watcher error")
+        if len(msg) > 800:
+            msg = msg[:800] + "…"
+        State.db_error = msg
+        _schedule_broadcast({"type": "db_error", "message": msg})
 
 
 # ---------------------------------------------------------------------------
@@ -273,9 +281,15 @@ def _start_watcher() -> None:
                     reconcile_once(bg_conn, State.inbox, on_event=_watcher_event_bridge)
                 finally:
                     bg_conn.close()
+                State.db_error = None
                 _schedule_broadcast({"type": "ready", "counts": _counts()})
-            except Exception:
+            except Exception as e:
                 log.exception("startup reconcile failed")
+                msg = str(e)
+                if len(msg) > 800:
+                    msg = msg[:800] + "…"
+                State.db_error = msg
+                _schedule_broadcast({"type": "db_error", "message": msg})
 
         threading.Thread(
             target=_reconcile_bg, name="minion-api-reconcile", daemon=True
@@ -320,6 +334,23 @@ def _counts() -> Dict[str, Any]:
         }
     except Exception:
         return {"sources": 0, "chunks": 0}
+
+
+def _database_status() -> Dict[str, Any]:
+    """Cheap DB health for GET /status (per-request thread may open first connection)."""
+    try:
+        conn = State.conn()
+        conn.execute("SELECT 1").fetchone()
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+        mode = str(row[0]) if row else None
+        State.db_error = None
+        return {"ok": True, "error": None, "journal_mode": mode}
+    except Exception as e:
+        msg = str(e)
+        if len(msg) > 500:
+            msg = msg[:500] + "…"
+        State.db_error = msg
+        return {"ok": False, "error": msg, "journal_mode": None}
 
 
 # ---------------------------------------------------------------------------
@@ -612,6 +643,7 @@ def status() -> Dict[str, Any]:
         "supported_extensions": supported_extensions(),
         "counts": _counts(),
         "active": active,
+        "database": _database_status(),
         "watcher": {
             "running": _watcher_thread is not None and _watcher_thread.is_alive()
             if _watcher_thread

@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
+import shutil
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -37,6 +40,8 @@ except Exception:  # pragma: no cover - import guarded so docs-only installs sti
 
 DEFAULT_EMBED_DIM = 384
 DB_FILENAME = "memory.db"
+
+log = logging.getLogger("minion.store")
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +223,48 @@ def _load_vec_extension(conn: sqlite3.Connection) -> None:
     conn.enable_load_extension(False)
 
 
+def _journal_mode_from_env() -> Optional[str]:
+    raw = (os.environ.get("MINION_SQLITE_JOURNAL") or "").strip().lower()
+    if raw in ("wal", "delete"):
+        return raw
+    return None
+
+
+def _apply_journal_mode(conn: sqlite3.Connection, db_path: Path) -> str:
+    """Pick WAL or DELETE journal; WAL may be unsupported on some volumes."""
+    forced = _journal_mode_from_env()
+    if forced == "delete":
+        row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+        return str(row[0]) if row else "delete"
+    if forced == "wal":
+        row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        return str(row[0]) if row else "wal"
+
+    try:
+        row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        got = str(row[0]) if row else ""
+        if got.upper() != "WAL":
+            log.warning("journal_mode requested WAL got %s for %s", got or "?", db_path)
+        return got or "wal"
+    except sqlite3.OperationalError as e:
+        log.warning(
+            "WAL unavailable for %s (%s); falling back to DELETE journal",
+            db_path,
+            e,
+        )
+        try:
+            row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+            return str(row[0]) if row else "delete"
+        except sqlite3.OperationalError as e2:
+            hint = (
+                f"SQLite cannot configure journal at {db_path}: {e2}. "
+                "Check free disk space; avoid iCloud or network-backed paths; "
+                "set MINION_DATA_DIR to a local folder; quit Minion and remove "
+                "stale memory.db-wal / memory.db-shm if the DB was uncleanly closed."
+            )
+            raise sqlite3.OperationalError(hint) from e2
+
+
 def connect(db_path: Path, *, embed_dim: int = DEFAULT_EMBED_DIM) -> sqlite3.Connection:
     """
     Open (creating if needed) the memory DB, load sqlite-vec, apply schema.
@@ -232,7 +279,7 @@ def connect(db_path: Path, *, embed_dim: int = DEFAULT_EMBED_DIM) -> sqlite3.Con
     conn.row_factory = sqlite3.Row
     _load_vec_extension(conn)
 
-    conn.execute("PRAGMA journal_mode=WAL")
+    _apply_journal_mode(conn, db_path)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA synchronous=NORMAL")
 

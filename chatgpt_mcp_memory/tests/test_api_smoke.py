@@ -30,6 +30,9 @@ def test_status_ready(sidecar) -> None:
     body = r.json()
 
     assert body["counts"] == {"sources": 0, "chunks": 0}
+    assert "database" in body
+    assert body["database"]["ok"] is True
+    assert body["database"]["error"] is None
     assert body["db_path"].endswith("memory.db")
     assert str(sidecar.data_dir) in body["data_dir"] or body["data_dir"].endswith(
         sidecar.data_dir.name

@@ -26,6 +26,29 @@ from ingest import _ARCHIVE_EXTS, IngestResult, _looks_like_chatgpt_export, inge
 from parsers import choose_parser
 from store import delete_source_by_path, iter_source_ids, sha256_of_file
 
+_watcher_err_lock = threading.Lock()
+_watcher_err_last: float = 0.0
+
+
+def _emit_watcher_error_bounded(
+    on_event: Optional[Callable[[str, Dict[str, object]], None]],
+    message: str,
+    interval_sec: float = 30.0,
+) -> None:
+    """Rate-limit error events so a burst of file notifications does not spam the UI."""
+    global _watcher_err_last
+    if on_event is None:
+        return
+    now = time.monotonic()
+    with _watcher_err_lock:
+        if now - _watcher_err_last < interval_sec:
+            return
+        _watcher_err_last = now
+    try:
+        on_event("error", {"message": message})
+    except Exception:
+        log.exception("on_event failed for error payload")
+
 
 def _is_ingestable(p: Path) -> bool:
     """A file is ingestable if a parser claims it OR it's an archive we unpack."""
@@ -298,9 +321,15 @@ def reconcile_once(
 class _Debouncer:
     """Coalesces rapid events into a single callback after `delay` seconds."""
 
-    def __init__(self, delay: float, fn: Callable[[Set[str]], None]) -> None:
+    def __init__(
+        self,
+        delay: float,
+        fn: Callable[[Set[str]], None],
+        on_error: Optional[Callable[[Exception], None]] = None,
+    ) -> None:
         self._delay = delay
         self._fn = fn
+        self._on_error = on_error
         self._lock = threading.Lock()
         self._timer: Optional[threading.Timer] = None
         self._pending: Set[str] = set()
@@ -322,8 +351,13 @@ class _Debouncer:
         if batch:
             try:
                 self._fn(batch)
-            except Exception:
+            except Exception as e:
                 log.exception("debounced handler failed")
+                if self._on_error is not None:
+                    try:
+                        self._on_error(e)
+                    except Exception:
+                        log.exception("debouncer on_error failed")
 
 
 def start_background(
@@ -486,7 +520,11 @@ def start_background(
         finally:
             conn.close()
 
-    debouncer = _Debouncer(debounce, _handle_batch)
+    debouncer = _Debouncer(
+        debounce,
+        _handle_batch,
+        on_error=lambda e: _emit_watcher_error_bounded(on_event, str(e)),
+    )
 
     class _Handler(FileSystemEventHandler):  # type: ignore[misc]
         def on_created(self, event):  # type: ignore[override]
@@ -551,8 +589,9 @@ def start_polling_watcher(
                     reconcile_once(conn, inbox, on_event=on_event)
                 finally:
                     conn.close()
-            except Exception:
+            except Exception as e:
                 log.exception("polling reconcile failed")
+                _emit_watcher_error_bounded(on_event, str(e))
             time.sleep(interval_sec)
 
     t = threading.Thread(target=_run, name="minion-poll-watcher", daemon=True)

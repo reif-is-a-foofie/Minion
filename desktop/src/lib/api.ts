@@ -62,6 +62,12 @@ export type Active = {
   skipped: number;
 };
 
+export type DatabaseStatus = {
+  ok: boolean;
+  error: string | null;
+  journal_mode: string | null;
+};
+
 export type Status = {
   data_dir: string;
   inbox: string;
@@ -69,6 +75,8 @@ export type Status = {
   supported_extensions: string[];
   counts: { sources: number; chunks: number };
   active: Active;
+  /** Present on newer sidecars; when ok is false, ingest/search are blocked. */
+  database?: DatabaseStatus;
   watcher: { running: boolean; mode?: string };
 };
 
@@ -83,7 +91,8 @@ export type EventMsg =
   | { type: "ingest_failed"; path: string; active?: Active }
   | { type: "source_updated"; result: Record<string, unknown>; counts: any; active?: Active }
   | { type: "source_removed"; key: string; counts: any }
-  | { type: "tree_done"; root: string; added: number; skipped: number; counts: any };
+  | { type: "tree_done"; root: string; added: number; skipped: number; counts: any }
+  | { type: "db_error"; message: string };
 
 /** Always ask the Rust shell — never cache. Stale `api_base` after a port
  * change or sidecar restart caused POST /nuke to hit the wrong listener (404). */
@@ -92,22 +101,37 @@ export async function getConfig(): Promise<AppConfig> {
 }
 
 async function assertSidecarHasNukeRoute(apiBase: string): Promise<void> {
-  let res: Response;
-  try {
-    res = await fetch(`${apiBase}/openapi.json`, { headers: { accept: "application/json" } });
-  } catch (e) {
-    throw new Error(
-      `Cannot reach sidecar at ${apiBase}: ${(e as Error).message ?? e}. Try Settings → Restart.`,
-    );
-  }
-  if (!res.ok) {
-    throw new Error(`Sidecar at ${apiBase} returned ${res.status}. Try Settings → Restart or update Minion.`);
-  }
-  const text = await res.text();
-  if (!text.includes('"/nuke"')) {
-    throw new Error(
-      `The server at ${apiBase} is not this Minion build (missing /nuke — often another user or app on the same port). Click Restart in Settings.`,
-    );
+  const maxAttempts = 18;
+  const delayMs = 300;
+  let lastNet: Error | undefined;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    let res: Response;
+    try {
+      res = await fetch(`${apiBase}/openapi.json`, { headers: { accept: "application/json" } });
+    } catch (e) {
+      lastNet = e instanceof Error ? e : new Error(String(e));
+      if (attempt < maxAttempts - 1) {
+        await new Promise((r) => setTimeout(r, delayMs));
+        continue;
+      }
+      throw new Error(
+        `Cannot reach sidecar at ${apiBase}: ${lastNet.message}. Try Settings → Restart.`,
+      );
+    }
+    if (!res.ok) {
+      if (attempt < maxAttempts - 1 && (res.status === 502 || res.status === 503 || res.status === 404)) {
+        await new Promise((r) => setTimeout(r, delayMs));
+        continue;
+      }
+      throw new Error(`Sidecar at ${apiBase} returned ${res.status}. Try Settings → Restart or update Minion.`);
+    }
+    const text = await res.text();
+    if (!text.includes('"/nuke"')) {
+      throw new Error(
+        `The server at ${apiBase} is not this Minion build (missing /nuke — often another user or app on the same port). Click Restart in Settings.`,
+      );
+    }
+    return;
   }
 }
 
@@ -159,6 +183,21 @@ export async function fetchStatus(init?: RequestInit): Promise<Status> {
     throw new Error(`${res.status} ${res.statusText}: ${body}`);
   }
   return (await res.json()) as Status;
+}
+
+/** Poll GET /status until it succeeds (e.g. after sidecar restart the port is bound before accept()). */
+export async function waitForHealthySidecar(maxMs = 20_000, init?: RequestInit): Promise<Status> {
+  const deadline = Date.now() + maxMs;
+  let last: unknown;
+  while (Date.now() < deadline) {
+    try {
+      return await fetchStatus(init);
+    } catch (e) {
+      last = e;
+      await new Promise((r) => setTimeout(r, 350));
+    }
+  }
+  throw last instanceof Error ? last : new Error(String(last));
 }
 
 export async function fetchSources(
