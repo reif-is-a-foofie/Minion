@@ -1,0 +1,12 @@
+Meeting notes (Kestrel) — 2026-04-20
+
+Attendees: Mara Ivers, Theo Park, Juno Reyes
+
+Decisions:
+- Use “RR FUSION” as the shorthand in docs for the semantic+keyword merge.
+- If Claude can’t write its config, the UI should prompt for the file path.
+
+Action items:
+- Juno will draft the onboarding one-pager and include the code KSTL-RUN-17.
+- Theo will confirm the launch target date is still 2026-05-04.
+

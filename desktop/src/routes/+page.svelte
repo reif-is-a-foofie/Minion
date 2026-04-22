@@ -6,6 +6,7 @@
     connectClaudeDesktop,
     copyIntoInbox,
     deleteSource,
+    factoryReset,
     nukeDb,
     fetchSettings,
     fetchSources,
@@ -102,6 +103,23 @@
       await refreshSources();
     } catch (e: any) {
       pushFeed("settings", `db wipe failed: ${e?.message ?? e}`);
+    }
+  }
+
+  async function runFactoryReset() {
+    const ok = confirm(
+      "Factory reset will DELETE Minion's local database and CLEAR the inbox directory. This is irreversible. Continue?",
+    );
+    if (!ok) return;
+    pushFeed("settings", "factory reset…");
+    try {
+      const res = await factoryReset();
+      pushFeed("settings", `reset complete: ${res.db_path.split("/").pop()}`);
+      await handleRestart();
+      status = await fetchStatus();
+      await refreshSources();
+    } catch (e: any) {
+      pushFeed("settings", `factory reset failed: ${e?.message ?? e}`);
     }
   }
 
@@ -790,6 +808,17 @@
           </div>
           <button class="ghost danger" onclick={runNukeDb} title="Delete memory.db and restart the sidecar">
             Nuke DB
+          </button>
+        </div>
+        <div class="setting-row">
+          <div class="setting-main">
+            <div class="setting-label">Factory reset</div>
+            <div class="setting-desc">
+              Wipes the database <em>and</em> clears the inbox for a truly fresh instance.
+            </div>
+          </div>
+          <button class="ghost danger" onclick={runFactoryReset} title="Delete memory.db, clear inbox, and restart the sidecar">
+            Factory reset
           </button>
         </div>
       </div>
@@ -1508,13 +1537,14 @@
     display: flex;
     align-items: flex-start;
     justify-content: center;
-    padding: 56px 24px;
+    padding: 24px;
     z-index: 100;
+    overflow-y: auto;
   }
   .modal {
     width: 100%;
     max-width: 860px;
-    max-height: calc(100vh - 112px);
+    max-height: calc(100vh - 48px);
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);

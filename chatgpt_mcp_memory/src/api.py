@@ -428,6 +428,44 @@ def nuke_db() -> Dict[str, Any]:
     return {"removed": removed, "missing": missing, "db_path": str(State.db_path)}
 
 
+@app.post("/factory-reset")
+def factory_reset() -> Dict[str, Any]:
+    """More aggressive reset than /nuke.
+
+    Deletes the database *and* clears the inbox directory contents.
+    The desktop app should restart the sidecar after calling this.
+    """
+    result = nuke_db()
+    inbox_removed: List[str] = []
+    inbox_missing: List[str] = []
+
+    try:
+        if not State.inbox.exists():
+            inbox_missing.append(str(State.inbox))
+        else:
+            # Remove children, not the inbox dir itself (so watchers/UX stay stable).
+            for child in list(State.inbox.iterdir()):
+                try:
+                    if child.is_dir():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
+                    inbox_removed.append(str(child))
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"failed to clear inbox item {child}: {e.__class__.__name__}: {e}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to clear inbox: {e.__class__.__name__}: {e}")
+
+    return {
+        **result,
+        "inbox": str(State.inbox),
+        "inbox_removed": inbox_removed,
+        "inbox_missing": inbox_missing,
+    }
+
+
 @app.get("/settings")
 def settings_endpoint() -> Dict[str, Any]:
     data = load_settings(State.data_dir)

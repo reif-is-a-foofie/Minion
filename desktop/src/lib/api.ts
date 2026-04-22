@@ -163,6 +163,17 @@ export async function nukeDb(): Promise<{ removed: string[]; missing: string[]; 
   return apiFetch("/nuke", { method: "POST" });
 }
 
+export async function factoryReset(): Promise<{
+  removed: string[];
+  missing: string[];
+  db_path: string;
+  inbox: string;
+  inbox_removed: string[];
+  inbox_missing: string[];
+}> {
+  return apiFetch("/factory-reset", { method: "POST" });
+}
+
 export type ConnState = "connecting" | "open" | "closed" | "unreachable";
 
 /// Connect to the sidecar's `/events` WebSocket with bounded retries.
