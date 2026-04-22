@@ -1,6 +1,6 @@
 {
   "name": "minion-desktop",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Minion desktop: drop-zone memory for your agents",
   "type": "module",
   "scripts": {
