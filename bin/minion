@@ -1055,7 +1055,7 @@ force = sys.argv[2] == '1'
 paths = [Path(p) for p in sys.argv[3:]]
 conn = connect(data_dir / DB_FILENAME)
 for p in paths:
-    res = ingest_file(conn, p, force=force)
+    res = ingest_file(conn, p, force=force, data_dir=data_dir, inbox=None)
     print(json.dumps({
         'path': res.path, 'source_id': res.source_id, 'kind': res.kind,
         'parser': res.parser, 'chunks': res.chunk_count,

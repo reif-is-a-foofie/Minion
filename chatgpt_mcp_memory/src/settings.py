@@ -11,6 +11,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
+from consent import merge_ambient_defaults
 from parsers import ALL_KINDS, set_disabled_kinds
 
 
@@ -55,7 +56,7 @@ def apply_settings(data: Dict[str, Any]) -> None:
 
 
 def _default() -> Dict[str, Any]:
-    return {"disabled_kinds": [], "telemetry_opt_out": False}
+    return {"disabled_kinds": [], "telemetry_opt_out": False, "ambient": merge_ambient_defaults({})}
 
 
 def _normalize(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -76,4 +77,5 @@ def _normalize(data: Dict[str, Any]) -> Dict[str, Any]:
     out.pop("analytics_opt_in", None)
     tot = out.get("telemetry_opt_out")
     out["telemetry_opt_out"] = bool(tot) if tot is not None else False
+    out["ambient"] = merge_ambient_defaults(out.get("ambient"))
     return out

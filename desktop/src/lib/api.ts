@@ -38,6 +38,8 @@ export type Source = {
   bytes: number;
   parser: string;
   updated_at: number;
+  /** Present when ambient consent was revoked for this DB source. */
+  revoked_at?: number | null;
   chunk_count?: number;
   meta?: Record<string, unknown>;
 };

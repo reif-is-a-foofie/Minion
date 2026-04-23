@@ -13,16 +13,24 @@ Endpoints:
   DELETE /sources                   -> body: {"path": "..."} OR {"source_id": "..."}
   POST /search                      -> body: {"query", "top_k", "kind"?, "path_glob"?, "role"?}
   GET  /search/stream               -> SSE: events `meta`, `hit` (JSON per line), `done`, optional `error`
-  GET  /identity/claims             -> list identity claims (optional ?status=&kind=)
-  POST /identity/claims/propose     -> same shape as MCP propose_identity_update
+  GET  /identity/claims             -> list identity claims (optional ?status=&kind=&layer=)
+  POST /identity/claims/propose     -> same shape as MCP propose_identity_update (+ optional layer, field)
   PATCH /identity/claims/{claim_id} -> {"status": "active"|"rejected"|...}
   GET  /identity/claims/{claim_id}/edges
+  GET  /identity/schema             -> ISA layer definitions + field keys
+  POST /identity/context            -> least-privilege claim subset (+ access log row)
+  GET  /identity/access-log         -> recent agent identity reads
   GET  /identity/summary            -> { "markdown": "..." }
   GET  /identity/clusters
   POST /identity/clusters/rebuild   -> run embedding clustering job
   POST /identity/export             -> write zip under data_dir/exports/
   GET  /chunks/{chunk_id}           -> one chunk for evidence drill-down
   GET  /capabilities                -> stable feature flags for local agent integrations
+  POST /crypto/setup                -> create passphrase-wrapped keyring (Phase 1)
+  POST /crypto/unlock               -> load DEK/L7K into sidecar memory
+  POST /crypto/lock                 -> drop in-memory keys
+  GET  /crypto/status               -> keyring present, unlocked, Layer0 sealed count, ambient settings
+  POST /sources/{source_id}/revoke  -> revoke source + consent + flag identity evidence withdrawn
   GET  /diagnostics/about           -> product blurb + privacy note (no secrets)
   GET  /diagnostics/log             -> JSON: redacted tail of ``MINION_LOG_FILE`` sidecar log
   GET  /diagnostics/log/text        -> plain text tail (paste into tickets)
@@ -40,6 +48,8 @@ Endpoints:
 Optional env:
   MINION_ANALYTICS_URL — HTTPS URL for anonymous analytics (overrides bundled default).
   MINION_DISABLE_REMOTE_ANALYTICS=1 — do not set a collector URL (fork / air-gapped builds).
+  MINION_EMBED_IDLE_SEC — positive float: drop cached embedding model after this many idle seconds.
+  MINION_EMBED_BATCH_SIZE — ingest embedding chunk size (default 64; lower reduces peak RAM).
 
 Run:
   python src/api.py --host 127.0.0.1 --port 8765
@@ -77,10 +87,22 @@ import diagnostics
 import telemetry
 import telemetry_feed
 import identity
+import identity_layers
+from ambient_session import attach_session, detach_session, get_session
+from ambient_vault import keyring_exists, setup_keyring, unlock_keyring
+from consent import merge_ambient_defaults, revoke_source_consent
+from layer0 import raw_events_dir
 from version import __version__
 from export_bundle import write_identity_export_zip
 from preference_cluster import run_preference_clustering
 from retrieval_bias import apply_identity_rerank, rrf_fuse
+from embed_runtime import (
+    embed_batch_size,
+    embed_idle_seconds,
+    touch_embedding_use,
+    unload_shared_embedding_caches_if_idle,
+)
+from process_title import apply_sidecar_title, data_dir_sha8
 from store import (
     DB_FILENAME,
     connect,
@@ -91,8 +113,10 @@ from store import (
     fts_available,
     get_chunk,
     get_source,
+    identity_access_log_list,
     identity_claim_get,
     identity_edges_for_claim,
+    source_set_revoked,
     keyword_search as store_keyword_search,
     list_sources,
     preference_clusters_list,
@@ -297,7 +321,12 @@ def _start_watcher() -> None:
             try:
                 bg_conn = connect(State.db_path)
                 try:
-                    reconcile_once(bg_conn, State.inbox, on_event=_watcher_event_bridge)
+                    reconcile_once(
+                        bg_conn,
+                        State.inbox,
+                        on_event=_watcher_event_bridge,
+                        data_dir=State.data_dir,
+                    )
                 finally:
                     bg_conn.close()
                 State.db_error = None
@@ -315,13 +344,19 @@ def _start_watcher() -> None:
         ).start()
 
         _watcher_thread = start_background(
-            _factory, State.inbox, on_event=_watcher_event_bridge
+            _factory,
+            State.inbox,
+            on_event=_watcher_event_bridge,
+            data_dir=State.data_dir,
         )
         if _watcher_thread is not None:
             _watcher_mode = "watchdog"
         else:
             _watcher_thread = start_polling_watcher(
-                _factory, State.inbox, on_event=_watcher_event_bridge
+                _factory,
+                State.inbox,
+                on_event=_watcher_event_bridge,
+                data_dir=State.data_dir,
             )
             _watcher_mode = "polling"
 
@@ -390,6 +425,16 @@ async def _lifespan(app: FastAPI):
         apply_settings(load_settings(State.data_dir))
     except Exception:
         log.exception("failed to load settings")
+    port = int(os.environ.get("MINION_API_PORT", "8765"))
+    apply_sidecar_title(port=port, data_dir=State.data_dir)
+    idle = embed_idle_seconds()
+    log.info(
+        "minion sidecar role=http port=%s data_dir_sha8=%s embed_idle_sec=%s embed_batch=%s",
+        port,
+        data_dir_sha8(State.data_dir),
+        idle if idle is not None else "off",
+        embed_batch_size(64),
+    )
     try:
         n_ext = load_user_extensions(State.data_dir)
         if n_ext:
@@ -513,6 +558,15 @@ class ConnectBody(BaseModel):
 class SettingsBody(BaseModel):
     disabled_kinds: Optional[List[str]] = None
     telemetry_opt_out: Optional[bool] = None
+    ambient: Optional[Dict[str, Any]] = None
+
+
+class CryptoSetupBody(BaseModel):
+    passphrase: str = Field(..., min_length=10, max_length=512)
+
+
+class CryptoUnlockBody(BaseModel):
+    passphrase: str = Field(..., min_length=1, max_length=512)
 
 
 class ReconcileBody(BaseModel):
@@ -527,6 +581,15 @@ class IdentityProposeBody(BaseModel):
     evidence_chunk_ids: Optional[List[str]] = None
     evidence_rationales: Optional[List[Optional[str]]] = None
     meta: Optional[Dict[str, Any]] = None
+    layer: Optional[int] = None
+    field: Optional[str] = None
+
+
+class IdentityContextBody(BaseModel):
+    agent_id: str = Field(..., min_length=1, max_length=200)
+    purpose: str = Field(..., min_length=3, max_length=2000)
+    requested_layers: List[int] = Field(..., min_length=1)
+    limit_per_layer: int = Field(default=24, ge=1, le=200)
 
 
 class IdentityPatchBody(BaseModel):
@@ -563,6 +626,8 @@ def nuke_db() -> Dict[str, Any]:
         State.data_dir / "telemetry.jsonl",
         State.data_dir / "telemetry.jsonl.1",
         State.data_dir / ".staging",
+        State.data_dir / "crypto",
+        State.data_dir / "memory",
     ]
     for p in candidates:
         try:
@@ -650,9 +715,82 @@ def update_settings(body: SettingsBody) -> Dict[str, Any]:
         current["disabled_kinds"] = body.disabled_kinds
     if body.telemetry_opt_out is not None:
         current["telemetry_opt_out"] = bool(body.telemetry_opt_out)
+    if body.ambient is not None:
+        current["ambient"] = merge_ambient_defaults(body.ambient)
     saved = save_settings(State.data_dir, current)
     apply_settings(saved)
     return {"settings": saved, "all_kinds": list(ALL_KINDS)}
+
+
+def _consent_key_for_source_kind(kind: str) -> Optional[str]:
+    return {
+        "chatgpt-export": "chatgpt_export",
+    }.get((kind or "").strip())
+
+
+@app.post("/crypto/setup")
+def crypto_setup(body: CryptoSetupBody) -> Dict[str, Any]:
+    """Create Argon2id-wrapped DEK/L7 keyring (Phase 1). Fails if keyring exists."""
+    try:
+        setup_keyring(State.data_dir, body.passphrase)
+    except FileExistsError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"{e.__class__.__name__}: {e}")
+    return {"ok": True, "keyring": str(State.data_dir / "crypto" / "keyring.json")}
+
+
+@app.post("/crypto/unlock")
+def crypto_unlock(body: CryptoUnlockBody) -> Dict[str, Any]:
+    """Derive MK, unwrap DEK/L7K into process memory for seal/decrypt operations."""
+    try:
+        sess = unlock_keyring(State.data_dir, body.passphrase)
+    except (FileNotFoundError, ValueError) as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"{e.__class__.__name__}: {e}")
+    attach_session(sess)
+    return {"ok": True, "unlocked": True}
+
+
+@app.post("/crypto/lock")
+def crypto_lock() -> Dict[str, Any]:
+    detach_session()
+    return {"ok": True, "unlocked": False}
+
+
+@app.get("/crypto/status")
+def crypto_status() -> Dict[str, Any]:
+    kr = keyring_exists(State.data_dir)
+    raw_dir = raw_events_dir(State.data_dir)
+    n = 0
+    try:
+        n = sum(1 for p in raw_dir.glob("*.sealed") if p.is_file())
+    except OSError:
+        pass
+    return {
+        "keyring_exists": kr,
+        "unlocked": get_session() is not None,
+        "layer0_sealed_count": n,
+        "ambient": merge_ambient_defaults(load_settings(State.data_dir).get("ambient")),
+    }
+
+
+@app.post("/sources/{source_id}/revoke")
+def revoke_source_endpoint(source_id: str) -> Dict[str, Any]:
+    """Mark DB source revoked; update consent; flag identity evidence-withdrawn."""
+    row = get_source(State.conn(), source_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="source not found")
+    source_set_revoked(State.conn(), source_id, revoked=True)
+    ck = _consent_key_for_source_kind(row.kind)
+    if ck:
+        cur = load_settings(State.data_dir)
+        save_settings(State.data_dir, revoke_source_consent(cur, ck))
+    n_flagged = identity.flag_claims_evidence_withdrawn_for_source(State.conn(), source_id)
+    State.conn().commit()
+    telemetry.log_event("source_revoke", source_id=source_id, claims_flagged=n_flagged)
+    return {"ok": True, "source_id": source_id, "claims_flagged": n_flagged}
 
 
 @app.post("/reconcile")
@@ -673,6 +811,7 @@ def reconcile_endpoint(body: ReconcileBody) -> Dict[str, Any]:
                     State.inbox,
                     force=force,
                     on_event=_watcher_event_bridge,
+                    data_dir=State.data_dir,
                 )
             finally:
                 conn.close()
@@ -715,7 +854,7 @@ def capabilities() -> Dict[str, Any]:
         "service": "minion-api",
         "product": "minion",
         "version": __version__,
-        "schema_version": 1,
+        "schema_version": 2,
         "auth": {
             "mutation_bearer": tok_on,
             "scheme": "Bearer",
@@ -746,6 +885,14 @@ def capabilities() -> Dict[str, Any]:
             "events_ws": "WS /events",
             "identity_claims": "GET /identity/claims",
             "identity_propose": "POST /identity/claims/propose",
+            "identity_schema": "GET /identity/schema",
+            "identity_context": "POST /identity/context",
+            "identity_access_log": "GET /identity/access-log",
+            "crypto_setup": "POST /crypto/setup",
+            "crypto_unlock": "POST /crypto/unlock",
+            "crypto_lock": "POST /crypto/lock",
+            "crypto_status": "GET /crypto/status",
+            "source_revoke": "POST /sources/{source_id}/revoke",
             "identity_export": "POST /identity/export",
             "clusters_rebuild": "POST /identity/clusters/rebuild",
             "diagnostics_about": "GET /diagnostics/about",
@@ -973,8 +1120,10 @@ _query_model_lock = threading.Lock()
 
 def _get_query_model():
     global _query_model
+    unload_shared_embedding_caches_if_idle()
     with _query_model_lock:
         if _query_model is not None:
+            touch_embedding_use()
             return _query_model
         from fastembed import TextEmbedding
         from store import get_meta
@@ -985,6 +1134,7 @@ def _get_query_model():
             or "sentence-transformers/all-MiniLM-L6-v2"
         )
         _query_model = TextEmbedding(model_name=name)
+        touch_embedding_use()
         return _query_model
 
 
@@ -1126,12 +1276,51 @@ def search_stream(
 def identity_claims_list(
     status: Optional[str] = None,
     kind: Optional[str] = None,
+    layer: Optional[int] = None,
     limit: int = 100,
 ) -> Dict[str, Any]:
-    rows, err = identity.list_claims(State.conn(), status=status, kind=kind, limit=limit)
+    rows, err = identity.list_claims(
+        State.conn(), status=status, kind=kind, layer=layer, limit=limit
+    )
     if err:
         raise HTTPException(status_code=400, detail=err)
     return {"claims": rows, "count": len(rows)}
+
+
+@app.get("/identity/schema")
+def identity_schema() -> Dict[str, Any]:
+    return identity.identity_schema_public()
+
+
+@app.post("/identity/context")
+def identity_context(request: Request, body: IdentityContextBody) -> Dict[str, Any]:
+    grants = identity_layers.parse_session_grants(
+        request.headers.get("X-Minion-Identity-Session-Grants")
+    )
+    payload, err = identity.grant_identity_context(
+        State.conn(),
+        agent_id=body.agent_id,
+        purpose=body.purpose,
+        requested_layers=body.requested_layers,
+        session_grants=grants,
+        limit_per_layer=body.limit_per_layer,
+    )
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    assert payload is not None
+    telemetry.log_event(
+        "identity_context",
+        access_log_id=payload.get("access_log_id"),
+        agent_id=body.agent_id,
+        granted_layers=payload.get("granted_layers"),
+    )
+    return payload
+
+
+@app.get("/identity/access-log")
+def identity_access_log(limit: int = 100) -> Dict[str, Any]:
+    rows = identity_access_log_list(State.conn(), limit=limit)
+    return {"entries": rows, "count": len(rows)}
 
 
 @app.get("/identity/claims/{claim_id}")
@@ -1161,6 +1350,8 @@ def identity_propose(body: IdentityProposeBody) -> Dict[str, Any]:
         evidence_chunk_ids=body.evidence_chunk_ids,
         evidence_rationales=body.evidence_rationales,
         meta=body.meta,
+        layer=body.layer,
+        field=body.field,
     )
     if err:
         raise HTTPException(status_code=400, detail=err)
@@ -1405,7 +1596,9 @@ async def ingest_endpoint(body: IngestBody) -> Dict[str, Any]:
             def _work_one(p: Path) -> Dict[str, Any]:
                 conn = connect(State.db_path)
                 try:
-                    res = ingest_file(conn, p)
+                    res = ingest_file(
+                        conn, p, data_dir=State.data_dir, inbox=State.inbox
+                    )
                     return {
                         "path": res.path,
                         "source_id": res.source_id,
@@ -1481,7 +1674,9 @@ async def ingest_endpoint(body: IngestBody) -> Dict[str, Any]:
         def _work() -> Dict[str, Any]:
             conn = connect(State.db_path)
             try:
-                res = ingest_file(conn, dest)
+                res = ingest_file(
+                    conn, dest, data_dir=State.data_dir, inbox=State.inbox
+                )
                 return {
                     "path": res.path,
                     "source_id": res.source_id,
@@ -1797,6 +1992,7 @@ def main() -> int:
     p.add_argument("--port", type=int, default=int(os.environ.get("MINION_API_PORT", "8765")))
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
+    os.environ["MINION_API_PORT"] = str(args.port)
 
     # Default: log to stderr. If MINION_LOG_FILE is set (desktop app), also
     # write to a rotating file so users can debug first-launch issues.

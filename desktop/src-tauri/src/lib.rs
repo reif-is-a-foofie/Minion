@@ -745,6 +745,11 @@ fn allocate_sidecar_port_ephemeral() -> Option<u16> {
 
 /// Port the sidecar should bind on for this app instance.
 ///
+/// Product note: one Minion.app session normally owns one HTTP sidecar child
+/// (`spawn_sidecar`). A *fixed* `MINION_API_PORT` is for dev or deliberate
+/// multi-instance setups; otherwise prefer unset so each launch can pick a free
+/// port and `resolve_sidecar_port` can SIGTERM stale `api.py` on that port.
+///
 /// - **`MINION_NEW_API_PORT`** (truthy) — prefer a fresh verified ephemeral
 ///   port even if `MINION_API_PORT` is set; on failure fall through to the rules
 ///   below (escape hatch when the fixed port is wedged).

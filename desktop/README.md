@@ -68,6 +68,12 @@ Dev quirks:
 - The Rust shell looks for `../chatgpt_mcp_memory/.venv/bin/python`; if absent
   it falls back to `python3` on `PATH`.
 - The sidecar binds `127.0.0.1:8765`. Override with `MINION_API_PORT`.
+- **One app per data dir:** leave `MINION_API_PORT` unset for normal use so each
+  launch picks a free loopback port and can reclaim stale `api.py` PIDs on that
+  port. Setting a **fixed** `MINION_API_PORT` is for intentional second instances
+  or automation; two desktop sessions on the same port + dir risk confusion.
+  Restart from the app (or `resolve_sidecar_port` in `src-tauri/src/lib.rs`) kills
+  orphaned `api.py --port …` for the chosen port before spawn.
 - Override data location with `MINION_DATA_DIR=/path`.
 - Disable the background watcher with `MINION_DISABLE_WATCHER=1` (useful
   when iterating on ingest logic).
@@ -76,6 +82,9 @@ Dev quirks:
   Override with `MINION_ANALYTICS_URL`, or disable entirely with
   `MINION_DISABLE_REMOTE_ANALYTICS=1`. Users turn off sending under **Settings → Support**.
   Payloads are coarse counters only (`chatgpt_mcp_memory/src/analytics_remote.py`).
+- **RAM / processes:** see [`../chatgpt_mcp_memory/docs/process-hygiene.md`](../chatgpt_mcp_memory/docs/process-hygiene.md)
+  (Multipass VM name clash, stale sidecars, optional `MINION_EMBED_IDLE_SEC` /
+  `MINION_EMBED_BATCH_SIZE`).
 
 ## Release zips: Intel vs Apple Silicon
 

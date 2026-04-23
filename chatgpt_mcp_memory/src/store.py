@@ -60,6 +60,7 @@ class Source:
     parser: str
     meta: Dict[str, Any]
     updated_at: float
+    revoked_at: Optional[float] = None
 
 
 @dataclass
@@ -101,7 +102,8 @@ CREATE TABLE IF NOT EXISTS sources (
     bytes       INTEGER NOT NULL,
     parser      TEXT NOT NULL,
     meta_json   TEXT NOT NULL DEFAULT '{}',
-    updated_at  REAL NOT NULL
+    updated_at  REAL NOT NULL,
+    revoked_at  REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_sources_kind ON sources(kind);
@@ -142,12 +144,16 @@ CREATE TABLE IF NOT EXISTS identity_claims (
     updated_at    REAL NOT NULL,
     superseded_by TEXT,
     meta_json     TEXT NOT NULL DEFAULT '{}',
+    layer         INTEGER,
+    field         TEXT,
+    last_reinforced_at REAL,
     FOREIGN KEY (superseded_by) REFERENCES identity_claims(claim_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_identity_claims_status ON identity_claims(status);
 CREATE INDEX IF NOT EXISTS idx_identity_claims_kind ON identity_claims(kind);
 CREATE INDEX IF NOT EXISTS idx_identity_claims_updated ON identity_claims(updated_at);
+CREATE INDEX IF NOT EXISTS idx_identity_claims_layer ON identity_claims(layer);
 
 CREATE TABLE IF NOT EXISTS identity_edges (
     edge_id     TEXT PRIMARY KEY,
@@ -160,6 +166,20 @@ CREATE TABLE IF NOT EXISTS identity_edges (
 
 CREATE INDEX IF NOT EXISTS idx_identity_edges_claim ON identity_edges(claim_id);
 CREATE INDEX IF NOT EXISTS idx_identity_edges_chunk ON identity_edges(chunk_id);
+
+CREATE TABLE IF NOT EXISTS identity_access_log (
+    log_id                  TEXT PRIMARY KEY,
+    created_at              REAL NOT NULL,
+    agent_id                TEXT NOT NULL,
+    purpose                 TEXT NOT NULL,
+    requested_layers_json   TEXT NOT NULL,
+    granted_layers_json     TEXT NOT NULL,
+    denied_layers_json      TEXT NOT NULL,
+    claim_ids_json          TEXT NOT NULL,
+    meta_json               TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_identity_access_log_created ON identity_access_log(created_at);
 
 CREATE TABLE IF NOT EXISTS preference_clusters (
     cluster_id              TEXT PRIMARY KEY,
@@ -324,8 +344,77 @@ def _verify_connection(conn: sqlite3.Connection) -> None:
         raise sqlite3.OperationalError(f"PRAGMA quick_check: {row[0]}")
 
 
+def _ensure_identity_isa_schema(conn: sqlite3.Connection) -> None:
+    """Upgrade identity_claims + identity_access_log on existing DBs."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS identity_access_log (
+            log_id                  TEXT PRIMARY KEY,
+            created_at              REAL NOT NULL,
+            agent_id                TEXT NOT NULL,
+            purpose                 TEXT NOT NULL,
+            requested_layers_json   TEXT NOT NULL,
+            granted_layers_json     TEXT NOT NULL,
+            denied_layers_json      TEXT NOT NULL,
+            claim_ids_json          TEXT NOT NULL,
+            meta_json               TEXT NOT NULL DEFAULT '{}'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_identity_access_log_created "
+        "ON identity_access_log(created_at)"
+    )
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(identity_claims)")}
+    if "layer" not in cols:
+        conn.execute("ALTER TABLE identity_claims ADD COLUMN layer INTEGER")
+    if "field" not in cols:
+        conn.execute("ALTER TABLE identity_claims ADD COLUMN field TEXT")
+    if "last_reinforced_at" not in cols:
+        conn.execute("ALTER TABLE identity_claims ADD COLUMN last_reinforced_at REAL")
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_identity_claims_layer ON identity_claims(layer)"
+        )
+    except sqlite3.OperationalError:
+        pass
+    # One-time backfill: map legacy kind → ISA layer when layer is null.
+    conn.execute(
+        "UPDATE identity_claims SET layer = 1 WHERE layer IS NULL AND kind = 'fact'"
+    )
+    conn.execute(
+        "UPDATE identity_claims SET layer = 2 WHERE layer IS NULL AND kind IN ('value', 'boundary')"
+    )
+    conn.execute(
+        "UPDATE identity_claims SET layer = 3 WHERE layer IS NULL AND kind = 'goal'"
+    )
+    conn.execute(
+        "UPDATE identity_claims SET layer = 4 WHERE layer IS NULL AND kind = 'relationship'"
+    )
+    conn.execute(
+        "UPDATE identity_claims SET layer = 5 WHERE layer IS NULL AND kind = 'pattern'"
+    )
+    conn.execute(
+        "UPDATE identity_claims SET layer = 6 WHERE layer IS NULL AND kind = 'preference'"
+    )
+    conn.execute(
+        "UPDATE identity_claims SET layer = 7 WHERE layer IS NULL AND kind = 'sensitive'"
+    )
+    conn.execute(
+        "UPDATE identity_claims SET layer = 3 WHERE layer IS NULL"
+    )
+
+
+def _ensure_sources_revoked_schema(conn: sqlite3.Connection) -> None:
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(sources)")}
+    if "revoked_at" not in cols:
+        conn.execute("ALTER TABLE sources ADD COLUMN revoked_at REAL")
+
+
 def _bootstrap_schema(conn: sqlite3.Connection, embed_dim: int) -> None:
     conn.executescript(_SCHEMA_SQL)
+    _ensure_identity_isa_schema(conn)
+    _ensure_sources_revoked_schema(conn)
     _ensure_vec_table(conn, embed_dim)
     _ensure_fts_table(conn)
 
@@ -573,7 +662,7 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
 
 def get_source_by_path(conn: sqlite3.Connection, path: str) -> Optional[Source]:
     row = conn.execute(
-        "SELECT source_id, path, kind, sha256, mtime, bytes, parser, meta_json, updated_at "
+        "SELECT source_id, path, kind, sha256, mtime, bytes, parser, meta_json, updated_at, revoked_at "
         "FROM sources WHERE path=?",
         (path,),
     ).fetchone()
@@ -582,7 +671,7 @@ def get_source_by_path(conn: sqlite3.Connection, path: str) -> Optional[Source]:
 
 def get_source(conn: sqlite3.Connection, source_id: str) -> Optional[Source]:
     row = conn.execute(
-        "SELECT source_id, path, kind, sha256, mtime, bytes, parser, meta_json, updated_at "
+        "SELECT source_id, path, kind, sha256, mtime, bytes, parser, meta_json, updated_at, revoked_at "
         "FROM sources WHERE source_id=?",
         (source_id,),
     ).fetchone()
@@ -599,7 +688,7 @@ def list_sources(
 ) -> List[Dict[str, Any]]:
     sql = [
         "SELECT s.source_id, s.path, s.kind, s.sha256, s.mtime, s.bytes, s.parser, "
-        "s.meta_json, s.updated_at, "
+        "s.meta_json, s.updated_at, s.revoked_at, "
         "(SELECT COUNT(*) FROM chunks c WHERE c.source_id=s.source_id) AS chunk_count "
         "FROM sources s WHERE 1=1"
     ]
@@ -630,6 +719,7 @@ def list_sources(
                 "parser": r["parser"],
                 "meta": json.loads(r["meta_json"] or "{}"),
                 "updated_at": r["updated_at"],
+                "revoked_at": float(r["revoked_at"]) if r["revoked_at"] is not None else None,
                 "chunk_count": int(r["chunk_count"]),
             }
         )
@@ -637,6 +727,12 @@ def list_sources(
 
 
 def _row_to_source(row: sqlite3.Row) -> Source:
+    rev = None
+    try:
+        if row["revoked_at"] is not None:
+            rev = float(row["revoked_at"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        rev = None
     return Source(
         source_id=row["source_id"],
         path=row["path"],
@@ -647,7 +743,21 @@ def _row_to_source(row: sqlite3.Row) -> Source:
         parser=row["parser"],
         meta=json.loads(row["meta_json"] or "{}"),
         updated_at=row["updated_at"],
+        revoked_at=rev,
     )
+
+
+def source_set_revoked(conn: sqlite3.Connection, source_id: str, *, revoked: bool = True) -> bool:
+    """Mark source revoked (ambient consent withdrawn). Returns False if missing."""
+    row = conn.execute("SELECT 1 FROM sources WHERE source_id=?", (source_id,)).fetchone()
+    if not row:
+        return False
+    now = time.time()
+    conn.execute(
+        "UPDATE sources SET revoked_at=?, updated_at=? WHERE source_id=?",
+        (now if revoked else None, now, source_id),
+    )
+    return True
 
 
 def delete_source(conn: sqlite3.Connection, source_id: str) -> int:
@@ -715,8 +825,8 @@ def upsert_source(
         conn.execute("DELETE FROM sources WHERE source_id=?", (sid,))
 
         conn.execute(
-            "INSERT INTO sources(source_id, path, kind, sha256, mtime, bytes, parser, meta_json, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sources(source_id, path, kind, sha256, mtime, bytes, parser, meta_json, updated_at, revoked_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
             (
                 sid,
                 path,
@@ -793,7 +903,7 @@ def search(
         f"SELECT c.rowid AS rid, c.chunk_id, c.source_id, c.role, c.text, c.meta_json, "
         f"s.path, s.kind, s.mtime, s.meta_json AS source_meta_json "
         f"FROM chunks c JOIN sources s ON s.source_id = c.source_id "
-        f"WHERE c.rowid IN ({placeholders})"
+        f"WHERE c.rowid IN ({placeholders}) AND s.revoked_at IS NULL"
     ]
     params: List[Any] = list(rowids)
     if role:
@@ -839,14 +949,14 @@ def search(
 def get_chunk(conn: sqlite3.Connection, chunk_id: str) -> Optional[Dict[str, Any]]:
     row = conn.execute(
         "SELECT c.chunk_id, c.source_id, c.role, c.text, c.meta_json, "
-        "s.path, s.kind, s.mtime, s.meta_json AS source_meta_json "
+        "s.path, s.kind, s.mtime, s.meta_json AS source_meta_json, s.revoked_at AS source_revoked_at "
         "FROM chunks c JOIN sources s ON s.source_id=c.source_id "
         "WHERE c.chunk_id=?",
         (chunk_id,),
     ).fetchone()
     if not row:
         return None
-    return {
+    out = {
         "chunk_id": row["chunk_id"],
         "source_id": row["source_id"],
         "role": row["role"],
@@ -857,6 +967,12 @@ def get_chunk(conn: sqlite3.Connection, chunk_id: str) -> Optional[Dict[str, Any
         "meta": json.loads(row["meta_json"] or "{}"),
         "source_meta": json.loads(row["source_meta_json"] or "{}"),
     }
+    try:
+        if row["source_revoked_at"] is not None:
+            out["source_revoked_at"] = float(row["source_revoked_at"])
+    except (KeyError, TypeError, ValueError):
+        pass
+    return out
 
 
 def browse_chunks_chronological(
@@ -885,7 +1001,8 @@ def browse_chunks_chronological(
         "s.path, s.kind, s.mtime, s.meta_json AS source_meta_json, "
         "json_extract(c.meta_json, '$.create_time') AS ctime "
         "FROM chunks c JOIN sources s ON s.source_id = c.source_id "
-        "WHERE json_extract(c.meta_json, '$.create_time') IS NOT NULL"
+        "WHERE json_extract(c.meta_json, '$.create_time') IS NOT NULL "
+        "AND s.revoked_at IS NULL"
     ]
     params: List[Any] = []
     if role:
@@ -962,7 +1079,7 @@ def keyword_search(
         "FROM fts_chunks "
         "JOIN chunks c ON c.rowid = fts_chunks.rowid "
         "JOIN sources s ON s.source_id = c.source_id "
-        "WHERE fts_chunks MATCH ?"
+        "WHERE fts_chunks MATCH ? AND s.revoked_at IS NULL"
     ]
     params: List[Any] = [_fts5_sanitize(query)]
     if role:
@@ -1043,7 +1160,9 @@ def list_conversations(
         "MIN(json_extract(c.meta_json, '$.create_time')) AS first_ts, "
         "MAX(json_extract(c.meta_json, '$.create_time')) AS last_ts, "
         "COUNT(*) AS msg_count "
-        "FROM chunks c WHERE json_extract(c.meta_json, '$.conversation_id') IS NOT NULL"
+        "FROM chunks c JOIN sources s ON s.source_id = c.source_id "
+        "WHERE json_extract(c.meta_json, '$.conversation_id') IS NOT NULL "
+        "AND s.revoked_at IS NULL"
     ]
     params: List[Any] = []
     if title_like:
@@ -1095,6 +1214,7 @@ def get_conversation_chunks(
         "s.path, s.kind, s.mtime "
         "FROM chunks c JOIN sources s ON s.source_id = c.source_id "
         "WHERE json_extract(c.meta_json, '$.conversation_id') = ? "
+        "AND s.revoked_at IS NULL "
         "ORDER BY json_extract(c.meta_json, '$.create_time') ASC, c.seq ASC "
         "LIMIT ?",
         (conversation_id, int(max(1, limit))),
@@ -1144,7 +1264,7 @@ def iter_source_ids(conn: sqlite3.Connection) -> Iterable[Tuple[str, str, str, f
 
 
 def _row_identity_claim(row: sqlite3.Row) -> Dict[str, Any]:
-    return {
+    out: Dict[str, Any] = {
         "claim_id": row["claim_id"],
         "kind": row["kind"],
         "text": row["text"],
@@ -1156,6 +1276,23 @@ def _row_identity_claim(row: sqlite3.Row) -> Dict[str, Any]:
         "superseded_by": row["superseded_by"],
         "meta": json.loads(row["meta_json"] or "{}"),
     }
+    try:
+        out["layer"] = int(row["layer"]) if row["layer"] is not None else None
+    except (KeyError, TypeError, ValueError):
+        out["layer"] = None
+    try:
+        out["field"] = row["field"]
+    except (KeyError, IndexError):
+        out["field"] = None
+    try:
+        out["last_reinforced_at"] = (
+            float(row["last_reinforced_at"])
+            if row["last_reinforced_at"] is not None
+            else None
+        )
+    except (KeyError, TypeError, ValueError):
+        out["last_reinforced_at"] = None
+    return out
 
 
 def identity_claim_insert(
@@ -1168,12 +1305,16 @@ def identity_claim_insert(
     confidence: Optional[float] = None,
     source_agent: Optional[str] = None,
     meta: Optional[Dict[str, Any]] = None,
+    layer: Optional[int] = None,
+    field: Optional[str] = None,
+    last_reinforced_at: Optional[float] = None,
 ) -> None:
     now = time.time()
     conn.execute(
         "INSERT INTO identity_claims(claim_id, kind, text, status, confidence, "
-        "source_agent, created_at, updated_at, superseded_by, meta_json) "
-        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+        "source_agent, created_at, updated_at, superseded_by, meta_json, layer, field, "
+        "last_reinforced_at) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
         (
             claim_id,
             kind,
@@ -1184,6 +1325,9 @@ def identity_claim_insert(
             now,
             now,
             json.dumps(meta or {}, ensure_ascii=False),
+            layer,
+            field,
+            last_reinforced_at,
         ),
     )
 
@@ -1191,7 +1335,7 @@ def identity_claim_insert(
 def identity_claim_get(conn: sqlite3.Connection, claim_id: str) -> Optional[Dict[str, Any]]:
     row = conn.execute(
         "SELECT claim_id, kind, text, status, confidence, source_agent, "
-        "created_at, updated_at, superseded_by, meta_json "
+        "created_at, updated_at, superseded_by, meta_json, layer, field, last_reinforced_at "
         "FROM identity_claims WHERE claim_id=?",
         (claim_id,),
     ).fetchone()
@@ -1203,11 +1347,12 @@ def identity_claim_list(
     *,
     status: Optional[str] = None,
     kind: Optional[str] = None,
+    layer: Optional[int] = None,
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
     sql = (
         "SELECT claim_id, kind, text, status, confidence, source_agent, "
-        "created_at, updated_at, superseded_by, meta_json "
+        "created_at, updated_at, superseded_by, meta_json, layer, field, last_reinforced_at "
         "FROM identity_claims WHERE 1=1"
     )
     params: List[Any] = []
@@ -1217,6 +1362,9 @@ def identity_claim_list(
     if kind:
         sql += " AND kind=?"
         params.append(kind)
+    if layer is not None:
+        sql += " AND layer=?"
+        params.append(int(layer))
     sql += " ORDER BY updated_at DESC LIMIT ?"
     params.append(int(max(1, min(limit, 2000))))
     return [_row_identity_claim(r) for r in conn.execute(sql, params).fetchall()]
@@ -1277,6 +1425,65 @@ def identity_edges_for_claim(conn: sqlite3.Connection, claim_id: str) -> List[Di
     ]
 
 
+def identity_access_log_insert(
+    conn: sqlite3.Connection,
+    *,
+    log_id: str,
+    agent_id: str,
+    purpose: str,
+    requested_layers: Sequence[int],
+    granted_layers: Sequence[int],
+    denied_layers: Sequence[int],
+    claim_ids: Sequence[str],
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    now = time.time()
+    conn.execute(
+        "INSERT INTO identity_access_log(log_id, created_at, agent_id, purpose, "
+        "requested_layers_json, granted_layers_json, denied_layers_json, claim_ids_json, meta_json) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            log_id,
+            now,
+            agent_id,
+            purpose,
+            json.dumps(list(requested_layers), ensure_ascii=False),
+            json.dumps(list(granted_layers), ensure_ascii=False),
+            json.dumps(list(denied_layers), ensure_ascii=False),
+            json.dumps(list(claim_ids), ensure_ascii=False),
+            json.dumps(meta or {}, ensure_ascii=False),
+        ),
+    )
+
+
+def identity_access_log_list(
+    conn: sqlite3.Connection, *, limit: int = 100
+) -> List[Dict[str, Any]]:
+    lim = int(max(1, min(limit, 500)))
+    rows = conn.execute(
+        "SELECT log_id, created_at, agent_id, purpose, requested_layers_json, "
+        "granted_layers_json, denied_layers_json, claim_ids_json, meta_json "
+        "FROM identity_access_log ORDER BY created_at DESC LIMIT ?",
+        (lim,),
+    ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "log_id": r["log_id"],
+                "created_at": float(r["created_at"]),
+                "agent_id": r["agent_id"],
+                "purpose": r["purpose"],
+                "requested_layers": json.loads(r["requested_layers_json"] or "[]"),
+                "granted_layers": json.loads(r["granted_layers_json"] or "[]"),
+                "denied_layers": json.loads(r["denied_layers_json"] or "[]"),
+                "claim_ids": json.loads(r["claim_ids_json"] or "[]"),
+                "meta": json.loads(r["meta_json"] or "{}"),
+            }
+        )
+    return out
+
+
 def preference_clusters_clear(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM preference_clusters")
 
@@ -1331,6 +1538,8 @@ def iter_chunk_embedding_rows(
     rows = conn.execute(
         "SELECT c.chunk_id, c.text, v.embedding AS emb "
         "FROM chunks c JOIN vec_chunks v ON v.rowid = c.rowid "
+        "JOIN sources s ON s.source_id = c.source_id "
+        "WHERE s.revoked_at IS NULL "
         "ORDER BY RANDOM() LIMIT ?",
         (int(max(1, limit)),),
     ).fetchall()

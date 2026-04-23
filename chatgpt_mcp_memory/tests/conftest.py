@@ -18,6 +18,11 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Tests import sibling modules (`ingest`, `api`, …) the same way the sidecar does.
+_SRC = Path(__file__).resolve().parent.parent / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 from typing import Any, Dict, List, Optional
 
 import httpx

@@ -179,6 +179,7 @@ def reconcile_once(
     *,
     force: bool = False,
     on_event: Optional[Callable[[str, Dict[str, object]], None]] = None,
+    data_dir: Optional[Path] = None,
 ) -> ReconcileReport:
     """
     Walk the inbox, sync each file to DB, delete DB rows for files that
@@ -188,13 +189,23 @@ def reconcile_once(
     inbox.mkdir(parents=True, exist_ok=True)
     report = ReconcileReport()
 
+    from ingest import infer_data_dir_for_inbox
+
+    resolved_data_dir = data_dir if data_dir is not None else infer_data_dir_for_inbox(inbox)
+
     # ChatGPT export directories are single logical sources. Ingest each one
     # as a whole, then exclude their internal files from the per-file walk so
     # the generic text parser doesn't shred the per-conversation JSONs.
     export_dirs: List[Path] = [d.resolve() for d in _find_chatgpt_export_dirs(inbox)]
     for export_dir in export_dirs:
         try:
-            res = ingest_file(conn, export_dir, force=force)
+            res = ingest_file(
+                conn,
+                export_dir,
+                force=force,
+                data_dir=resolved_data_dir,
+                inbox=inbox,
+            )
         except Exception:
             log.exception("chatgpt-export ingest failed: %s", export_dir)
             report.errors += 1
@@ -271,7 +282,13 @@ def reconcile_once(
             kwargs = {"force": force}
             if on_event:
                 kwargs["on_progress"] = _file_progress  # type: ignore[assignment]
-            res = ingest_file(conn, p, **kwargs)
+            res = ingest_file(
+                conn,
+                p,
+                data_dir=resolved_data_dir,
+                inbox=inbox,
+                **kwargs,
+            )
         except Exception as e:  # pragma: no cover - defensive
             log.exception("ingest failed: %s", p)
             report.errors += 1
@@ -366,6 +383,7 @@ def start_background(
     *,
     debounce: float = DEFAULT_DEBOUNCE_SEC,
     on_event: Optional[Callable[[str, Dict[str, object]], None]] = None,
+    data_dir: Optional[Path] = None,
 ) -> Optional[threading.Thread]:
     """
     Start the watcher in a background daemon thread.
@@ -381,6 +399,10 @@ def start_background(
 
     inbox = Path(inbox).expanduser().resolve()
     inbox.mkdir(parents=True, exist_ok=True)
+
+    from ingest import infer_data_dir_for_inbox
+
+    resolved_dd = data_dir if data_dir is not None else infer_data_dir_for_inbox(inbox)
 
     def _emit(kind: str, payload: Dict[str, object]) -> None:
         if on_event is None:
@@ -453,7 +475,13 @@ def start_background(
                     _emit("file_progress", payload)
 
                 try:
-                    res = ingest_file(conn, export_dir, on_progress=_export_progress)
+                    res = ingest_file(
+                        conn,
+                        export_dir,
+                        on_progress=_export_progress,
+                        data_dir=resolved_dd,
+                        inbox=inbox,
+                    )
                     if not res.skipped:
                         log.info(
                             "live ingested export dir %s kind=%s parser=%s chunks=%d",
@@ -493,7 +521,13 @@ def start_background(
                     _emit("file_progress", payload)
 
                 try:
-                    res = ingest_file(conn, p, on_progress=_file_progress)
+                    res = ingest_file(
+                        conn,
+                        p,
+                        on_progress=_file_progress,
+                        data_dir=resolved_dd,
+                        inbox=inbox,
+                    )
                     if not res.skipped:
                         log.info(
                             "live ingested %s kind=%s parser=%s chunks=%d",
@@ -571,10 +605,15 @@ def start_polling_watcher(
     *,
     interval_sec: float = 30.0,
     on_event: Optional[Callable[[str, Dict[str, object]], None]] = None,
+    data_dir: Optional[Path] = None,
 ) -> threading.Thread:
     """Scan the inbox on a fixed interval when live filesystem watching is unavailable."""
     inbox = Path(inbox).expanduser().resolve()
     inbox.mkdir(parents=True, exist_ok=True)
+
+    from ingest import infer_data_dir_for_inbox
+
+    resolved_dd = data_dir if data_dir is not None else infer_data_dir_for_inbox(inbox)
 
     def _run() -> None:
         log.warning(
@@ -586,7 +625,7 @@ def start_polling_watcher(
             try:
                 conn = conn_factory()
                 try:
-                    reconcile_once(conn, inbox, on_event=on_event)
+                    reconcile_once(conn, inbox, on_event=on_event, data_dir=resolved_dd)
                 finally:
                     conn.close()
             except Exception as e:
@@ -637,7 +676,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     inbox = Path(args.inbox).expanduser().resolve() if args.inbox else _default_inbox(data_dir)
 
     conn = connect(db_path)
-    report = reconcile_once(conn, inbox, force=args.force)
+    report = reconcile_once(conn, inbox, force=args.force, data_dir=data_dir)
     sys.stderr.write(
         f"reconcile: added={report.added} deleted={report.deleted} "
         f"skipped={report.skipped} errors={report.errors}\n"
@@ -657,7 +696,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         try:
             while True:
                 time.sleep(30)
-                reconcile_once(conn, inbox)
+                reconcile_once(conn, inbox, data_dir=data_dir)
         except KeyboardInterrupt:
             return 0
     try:

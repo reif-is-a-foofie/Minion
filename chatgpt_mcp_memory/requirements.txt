@@ -14,3 +14,6 @@ uvicorn>=0.30
 # uvicorn needs an explicit WebSocket protocol impl; without it, /events 404s silently.
 websockets>=12.0
 pydantic>=2.7
+# Ambient PRD Phase 1: Argon2id (MK) + AES-256-GCM (DEK/L7K, Layer 0 blobs).
+argon2-cffi>=23.1.0
+cryptography>=42.0.0

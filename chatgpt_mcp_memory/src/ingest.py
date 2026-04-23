@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -33,6 +34,26 @@ from parsers import (
 )
 from store import sha256_of_file, upsert_source
 import telemetry
+from embed_runtime import (
+    embed_batch_size,
+    touch_embedding_use,
+    unload_shared_embedding_caches_if_idle,
+)
+
+log = logging.getLogger("minion.ingest")
+
+
+def infer_data_dir_for_inbox(inbox: Path) -> Optional[Path]:
+    """Resolve data_dir from MINION_DATA_DIR or default layout (inbox sibling ``data``)."""
+    env = (os.environ.get("MINION_DATA_DIR") or "").strip()
+    if env:
+        p = Path(env).expanduser().resolve()
+        return p if p.is_dir() or p.parent.is_dir() else None
+    inbox_r = Path(inbox).expanduser().resolve()
+    cand = inbox_r.parent / "data"
+    if cand.is_dir():
+        return cand
+    return None
 
 
 def _chatgpt_export_manifest_paths(root: Path) -> List[Path]:
@@ -202,13 +223,16 @@ _MODEL_NAME: Optional[str] = None
 def _get_model(name: str):
     """Cache the fastembed model. Safe to call from multiple threads."""
     global _MODEL, _MODEL_NAME
+    unload_shared_embedding_caches_if_idle()
     with _MODEL_LOCK:
         if _MODEL is not None and _MODEL_NAME == name:
+            touch_embedding_use()
             return _MODEL
         from fastembed import TextEmbedding
 
         _MODEL = TextEmbedding(model_name=name)
         _MODEL_NAME = name
+        touch_embedding_use()
         return _MODEL
 
 
@@ -227,18 +251,19 @@ def _embed(
     model,
     texts: List[str],
     *,
-    batch_size: int = 64,
+    batch_size: Optional[int] = None,
     on_progress: ProgressFn = _noop,
 ) -> np.ndarray:
     if not texts:
         return np.zeros((0, 384), dtype=np.float32)
+    bs = embed_batch_size(64) if batch_size is None else max(1, min(int(batch_size), 256))
     out: List[np.ndarray] = []
     total = len(texts)
     i = 0
     on_progress("embed", {"done": 0, "total": total})
     while i < total:
-        batch = texts[i : i + batch_size]
-        vecs = list(model.embed(batch, batch_size=batch_size))
+        batch = texts[i : i + bs]
+        vecs = list(model.embed(batch, batch_size=bs))
         out.append(np.asarray(vecs, dtype=np.float32))
         i += len(batch)
         on_progress("embed", {"done": i, "total": total})
@@ -376,6 +401,8 @@ def ingest_file(
     model_name: Optional[str] = None,
     force: bool = False,
     on_progress: ProgressFn = _noop,
+    data_dir: Optional[Path] = None,
+    inbox: Optional[Path] = None,
 ) -> IngestResult:
     """Public ingest entrypoint. Wraps the pipeline with telemetry.
 
@@ -384,7 +411,13 @@ def ingest_file(
     whether it was triggered by the watcher, the CLI, or `bin/minion add`.
     """
     result = _ingest_file_inner(
-        conn, path, model_name=model_name, force=force, on_progress=on_progress
+        conn,
+        path,
+        model_name=model_name,
+        force=force,
+        on_progress=on_progress,
+        data_dir=data_dir,
+        inbox=inbox,
     )
     try:
         telemetry.log_event(
@@ -413,6 +446,8 @@ def _ingest_file_inner(
     model_name: Optional[str] = None,
     force: bool = False,
     on_progress: ProgressFn = _noop,
+    data_dir: Optional[Path] = None,
+    inbox: Optional[Path] = None,
 ) -> IngestResult:
     """Parse + embed + upsert. Skips unchanged files (same sha256) unless force=True."""
     path = Path(path).expanduser().resolve()
@@ -426,7 +461,13 @@ def _ingest_file_inner(
     if path.is_dir():
         if _looks_like_chatgpt_export(path):
             return _ingest_chatgpt_export_dir(
-                conn, path, model_name=model_name, force=force, on_progress=on_progress
+                conn,
+                path,
+                model_name=model_name,
+                force=force,
+                on_progress=on_progress,
+                data_dir=data_dir,
+                inbox=inbox,
             )
         return IngestResult(spath, None, "?", "?", 0, True, reason="directory (not a recognized export)")
 
@@ -521,6 +562,8 @@ def _ingest_chatgpt_export_dir(
     model_name: Optional[str],
     force: bool,
     on_progress: ProgressFn,
+    data_dir: Optional[Path] = None,
+    inbox: Optional[Path] = None,
 ) -> IngestResult:
     """Ingest a ChatGPT export directory as a single logical source.
 
@@ -589,6 +632,21 @@ def _ingest_chatgpt_export_dir(
         chunks=chunk_tuples,
         embeddings=embeddings,
     )
+
+    if data_dir is not None:
+        try:
+            from ambient_pipeline import maybe_seal_chatgpt_export_after_ingest
+
+            maybe_seal_chatgpt_export_after_ingest(
+                conn,
+                Path(data_dir),
+                path,
+                source_id=source_id,
+                ingest_digest=digest,
+                inbox=inbox,
+            )
+        except Exception:
+            log.exception("ambient seal hook failed for %s", spath)
 
     return IngestResult(
         path=spath,

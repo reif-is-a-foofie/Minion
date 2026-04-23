@@ -9,7 +9,7 @@ import sys
 import threading
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 
@@ -40,6 +40,8 @@ from store import (
 )
 import telemetry
 import identity
+from embed_runtime import should_unload_embedding, touch_embedding_use
+from process_title import apply_mcp_title, data_dir_sha8
 from version import __version__
 from retrieval_bias import apply_identity_rerank, rrf_fuse
 from build_voice import (
@@ -267,6 +269,7 @@ _MODEL: Optional[TextEmbedding] = None
 _MODEL_NAME: Optional[str] = None
 
 _SESSION_STATE: Dict[str, Any] = {"brief_sent": False}
+_MCP_BOOT_LOGGED = False
 
 
 def _maybe_auto_migrate(data_dir: Path) -> None:
@@ -319,10 +322,10 @@ def _maybe_start_watcher(db_path: Path) -> None:
         conn = _CONN
         if conn is not None:
             try:
-                reconcile_once(conn, inbox)
+                reconcile_once(conn, inbox, data_dir=_data_dir())
             except Exception:
                 log.exception("startup reconcile failed")
-        start_background(_new_conn, inbox)
+        start_background(_new_conn, inbox, data_dir=_data_dir())
     except Exception:
         log.exception("failed to start watcher")
 
@@ -330,6 +333,9 @@ def _maybe_start_watcher(db_path: Path) -> None:
 def _get_model() -> TextEmbedding:
     global _MODEL, _MODEL_NAME
     with _INDEX_LOCK:
+        if should_unload_embedding():
+            _MODEL = None
+            _MODEL_NAME = None
         conn = _get_conn()
         name = (
             get_meta(conn, "model_name")
@@ -337,9 +343,11 @@ def _get_model() -> TextEmbedding:
             or DEFAULT_EMBED_MODEL
         )
         if _MODEL is not None and _MODEL_NAME == name:
+            touch_embedding_use()
             return _MODEL
         _MODEL = TextEmbedding(model_name=name)
         _MODEL_NAME = name
+        touch_embedding_use()
         return _MODEL
 
 
@@ -838,6 +846,13 @@ def _tool_index_info(_: Dict[str, Any]) -> Dict[str, Any]:
 
 def _tool_propose_identity_update(args: Dict[str, Any]) -> Dict[str, Any]:
     conn = _get_conn()
+    layer_arg = args.get("layer")
+    layer_i: Optional[int] = None
+    if layer_arg is not None:
+        try:
+            layer_i = int(layer_arg)
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "layer must be an integer 1..7"}
     payload, err = identity.propose_identity_update(
         conn,
         kind=str(args.get("kind") or ""),
@@ -847,6 +862,8 @@ def _tool_propose_identity_update(args: Dict[str, Any]) -> Dict[str, Any]:
         evidence_chunk_ids=args.get("evidence_chunk_ids"),
         evidence_rationales=args.get("evidence_rationales"),
         meta=args.get("meta") if isinstance(args.get("meta"), dict) else None,
+        layer=layer_i,
+        field=args.get("field") if args.get("field") is not None else None,
     )
     if err:
         return {"status": "error", "error": err}
@@ -861,15 +878,69 @@ def _tool_list_identity_claims(args: Dict[str, Any]) -> Dict[str, Any]:
         lim = int(limit) if limit is not None else 100
     except (TypeError, ValueError):
         lim = 100
+    layer_arg = args.get("layer")
+    layer_i: Optional[int] = None
+    if layer_arg is not None:
+        try:
+            layer_i = int(layer_arg)
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "layer must be an integer 1..7"}
     rows, err = identity.list_claims(
         conn,
         status=args.get("status"),
         kind=args.get("kind"),
+        layer=layer_i,
         limit=lim,
     )
     if err:
         return {"status": "error", "error": err}
     return {"status": "ok", "claims": rows, "count": len(rows)}
+
+
+def _session_layer_grants_from_args(raw: Any) -> Set[int]:
+    out: Set[int] = set()
+    if not isinstance(raw, list):
+        return out
+    for x in raw:
+        try:
+            n = int(x)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= n <= 7:
+            out.add(n)
+    return out
+
+
+def _tool_get_identity_context(args: Dict[str, Any]) -> Dict[str, Any]:
+    conn = _get_conn()
+    rl = args.get("requested_layers")
+    if not isinstance(rl, list) or not rl:
+        return {
+            "status": "error",
+            "error": "requested_layers must be a non-empty array of integers (ISA layers 1–7)",
+        }
+    try:
+        layers = [int(x) for x in rl]
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "requested_layers must be integers"}
+    grants = _session_layer_grants_from_args(args.get("session_layer_grants"))
+    lim_raw = args.get("limit_per_layer")
+    try:
+        lim = int(lim_raw) if lim_raw is not None else 24
+    except (TypeError, ValueError):
+        lim = 24
+    payload, err = identity.grant_identity_context(
+        conn,
+        agent_id=str(args.get("agent_id") or "mcp_agent"),
+        purpose=str(args.get("purpose") or ""),
+        requested_layers=layers,
+        session_grants=grants,
+        limit_per_layer=lim,
+    )
+    if err:
+        return {"status": "error", "error": err}
+    assert payload is not None
+    return {"status": "ok", **payload}
 
 
 def _tool_get_identity_summary(_: Dict[str, Any]) -> Dict[str, Any]:
@@ -1138,6 +1209,16 @@ TOOLS: List[Dict[str, Any]] = [
                     "items": {"type": ["string", "null"]},
                 },
                 "meta": {"type": "object", "additionalProperties": True},
+                "layer": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 7,
+                    "description": "ISA layer; omit to infer from kind.",
+                },
+                "field": {
+                    "type": ["string", "null"],
+                    "description": "Schema field key for this layer (see get_identity_schema via HTTP GET /identity/schema).",
+                },
             },
         },
     },
@@ -1151,11 +1232,51 @@ TOOLS: List[Dict[str, Any]] = [
             "properties": {
                 "status": {
                     "type": "string",
-                    "enum": ["proposed", "active", "rejected", "superseded"],
+                    "enum": sorted(identity.CLAIM_STATUSES),
                     "description": "Omit to list all statuses.",
                 },
                 "kind": {"type": "string"},
+                "layer": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 7,
+                    "description": "Filter by ISA layer.",
+                },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+            },
+        },
+    },
+    {
+        "name": "get_identity_context",
+        "title": "Identity context for agents (least privilege)",
+        "description": (
+            "Returns active claims for granted ISA layers only, and appends an audit row. "
+            "Layers 1,3,6 are open; 2,4,5,7 require the user to have granted those layer numbers "
+            "this session — pass them in session_layer_grants after the Minion UI unlock "
+            "(local HTTP clients may send header X-Minion-Identity-Session-Grants: 2,5,7 instead)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["purpose", "requested_layers"],
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": "Logical agent name for the access log.",
+                    "default": "mcp_agent",
+                },
+                "purpose": {"type": "string", "minLength": 3},
+                "requested_layers": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1, "maximum": 7},
+                    "minItems": 1,
+                },
+                "session_layer_grants": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1, "maximum": 7},
+                    "description": "Layers the user unlocked this session (selective + locked tiers).",
+                },
+                "limit_per_layer": {"type": "integer", "minimum": 1, "maximum": 200, "default": 24},
             },
         },
     },
@@ -1235,8 +1356,25 @@ def _maybe_inject_brief(result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_initialize(req: Dict[str, Any]) -> Dict[str, Any]:
+    global _MCP_BOOT_LOGGED
     req_id = req.get("id")
     _SESSION_STATE["brief_sent"] = False
+    if not _MCP_BOOT_LOGGED:
+        _MCP_BOOT_LOGGED = True
+        apply_mcp_title()
+        from embed_runtime import embed_batch_size, embed_idle_seconds
+
+        try:
+            tag = data_dir_sha8(_data_dir())
+        except Exception:
+            tag = "?"
+        idle = embed_idle_seconds()
+        log.info(
+            "minion mcp role=mcp data_dir_sha8=%s embed_idle_sec=%s embed_batch=%s",
+            tag,
+            idle if idle is not None else "off",
+            embed_batch_size(64),
+        )
 
     instructions = _load_retrieval_instructions()
 
@@ -1377,10 +1515,12 @@ def _handle_initialize(req: Dict[str, Any]) -> Dict[str, Any]:
             "`structuredContent.profile_brief`. Treat it as priors, not binding rules."
         )
     instructions += (
-        "\n\n## Digital identity graph\n\n"
-        "Structured claims (preferences, values, relationships, goals, boundaries, facts) "
-        "can be stored with evidence from `ask_minion` chunk_ids. Use `propose_identity_update`; "
-        "claims stay `proposed` until the user accepts them in the Minion desktop app. "
+        "\n\n## Digital identity graph (ISA)\n\n"
+        "Claims are organized in seven ISA layers (facts, values, goals, relationships, "
+        "behavioral patterns, preferences, sensitive). Use `propose_identity_update` with optional "
+        "layer/field; layer 7 requires meta.explicit_declaration true. "
+        "`get_identity_context` returns only layers the user has unlocked for this session "
+        "(session_layer_grants) plus always-open layers. "
         "`list_identity_claims` and `get_identity_summary` surface the queue and a markdown digest."
     )
     return _jsonrpc_result(
@@ -1411,6 +1551,7 @@ _DISPATCH = {
     "index_info": _tool_index_info,
     "propose_identity_update": _tool_propose_identity_update,
     "list_identity_claims": _tool_list_identity_claims,
+    "get_identity_context": _tool_get_identity_context,
     "get_identity_summary": _tool_get_identity_summary,
 }
 

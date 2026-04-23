@@ -21,6 +21,9 @@ The storage layer is a single SQLite file (`memory.db`) using
 [`sqlite-vec`](https://github.com/asg017/sqlite-vec) for vector KNN. Adding,
 updating, and deleting sources are atomic—no full rebuild required.
 
+Ops note: host RAM, Multipass VMs, and duplicate `api.py` sidecars are covered in
+[`docs/process-hygiene.md`](docs/process-hygiene.md).
+
 ## 0) Prereqs (Intel macOS)
 
 - Python 3.10+ recommended (`python3 --version`)
