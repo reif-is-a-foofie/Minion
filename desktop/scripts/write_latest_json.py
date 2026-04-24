@@ -4,12 +4,12 @@
 Example (after `tauri build` with TAURI_SIGNING_PRIVATE_KEY_* set):
 
   python3 scripts/write_latest_json.py \\
-    --version 1.0.2 \\
+    --version 1.0.1 \\
     --notes "Bug fixes" \\
-    --darwin-aarch64-url "https://github.com/org/repo/releases/download/v1.0.2/Minion_1.0.2_aarch64.app.tar.gz" \\
-    --darwin-aarch64-sig path/to/Minion_1.0.2_aarch64.app.tar.gz.sig \\
-    --darwin-x86_64-url "https://github.com/org/repo/releases/download/v1.0.2/Minion_1.0.2_x64.app.tar.gz" \\
-    --darwin-x86_64-sig path/to/Minion_1.0.2_x64.app.tar.gz.sig \\
+    --darwin-aarch64-url "https://github.com/org/repo/releases/download/v1.0.1/Minion_1.0.1_aarch64.app.tar.gz" \\
+    --darwin-aarch64-sig path/to/Minion_1.0.1_aarch64.app.tar.gz.sig \\
+    --darwin-x86_64-url "https://github.com/org/repo/releases/download/v1.0.1/Minion_1.0.1_x64.app.tar.gz" \\
+    --darwin-x86_64-sig path/to/Minion_1.0.1_x64.app.tar.gz.sig \\
     > latest.json
 
 Attach `latest.json` plus each `.tar.gz` to the GitHub release. The app’s

@@ -2,7 +2,7 @@
 
 **Shipped two ways:** (1) Minion copies this file to your **`derived/`** folder and the MCP server **injects** it via `initialize.instructions` when Claude connects — so you do not *have* to paste this file for retrieval rules to apply. (2) You can still paste it into **Claude → Custom Instructions** (with `core_profile.md`) if you want the same text in global instructions too.
 
-> **Auto-injected brief:** Minion attaches a condensed user brief (preferences, key names, recurring frameworks) to the **first** tool result of each session under `structuredContent.profile_brief`. Treat it as grounding, not as a script; call `ask_minion` for deeper, query-specific context.
+> **Auto-injected brief:** Minion adds a condensed user brief (preferences, key names, recurring frameworks) to the **first** tool result JSON of each session under the `profile_brief` key (same JSON object as the rest of the tool output). Treat it as grounding, not as a script; call `ask_minion` for deeper, query-specific context.
 
 Use this policy when answering as my agent.
 
@@ -37,6 +37,14 @@ to `keyword` mode directly.
 2. `core_profile.md`
 3. Retrieved memories from `ask_minion` (this archive)
 4. Claude's built-in memory/persona feature (last resort, only if the above returned nothing)
+
+## ISA identity graph (seven layers)
+
+Durable claims live in layers **L1–L7**: identity facts; values and boundaries; goals; relationships; behavioral patterns; preferences; sensitive attributes. **Open by default** for agent reads via `get_identity_context`: L1, L3, L6. **Selective** (user must grant this session): L2, L4, L5. **Locked**: L7 — same grant rule as selective here, and **layer 7 must never be inferred**; proposals require `meta.explicit_declaration` true. Use MCP `get_identity_schema` for titles, tiers, and valid `field` keys per layer before calling `propose_identity_update`.
+
+## Ambient learning
+
+With **ambient** consent and crypto enabled, ingested exports can be **sealed** to encrypted Layer-0 archives (plaintext removed per policy). Separately, **preference clustering** in the Minion app proposes **L6** preference claims from chunk embeddings; those stay **proposed** until the user approves — treat ambient-derived identity as a review queue, not live fact until accepted.
 
 ## When to retrieve
 

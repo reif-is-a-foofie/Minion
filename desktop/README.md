@@ -142,20 +142,32 @@ Signed updates use **`tauri-plugin-updater`**. The app reads
 
    ```bash
    python3 scripts/write_latest_json.py \
-     --version 1.0.2 \
+     --version 1.0.1 \
      --notes "…" \
-     --darwin-aarch64-url "https://github.com/…/Minion_1.0.2_aarch64.app.tar.gz" \
-     --darwin-aarch64-sig path/to/Minion_1.0.2_aarch64.app.tar.gz.sig \
-     --darwin-x86_64-url "https://github.com/…/Minion_1.0.2_x64.app.tar.gz" \
-     --darwin-x86_64-sig path/to/Minion_1.0.2_x64.app.tar.gz.sig \
+     --darwin-aarch64-url "https://github.com/…/Minion_1.0.1_aarch64.app.tar.gz" \
+     --darwin-aarch64-sig path/to/Minion_1.0.1_aarch64.app.tar.gz.sig \
+     --darwin-x86_64-url "https://github.com/…/Minion_1.0.1_x64.app.tar.gz" \
+     --darwin-x86_64-sig path/to/Minion_1.0.1_x64.app.tar.gz.sig \
      > latest.json
    ```
 
    Attach **`latest.json`** to the release as `latest.json` so the
    `releases/latest/download/latest.json` URL resolves.
 
-Release builds prompt in **Settings → Support → Check for updates**; a
-background check also runs ~18s after the app connects (production only).
+**v1.0.1 behavior:** With **Install updates automatically** enabled (default) in
+**Settings → Support**, a background check ~18s after the app connects
+(production only) will **download the signed update and relaunch** when a newer
+version exists — no confirmation dialog. Turn the toggle off if you prefer to
+review updates first; you can still use **Check for updates now** (with
+confirmation when auto-install is off). Failed checks do not advance the 12h
+throttle, so a transient network error retries on the next manual check or
+session.
+
+**Standalone `.app` caveat:** Replacing the app bundle updates the shell only.
+Until the PyInstaller sidecar bundle ships (see `TODO(sidecar-bundle)` in
+`src-tauri/src/lib.rs`), users who rely on a **repo checkout + venv** beside the
+`.app` should keep that layout in sync after an update (or reinstall from the
+release instructions).
 
 ## Connect any MCP client
 

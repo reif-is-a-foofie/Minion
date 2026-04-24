@@ -79,3 +79,51 @@ Keep these invariants when you change anything:
 - `desktop/` — Tauri app (Rust shell + SvelteKit UI).
 - `chatgpt_mcp_memory/src/telemetry.py` — the feedback-loop log.
 - `~/Library/Application Support/Minion/data/` — live DB, inbox, telemetry.
+
+## Testing methodology (for every agent)
+
+Use one entrypoint from the repo root so CI and humans stay aligned:
+
+```bash
+python scripts/minion_test.py doctor    # deps OK? (fast)
+python scripts/minion_test.py core      # Python: unit + real sidecar HTTP/WS smoke
+python scripts/minion_test.py desktop-quick   # Svelte check (needs desktop/node_modules)
+python scripts/minion_test.py all         # core then desktop-quick
+python scripts/minion_test.py all --ci    # like CI: core + npm ci + check
+```
+
+**Tiers**
+
+| Tier | What | When |
+|------|------|------|
+| **0** | `doctor` | Before claiming “tests pass”; verifies pytest/httpx/websockets/FastAPI imports. |
+| **1** | `core` (`pytest chatgpt_mcp_memory/tests`) | Default gate for every PR. Spins a real `api.py` process per test where needed — not mocked HTTP. |
+| **2** | `mcp-eval` / `eval/test_mcp_golden.py` | Regression on retrieval against a **real indexed corpus**. Needs `MINION_DERIVED_DIR` or `--derived-dir`. Skips in CI if unset; run locally before shipping retrieval changes. |
+| **3** | `desktop` / `desktop-quick` | UI contract: `npm run check` (types + Svelte). Full `desktop` runs `npm ci` first (CI-style). |
+
+**Setup (once per machine)**
+
+```bash
+cd chatgpt_mcp_memory
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+cd ../desktop && npm ci
+```
+
+Then either `export MINION_PYTHON=$PWD/../chatgpt_mcp_memory/.venv/bin/python` from repo root, or activate `.venv` before `python scripts/minion_test.py …` so `core` uses the same interpreter.
+
+**Pytest forwards** (only for `core` / `all`): put pytest args after `--`:
+
+`python scripts/minion_test.py core -- -k test_status_ready`
+
+**Golden / MCP eval**
+
+```bash
+python scripts/minion_test.py mcp-eval --derived-dir /path/to/derived
+# or: pytest eval/ --derived-dir /path/to/derived
+```
+
+**Principles**
+
+- Prefer the **smallest tier** that covers your change; do not skip tier 1 before merge.
+- Sidecar tests use isolated `MINION_DATA_DIR` under pytest `tmp_path`; they do not touch the user’s live app data.
+- If you add a new “must never break” behavior, add a test in tier 1 (fast, no derived dir) when possible; use tier 2 only when behavior depends on real embeddings or export shape.

@@ -1,0 +1,27 @@
+# Fast MCP / sidecar unit tests (no indexed corpus required).
+name: MCP Python tests
+on:
+  push:
+    paths:
+      - "chatgpt_mcp_memory/**"
+      - ".github/workflows/mcp-python-tests.yml"
+  pull_request:
+    paths:
+      - "chatgpt_mcp_memory/**"
+      - ".github/workflows/mcp-python-tests.yml"
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: chatgpt_mcp_memory
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install -r requirements.txt pytest
+      - name: Run targeted tests
+        run: python -m pytest tests/test_mcp_tool_result_shape.py tests/test_embed_runtime.py -q

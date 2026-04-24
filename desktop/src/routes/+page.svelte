@@ -106,6 +106,28 @@
   /** From GET /capabilities — collector URL is available (not air-gapped / disabled). */
   let analyticsUrlConfigured = $state(true);
   let updaterBusy = $state(false);
+  /** When true, background checks download & relaunch without prompting. Manual "Check for updates" still confirms if this is off. */
+  let autoInstallUpdates = $state(true);
+  const LS_AUTO_INSTALL_UPDATES = "minion_auto_install_updates";
+
+  function readAutoInstallUpdates(): boolean {
+    try {
+      const v = localStorage.getItem(LS_AUTO_INSTALL_UPDATES);
+      if (v === null) return true;
+      return v === "1" || v === "true";
+    } catch {
+      return true;
+    }
+  }
+
+  function setAutoInstallUpdates(on: boolean) {
+    autoInstallUpdates = on;
+    try {
+      localStorage.setItem(LS_AUTO_INSTALL_UPDATES, on ? "1" : "0");
+    } catch {
+      /* ignore quota / private mode */
+    }
+  }
 
   let supportAbout = $state<DiagnosticsAbout | null>(null);
   let supportPeers = $state<DiagnosticsPeersResponse | null>(null);
@@ -294,6 +316,7 @@
   async function maybeCheckForAppUpdate(force: boolean) {
     if (import.meta.env.DEV) return;
     if (updaterBusy) return;
+    if (!force && !autoInstallUpdates) return;
     const key = "minion_last_update_check";
     if (!force) {
       const last = Number(localStorage.getItem(key) || "0");
@@ -309,13 +332,18 @@
         localStorage.setItem(key, String(Date.now()));
         return;
       }
-      const go = await ask(
-        `Minion ${update.version} is available.${update.body ? `\n\n${update.body}` : ""}\n\nDownload and install now? (macOS may ask for permission.)`,
-        { title: "Update available", kind: "info" },
-      );
-      if (!go) {
-        localStorage.setItem(key, String(Date.now()));
-        return;
+      const silentInstall = force ? autoInstallUpdates : true;
+      if (!silentInstall) {
+        const go = await ask(
+          `Minion ${update.version} is available.${update.body ? `\n\n${update.body}` : ""}\n\nDownload and install now? (macOS may ask for permission.)`,
+          { title: "Update available", kind: "info" },
+        );
+        if (!go) {
+          localStorage.setItem(key, String(Date.now()));
+          return;
+        }
+      } else if (force) {
+        pushFeed("settings", `Update ${update.version} available — installing…`);
       }
       await update.downloadAndInstall((ev) => {
         if (ev.event === "Started") {
@@ -323,12 +351,12 @@
         }
       });
       pushFeed("settings", "Installing… app will restart.");
+      localStorage.setItem(key, String(Date.now()));
       await relaunch();
     } catch (e) {
       if (force) pushFeed("settings", `Update check failed: ${(e as Error).message}`);
     } finally {
       updaterBusy = false;
-      localStorage.setItem(key, String(Date.now()));
     }
   }
 
@@ -970,6 +998,7 @@
   }
 
   onMount(() => {
+    autoInstallUpdates = readAutoInstallUpdates();
     let unlistens: Array<() => void> = [];
 
     (async () => {
@@ -1477,6 +1506,12 @@
                     <li>
                       <div class="file-main">
                         <span class="kind">{c.kind}</span>
+                        {#if c.layer != null && c.layer >= 1 && c.layer <= 7}
+                          <span class="meta mono" title="ISA layer">L{c.layer}</span>
+                        {/if}
+                        {#if c.field}
+                          <span class="meta mono" title="Schema field">{c.field}</span>
+                        {/if}
                         <span class="path mono" title={c.claim_id}>{c.claim_id}</span>
                         {#if c.source_agent}
                           <span class="meta">via {c.source_agent}</span>
@@ -1690,6 +1725,17 @@
                   Release builds check GitHub for a signed <span class="mono">latest.json</span> (see
                   <span class="mono">desktop/scripts/write_latest_json.py</span>). You stay on the stable channel unless you change the
                   updater endpoints in <span class="mono">tauri.conf.json</span>.
+                </p>
+                <label class="support-analytics-row">
+                  <input
+                    type="checkbox"
+                    checked={autoInstallUpdates}
+                    onchange={(e) => setAutoInstallUpdates((e.currentTarget as HTMLInputElement).checked)}
+                  />
+                  <span>Install updates automatically (download signed build &amp; restart)</span>
+                </label>
+                <p class="setting-desc subtle">
+                  When off, the app still checks in the background but only installs after you confirm from “Check for updates now”.
                 </p>
                 <div class="support-actions">
                   <button type="button" class="ghost" onclick={() => void maybeCheckForAppUpdate(true)} disabled={updaterBusy}>

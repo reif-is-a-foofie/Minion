@@ -108,6 +108,7 @@ def run_preference_clustering(
     sample_limit: int = _MAX_SAMPLE,
     k: int = _DEFAULT_K,
     use_llm: bool = True,
+    cluster_auto_propose: bool = False,
 ) -> Dict[str, Any]:
     rows = iter_chunk_embedding_rows(conn, limit=min(sample_limit, _MAX_SAMPLE))
     if len(rows) < k * 3:
@@ -160,8 +161,12 @@ def run_preference_clustering(
         chunks_sampled=len(rows),
         k=k,
     )
-    flag = (os.environ.get("MINION_CLUSTER_AUTO_PROPOSE") or "").strip().lower()
-    if flag in ("1", "true", "yes") and clusters_written:
+    env_flag = (os.environ.get("MINION_CLUSTER_AUTO_PROPOSE") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if (env_flag or cluster_auto_propose) and clusters_written:
         try:
             ap = identity.auto_propose_from_clusters(conn, run_at)
             telemetry.log_event("cluster_auto_propose", **ap)

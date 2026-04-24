@@ -33,6 +33,7 @@ from store import (
     get_conversation_chunks as store_get_conversation_chunks,
     get_meta,
     get_source,
+    identity_claim_get,
     keyword_search as store_keyword_search,
     list_conversations as store_list_conversations,
     list_sources as store_list_sources,
@@ -41,6 +42,7 @@ from store import (
 import telemetry
 import identity
 from embed_runtime import should_unload_embedding, touch_embedding_use
+from settings import load_settings, merge_identity_defaults
 from process_title import apply_mcp_title, data_dir_sha8
 from version import __version__
 from retrieval_bias import apply_identity_rerank, rrf_fuse
@@ -76,6 +78,51 @@ _INSTRUCTIONS_FALLBACK = (
     "specific name, retry in mode='keyword' (scans OCR with noise and "
     "embeddings underrank rare proper nouns). Use mode='oldest' or "
     "mode='newest' for first/last/time-scoped questions."
+)
+
+# Injected when voice.md is not built yet (keeps initialize smaller than the old inlined essay).
+_VOICE_BOOTSTRAP_INSTRUCTIONS = (
+    "\n\n---\n\n"
+    "# Voice bootstrap required (one-time, silent self-setup)\n\n"
+    "The user's voice profile has not been built yet. On your **first** substantive "
+    "turn this session, run this **silently** before answering their question. "
+    "Persist to `voice.md` via `commit_voice`; afterward it is auto-injected every session.\n\n"
+    "## 1. Evidence (semantic first)\n\n"
+    "`ask_minion` with `mode='relevance'`, `role='user'`, `top_k=12`. Query in the "
+    "**shape of a user utterance** (imperatives they would type), not meta-requests. "
+    "Run these **8** probes (one call each):\n"
+    "```\n"
+    "ask_minion(query=\"don't use emojis, em dashes, or ellipses in your responses\", mode='relevance', role='user', top_k=12)\n"
+    "ask_minion(query=\"respond in short paragraphs, no bullet points or headers\", mode='relevance', role='user', top_k=12)\n"
+    "ask_minion(query=\"keep it short, minimum words, compress this down\", mode='relevance', role='user', top_k=12)\n"
+    "ask_minion(query=\"shorter sentences, punchier, less wordy\", mode='relevance', role='user', top_k=12)\n"
+    "ask_minion(query=\"this sounds like an AI wrote it, rewrite in a human voice\", mode='relevance', role='user', top_k=12)\n"
+    "ask_minion(query=\"I love how this writer writes, capture that voice\", mode='relevance', role='user', top_k=12)\n"
+    "ask_minion(query=\"write like Hemingway, Didion, Paul Graham, or a specific author I named\", mode='relevance', role='user', top_k=12)\n"
+    "ask_minion(query=\"more casual, less formal, how I would say it to a friend\", mode='relevance', role='user', top_k=12)\n"
+    "```\n\n"
+    "If hits are thin: `browse_conversations(limit=15, order='newest')`. "
+    "`conversation_chunks` only when one thread needs full context. "
+    "**Keyword mode:** only after a specific proper noun appears in semantic hits; "
+    "run `mode='keyword'` on that token — never as a generic semantic fallback.\n\n"
+    "## 2. Synthesize\n\n"
+    "Markdown voice profile with **exact** H3 headings: Typography, Formatting, "
+    "Length and density, Tone and register, Style references, Hard nos, Voice sample. "
+    "Use `_(insufficient signal)_` when a section lacks evidence. "
+    "Voice sample = one 60–150 word paragraph in their voice (synthesized, not quoted).\n\n"
+    "## 3. Commit\n\n"
+    "`commit_voice(voice_markdown=...)` — 400–1800 chars; tool enforces headings/size.\n\n"
+    "## Rules\n\n"
+    "- **Voice vs content:** layout/tone/register rules are voice; one-off creative "
+    "tasks are not. When in doubt, omit.\n"
+    "- **Evidence only:** no invented rules from model priors.\n"
+    "- **Domain:** noisy verticals (code, scripture, etc.) — voice cues only.\n"
+    "- **Silent:** do not narrate bootstrap; no draft approval step.\n"
+    "- After `commit_voice` succeeds, answer the user's question using that voice.\n\n"
+    "## Later sessions\n\n"
+    "Durable in-session preferences (`save this`, `never X again`, author as style "
+    "target): one-sentence confirmation, then `append_to_voice`. Never persist without "
+    "explicit user confirmation."
 )
 
 log = logging.getLogger("minion.mcp")
@@ -911,6 +958,27 @@ def _session_layer_grants_from_args(raw: Any) -> Set[int]:
     return out
 
 
+def _persisted_session_layer_grants() -> Set[int]:
+    try:
+        data = load_settings(_data_dir())
+        ident = merge_identity_defaults(data.get("identity"))
+        out: Set[int] = set()
+        for x in ident.get("session_layer_grants") or []:
+            try:
+                n = int(x)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= n <= 7:
+                out.add(n)
+        return out
+    except Exception:
+        return set()
+
+
+def _merge_tool_and_persisted_grants(args_raw: Any, persisted: Set[int]) -> Set[int]:
+    return _session_layer_grants_from_args(args_raw) | persisted
+
+
 def _tool_get_identity_context(args: Dict[str, Any]) -> Dict[str, Any]:
     conn = _get_conn()
     rl = args.get("requested_layers")
@@ -923,7 +991,10 @@ def _tool_get_identity_context(args: Dict[str, Any]) -> Dict[str, Any]:
         layers = [int(x) for x in rl]
     except (TypeError, ValueError):
         return {"status": "error", "error": "requested_layers must be integers"}
-    grants = _session_layer_grants_from_args(args.get("session_layer_grants"))
+    grants = _merge_tool_and_persisted_grants(
+        args.get("session_layer_grants"),
+        _persisted_session_layer_grants(),
+    )
     lim_raw = args.get("limit_per_layer")
     try:
         lim = int(lim_raw) if lim_raw is not None else 24
@@ -949,43 +1020,25 @@ def _tool_get_identity_summary(_: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "ok", "markdown": md}
 
 
+def _tool_get_identity_schema(_: Dict[str, Any]) -> Dict[str, Any]:
+    return {"status": "ok", "schema": identity.identity_schema_public()}
+
+
 TOOLS: List[Dict[str, Any]] = [
     {
         "name": "ask_minion",
         "title": "Ask Minion — the user's digital identity",
         "description": (
-            "Minion is the user's digital identity and long-term memory: the "
-            "accumulated record of who they are, in their own words. Their "
-            "chat history, notes, documents, scans, photos, voice, video, "
-            "code, decisions, beliefs, relationships, projects, plans — "
-            "continuous across every session.\n\n"
-            "Consult Minion the way you would consult the person themselves. "
-            "Their words are the source of truth for anything about their "
-            "life.\n\n"
-            "Before answering a question about the user, ask whether the "
-            "answer lives in their experience — their history, relationships, "
-            "decisions, preferences, work, writing, faith, health, anything "
-            "tied to their identity. If so, search Minion first, then speak.\n\n"
-            "Search strategy: start with `relevance` (semantic). If the top "
-            "hits feel weak or miss a specific name, retry the same question "
-            "in `keyword` mode — handwriting and scans OCR with noise and "
-            "embeddings underrank rare proper nouns. Expand a promising hit "
-            "with `get_chunk`, pull a whole thread with `conversation_chunks`, "
-            "list chats with `browse_conversations`. For time-scoped "
-            "questions (first, earliest, latest, before X, since Y), use "
-            "`oldest` or `newest` mode.\n\n"
-            "When you answer from a Minion hit, name the source briefly so "
-            "the user can verify — the document title, file name, or "
-            "conversation title from the hit. Link to the source using the "
-            "`file_url` field from the result as a markdown link: e.g. "
-            "`[your patriarchal blessing certificate](file:///...)`. Cmd-click "
-            "opens the file on macOS. Keep it conversational: one link per "
-            "answer on the primary source; don't quote raw paths or IDs.\n\n"
-            "Modes: `relevance` (semantic, default) · `oldest`/`newest` "
-            "(chronological, query optional) · `keyword` (FTS5 exact-phrase). "
-            "Bound time with `before`/`after`. Expand a hit with `get_chunk`; "
-            "list chats with `browse_conversations`; fetch a full thread with "
-            "`conversation_chunks`. When in doubt, search first."
+            "Search the user's local Minion index (their memory). Full retrieval "
+            "strategy lives in `initialize.instructions` and optional "
+            "`retrieval_policy.md` — follow those; this tool is the primary search.\n\n"
+            "Modes: `relevance` (default, semantic) · `oldest` / `newest` "
+            "(time-ordered; query optional) · `keyword` (FTS5; use when proper "
+            "nouns or exact phrases matter). Use `before` / `after` / `since` "
+            "filters as needed. Expand hits with `get_chunk`; threads via "
+            "`browse_conversations` + `conversation_chunks`.\n\n"
+            "When citing: one markdown link per answer using `file_url` from the hit; "
+            "name the source; avoid raw paths or internal ids."
         ),
         "inputSchema": {
             "type": "object",
@@ -1217,7 +1270,7 @@ TOOLS: List[Dict[str, Any]] = [
                 },
                 "field": {
                     "type": ["string", "null"],
-                    "description": "Schema field key for this layer (see get_identity_schema via HTTP GET /identity/schema).",
+                    "description": "Schema field key for this layer (call `get_identity_schema` for allowed keys per layer).",
                 },
             },
         },
@@ -1287,6 +1340,15 @@ TOOLS: List[Dict[str, Any]] = [
         "inputSchema": {"type": "object", "additionalProperties": False},
     },
     {
+        "name": "get_identity_schema",
+        "title": "ISA identity schema",
+        "description": (
+            "Seven ISA layers with titles, access tiers (open / selective / locked), "
+            "and valid `field` keys per layer for `propose_identity_update`. Same payload as HTTP GET /identity/schema."
+        ),
+        "inputSchema": {"type": "object", "additionalProperties": False},
+    },
+    {
         "name": "index_info",
         "title": "Index metadata",
         "description": "Return aggregate metadata about the loaded local index.",
@@ -1314,45 +1376,34 @@ def _jsonrpc_error(req_id: Any, code: int, message: str, data: Any = None) -> Di
     return out
 
 
-def _tool_result(payload: Any, *, is_error: bool = False) -> Dict[str, Any]:
+def _normalize_tool_payload(payload: Any) -> Dict[str, Any]:
     if isinstance(payload, list):
-        structured: Dict[str, Any] = {"results": payload}
-    elif isinstance(payload, dict):
-        structured = payload
-    else:
-        structured = {"value": payload}
-    return {
-        "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}],
-        "structuredContent": structured,
-        "isError": bool(is_error),
-    }
+        return {"results": payload}
+    if isinstance(payload, dict):
+        return dict(payload)
+    return {"value": payload}
 
 
-def _maybe_inject_brief(result: Dict[str, Any]) -> Dict[str, Any]:
+def _maybe_inject_brief_structured(structured: Dict[str, Any]) -> Dict[str, Any]:
     if _SESSION_STATE.get("brief_sent"):
-        return result
-    if result.get("isError"):
-        return result
+        return structured
+    if structured.get("error"):
+        return structured
     brief = _load_profile_brief()
     if not brief:
-        return result
-    structured = result.get("structuredContent")
-    if isinstance(structured, dict):
-        structured["profile_brief"] = brief
-    content = result.get("content")
-    if isinstance(content, list):
-        content.insert(
-            0,
-            {
-                "type": "text",
-                "text": (
-                    "# Minion profile brief (auto-injected, first tool call of session)\n\n"
-                    + brief
-                ),
-            },
-        )
+        return structured
+    out = dict(structured)
+    out["profile_brief"] = brief
     _SESSION_STATE["brief_sent"] = True
-    return result
+    return out
+
+
+def _tool_result_structured(structured: Dict[str, Any], *, is_error: bool = False) -> Dict[str, Any]:
+    """Single JSON body in `content` (no duplicate structuredContent) to save tokens on the wire."""
+    return {
+        "content": [{"type": "text", "text": json.dumps(structured, ensure_ascii=False)}],
+        "isError": bool(is_error),
+    }
 
 
 def _handle_initialize(req: Dict[str, Any]) -> Dict[str, Any]:
@@ -1406,118 +1457,18 @@ def _handle_initialize(req: Dict[str, Any]) -> Dict[str, Any]:
             "voice.md above the USER_EDITS sentinel."
         )
     else:
-        instructions += (
-            "\n\n---\n\n"
-            "# Voice bootstrap required (one-time, silent self-setup)\n\n"
-            "The user's voice profile has not been built yet. On your FIRST "
-            "substantive turn this session, run this self-setup silently "
-            "BEFORE answering the user's question. It is a one-time action; "
-            "the result is persisted to `voice.md` and auto-injected into "
-            "every future session.\n\n"
-            "## Procedure\n\n"
-            "1. **Gather evidence via semantic retrieval.** `ask_minion` with "
-            "`mode='relevance'` is an NLP semantic search over the user's own "
-            "utterances (MiniLM embeddings). Trust it. Query in the *shape of "
-            "the answer*, not the shape of the question. Users don't narrate "
-            "their preferences (`I want responses formatted as...`); they "
-            "state imperatives (`no emojis`, `write like me`, `cut the "
-            "words`). Phrase your queries as hypothetical user utterances. "
-            "Always filter `role='user'` so you see only the user's own "
-            "directives, not assistant replies. 6-8 queries is the right "
-            "budget, one per dimension. These eight seeds were tuned against "
-            "this corpus (mean top-hit score 0.66 on a 22k-chunk index) and "
-            "each probes a distinct axis:\n\n"
-            "```\n"
-            "ask_minion(query=\"don't use emojis, em dashes, or ellipses in your responses\",\n"
-            "           mode='relevance', role='user', top_k=12)  # typography\n"
-            "ask_minion(query=\"respond in short paragraphs, no bullet points or headers\",\n"
-            "           mode='relevance', role='user', top_k=12)  # formatting\n"
-            "ask_minion(query=\"keep it short, minimum words, compress this down\",\n"
-            "           mode='relevance', role='user', top_k=12)  # length / density\n"
-            "ask_minion(query=\"shorter sentences, punchier, less wordy\",\n"
-            "           mode='relevance', role='user', top_k=12)  # sentence shape\n"
-            "ask_minion(query=\"this sounds like an AI wrote it, rewrite in a human voice\",\n"
-            "           mode='relevance', role='user', top_k=12)  # voice / register\n"
-            "ask_minion(query=\"I love how this writer writes, capture that voice\",\n"
-            "           mode='relevance', role='user', top_k=12)  # style references (self)\n"
-            "ask_minion(query=\"write like Hemingway, Didion, Paul Graham, or a specific author I named\",\n"
-            "           mode='relevance', role='user', top_k=12)  # style references (external)\n"
-            "ask_minion(query=\"more casual, less formal, how I would say it to a friend\",\n"
-            "           mode='relevance', role='user', top_k=12)  # formality\n"
-            "```\n\n"
-            "   Sources grow over time: style references come from the user's "
-            "past ChatGPT/Claude chats already in the index, plus future Claude "
-            "sessions once those get ingested. You never ask the user to hand-"
-            "maintain a list. You infer from what the index contains.\n\n"
-            "   Supplement with `browse_conversations(limit=15, order='newest')` "
-            "for recent work context if the semantic hits feel sparse. Use "
-            "`conversation_chunks(...)` to pull a whole thread only if a single "
-            "hit needs more context.\n\n"
-            "   Reserve `mode='keyword'` for one narrow job: if a specific "
-            "author or work name surfaces in the semantic hits (e.g. `Paul "
-            "Graham`, `Hemingway`, a book title), follow up with "
-            "`mode='keyword'` on that exact token to find every occurrence. "
-            "Do not use keyword mode as a semantic fallback.\n\n"
-            "2. **Synthesize** a short, binding voice profile in Markdown. "
-            "Use these exact H3 headings; mark any section without support "
-            "as `_(insufficient signal)_` rather than inventing rules:\n\n"
-            "   - `### Typography` - hard character rules (em dashes, "
-            "emojis, ellipses, quotes).\n"
-            "   - `### Formatting` - paragraphs vs bullets, headers, tables, "
-            "code blocks.\n"
-            "   - `### Length and density` - compression, preamble, hedging, "
-            "word-count targets.\n"
-            "   - `### Tone and register` - 3-5 specific phrases "
-            "(`diagnostic, time-pressed, systems-minded`). Avoid generic "
-            "adjectives like `professional` or `clear`.\n"
-            "   - `### Style references` - writers, works, or registers the "
-            "user explicitly references. Leave empty if none surface.\n"
-            "   - `### Hard nos` - things the user rejects about responses.\n"
-            "   - `### Voice sample` - ONE short paragraph (60-150 words) "
-            "in the user's own voice, synthesized from patterns. Not a "
-            "direct quote.\n\n"
-            "3. **Commit** by calling `commit_voice` with the markdown as "
-            "`voice_markdown`. Total length 400-1800 chars. The tool "
-            "enforces size and heading checks.\n\n"
-            "## Critical distinctions\n\n"
-            "- **Voice directives vs content directives.** A user asking "
-            "Claude to `write the words Enter and Exit on a sign` is about "
-            "a generated asset, NOT voice. A user saying `respond in "
-            "paragraphs` or `don't hedge` IS voice. When in doubt, omit.\n"
-            "- **Evidence only.** Infer rules only from what the retrieved "
-            "hits support. Do not import defaults or your general priors.\n"
-            "- **Domain filtering.** If the user's chats are dominated by a "
-            "domain (real estate, code, scripture), extract voice cues only; "
-            "do not encode domain content as rules.\n\n"
-            "## Housekeeping\n\n"
-            "- Run silently. Do not narrate the bootstrap to the user.\n"
-            "- Do not show the draft for approval. The user can always edit "
-            "`voice.md` below the USER_EDITS sentinel afterward.\n"
-            "- After `commit_voice` returns `status=ok`, proceed with the "
-            "user's actual question and apply the voice you just synthesized "
-            "from here onward in the conversation.\n\n"
-            "## Future signals (after this bootstrap)\n\n"
-            "Once the profile is committed, it grows incrementally. When the "
-            "user signals a durable voice preference in any future session — "
-            "`save this`, `write like Didion from now on`, `never do X again`, "
-            "or explicitly names an author or piece as a style target — ask a "
-            "one-sentence confirmation and then call `append_to_voice` to "
-            "persist it. Do not persist without explicit user confirmation. "
-            "The user never hand-maintains style references; they come from "
-            "past chats (via this bootstrap) and future chats (via "
-            "`append_to_voice`)."
-        )
+        instructions += _VOICE_BOOTSTRAP_INSTRUCTIONS
 
     if _load_profile_brief() is not None:
         instructions += (
-            "\n\nOn your first tool call this session, Minion also attaches a "
-            "condensed user brief (observed patterns from chat history) under "
-            "`structuredContent.profile_brief`. Treat it as priors, not binding rules."
+            "\n\nOn your first tool call this session, the tool result JSON includes "
+            "`profile_brief` (condensed patterns from chat history). Treat it as priors, not binding rules."
         )
     instructions += (
         "\n\n## Digital identity graph (ISA)\n\n"
         "Claims are organized in seven ISA layers (facts, values, goals, relationships, "
-        "behavioral patterns, preferences, sensitive). Use `propose_identity_update` with optional "
+        "behavioral patterns, preferences, sensitive). Call `get_identity_schema` for layer titles, "
+        "access tiers, and valid `field` keys. Use `propose_identity_update` with optional "
         "layer/field; layer 7 requires meta.explicit_declaration true. "
         "`get_identity_context` returns only layers the user has unlocked for this session "
         "(session_layer_grants) plus always-open layers. "
@@ -1553,6 +1504,7 @@ _DISPATCH = {
     "list_identity_claims": _tool_list_identity_claims,
     "get_identity_context": _tool_get_identity_context,
     "get_identity_summary": _tool_get_identity_summary,
+    "get_identity_schema": _tool_get_identity_schema,
 }
 
 
@@ -1567,10 +1519,12 @@ def _handle_tools_call(req: Dict[str, Any]) -> Dict[str, Any]:
         return _jsonrpc_error(req_id, -32602, f"Unknown tool: {name}")
 
     try:
-        result = _tool_result(fn(arguments))
+        structured = _normalize_tool_payload(fn(arguments))
+        structured = _maybe_inject_brief_structured(structured)
+        result = _tool_result_structured(structured, is_error=False)
     except Exception as e:
-        result = _tool_result({"error": str(e)}, is_error=True)
-    return _jsonrpc_result(req_id, _maybe_inject_brief(result))
+        result = _tool_result_structured({"error": str(e)}, is_error=True)
+    return _jsonrpc_result(req_id, result)
 
 
 def main() -> None:

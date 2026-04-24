@@ -26,6 +26,7 @@ from run_eval import (  # noqa: E402
     DEFAULT_SERVER_PY,
     MCPStdioClient,
     run_case,
+    tool_result_payload,
 )
 
 
@@ -65,7 +66,7 @@ def test_golden_query(mcp_client, case):
 
 
 def test_profile_brief_first_call_only(request):
-    """First tools/call carries structuredContent.profile_brief; second does not."""
+    """First tools/call JSON carries profile_brief; second does not."""
     derived = _resolve_derived_dir(request)
     if derived is None:
         pytest.skip("No --derived-dir / MINION_DERIVED_DIR — skipping brief-injection test.")
@@ -87,9 +88,9 @@ def test_profile_brief_first_call_only(request):
     finally:
         client.stop()
 
-    sc1 = first.get("structuredContent") or {}
-    sc2 = second.get("structuredContent") or {}
-    assert isinstance(sc1, dict), f"first call structuredContent not a dict: {sc1!r}"
+    sc1 = tool_result_payload(first)
+    sc2 = tool_result_payload(second)
+    assert isinstance(sc1, dict), f"first call payload not a dict: {sc1!r}"
     assert "profile_brief" in sc1, "first call missing profile_brief"
     assert len(sc1["profile_brief"]) > 50, "profile_brief suspiciously short"
     assert "profile_brief" not in sc2, "profile_brief leaked into second call"
@@ -100,7 +101,7 @@ def test_temporal_oldest_user_message(mcp_client):
     result = mcp_client.call_tool(
         "ask_minion", {"mode": "oldest", "role": "user", "top_k": 1, "max_chars": 200}
     )
-    sc = result.get("structuredContent") or {}
+    sc = tool_result_payload(result)
     hits = sc.get("results") or []
     assert hits, f"mode=oldest returned no hits: {result!r}"
     top = hits[0]
@@ -121,8 +122,8 @@ def test_temporal_newest_is_after_oldest(mcp_client):
     newest = mcp_client.call_tool(
         "ask_minion", {"mode": "newest", "top_k": 1, "max_chars": 50}
     )
-    o = (oldest.get("structuredContent") or {}).get("results") or []
-    n = (newest.get("structuredContent") or {}).get("results") or []
+    o = tool_result_payload(oldest).get("results") or []
+    n = tool_result_payload(newest).get("results") or []
     assert o and n
     assert float(n[0]["create_time"]) > float(o[0]["create_time"])
 
@@ -133,7 +134,7 @@ def test_keyword_mode_recovers_rare_phrase(mcp_client):
         "ask_minion",
         {"mode": "keyword", "query": "Song for Maia", "top_k": 5, "max_chars": 200},
     )
-    sc = result.get("structuredContent") or {}
+    sc = tool_result_payload(result)
     hits = sc.get("results") or []
     assert hits, f"keyword mode returned no hits for proper-noun query: {result!r}"
     joined = " ".join((h.get("text") or "").lower() for h in hits)
@@ -147,7 +148,7 @@ def test_browse_conversations(mcp_client):
     result = mcp_client.call_tool(
         "browse_conversations", {"order": "newest", "limit": 25}
     )
-    sc = result.get("structuredContent") or {}
+    sc = tool_result_payload(result)
     convs = sc.get("conversations") or []
     assert len(convs) >= 5, f"expected >= 5 conversations, got {len(convs)}"
     for c in convs:
@@ -233,7 +234,7 @@ def test_commit_voice_roundtrip(request, tmp_path, monkeypatch):
     try:
         client.initialize()
         commit = client.call_tool("commit_voice", {"voice_markdown": synthesis})
-        csc = commit.get("structuredContent") or {}
+        csc = tool_result_payload(commit)
         assert csc.get("status") == "ok", f"commit failed: {csc!r}"
         assert csc.get("built") is True
     finally:
@@ -256,25 +257,25 @@ def test_commit_voice_roundtrip(request, tmp_path, monkeypatch):
 def test_commit_voice_rejects_junk(mcp_client):
     """commit_voice validates size + heading requirement."""
     r1 = mcp_client.call_tool("commit_voice", {"voice_markdown": "too short"})
-    sc1 = r1.get("structuredContent") or {}
+    sc1 = tool_result_payload(r1)
     assert sc1.get("status") == "error"
 
     r2 = mcp_client.call_tool("commit_voice", {"voice_markdown": "x" * 300})
-    sc2 = r2.get("structuredContent") or {}
+    sc2 = tool_result_payload(r2)
     assert sc2.get("status") == "error", "no-heading markdown should be rejected"
 
 
 def test_list_sources_detail_mode(mcp_client):
     """list_sources in list mode returns rows; pass source_id for full detail."""
     rows_result = mcp_client.call_tool("list_sources", {"limit": 5})
-    sc = rows_result.get("structuredContent") or {}
+    sc = tool_result_payload(rows_result)
     sources = sc.get("sources") or []
     assert sources, f"list_sources returned nothing: {rows_result!r}"
     assert "source" not in sc, "list mode should not return 'source' singular"
 
     sid = sources[0]["source_id"]
     detail = mcp_client.call_tool("list_sources", {"source_id": sid})
-    dsc = detail.get("structuredContent") or {}
+    dsc = tool_result_payload(detail)
     src = dsc.get("source")
     assert src, f"detail mode missing 'source': {detail!r}"
     assert src["source_id"] == sid
@@ -314,14 +315,14 @@ def test_append_to_voice_roundtrip(request, tmp_path):
     client.start()
     try:
         client.initialize()
-        assert client.call_tool("commit_voice", {"voice_markdown": seed}).get("structuredContent", {}).get("status") == "ok"
+        assert tool_result_payload(client.call_tool("commit_voice", {"voice_markdown": seed})).get("status") == "ok"
 
         # First append replaces the insufficient-signal marker.
         r1 = client.call_tool("append_to_voice", {
             "section": "Style references",
             "content": "Paul Graham essays. Terse, structured, claim-first.",
         })
-        sc1 = r1.get("structuredContent") or {}
+        sc1 = tool_result_payload(r1)
         assert sc1.get("status") == "ok", f"first append failed: {sc1!r}"
         assert sc1.get("appended") is True, "first append should write"
 
@@ -330,7 +331,7 @@ def test_append_to_voice_roundtrip(request, tmp_path):
             "section": "Style references",
             "content": "Paul Graham essays. Terse, structured, claim-first.",
         })
-        sc2 = r2.get("structuredContent") or {}
+        sc2 = tool_result_payload(r2)
         assert sc2.get("status") == "ok"
         assert sc2.get("appended") is False, "duplicate content should no-op"
 
@@ -339,14 +340,14 @@ def test_append_to_voice_roundtrip(request, tmp_path):
             "section": "Hard nos",
             "content": "No AI-voiced prose. No self-effacing caveats.",
         })
-        assert (r3.get("structuredContent") or {}).get("appended") is True
+        assert tool_result_payload(r3).get("appended") is True
 
         # Invalid section rejected.
         r4 = client.call_tool("append_to_voice", {
             "section": "NotASection",
             "content": "whatever",
         })
-        assert (r4.get("structuredContent") or {}).get("status") == "error"
+        assert tool_result_payload(r4).get("status") == "error"
     finally:
         client.stop()
 
@@ -372,7 +373,7 @@ def test_conversation_chunks_roundtrip(mcp_client):
     browse = mcp_client.call_tool(
         "browse_conversations", {"order": "most_messages", "limit": 1}
     )
-    convs = (browse.get("structuredContent") or {}).get("conversations") or []
+    convs = tool_result_payload(browse).get("conversations") or []
     assert convs, "browse_conversations returned no rows"
     cid = convs[0]["conversation_id"]
 
@@ -380,7 +381,7 @@ def test_conversation_chunks_roundtrip(mcp_client):
         "conversation_chunks",
         {"conversation_id": cid, "limit": 10, "max_chars": 120},
     )
-    sc = result.get("structuredContent") or {}
+    sc = tool_result_payload(result)
     assert sc.get("conversation_id") == cid
     chunks = sc.get("chunks") or []
     assert len(chunks) >= 1

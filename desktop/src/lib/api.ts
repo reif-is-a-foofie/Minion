@@ -254,6 +254,9 @@ export type IdentityClaim = {
   updated_at: number;
   superseded_by?: string | null;
   meta?: Record<string, unknown>;
+  layer?: number | null;
+  field?: string | null;
+  last_reinforced_at?: number | null;
 };
 
 export type IdentityEdge = {

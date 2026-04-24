@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Set
 
 from consent import merge_ambient_defaults
 from parsers import ALL_KINDS, set_disabled_kinds
@@ -55,8 +55,52 @@ def apply_settings(data: Dict[str, Any]) -> None:
     set_disabled_kinds(disabled)
 
 
+def merge_identity_defaults(raw: Any) -> Dict[str, Any]:
+    """ISA session grants + cluster options; unknown keys preserved."""
+    base: Dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+    grants_raw = base.get("session_layer_grants")
+    cleaned: List[int] = []
+    seen: Set[int] = set()
+    seq = grants_raw if isinstance(grants_raw, list) else []
+    for x in seq:
+        try:
+            n = int(x)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= n <= 7 and n not in seen:
+            cleaned.append(n)
+            seen.add(n)
+    cleaned.sort()
+    cap = base.get("cluster_auto_propose")
+    cluster_auto = bool(cap) if cap is not None else False
+    ts_raw = base.get("session_grants_updated_at")
+    ts: Any = None
+    if ts_raw is not None:
+        try:
+            ts = float(ts_raw)
+        except (TypeError, ValueError):
+            ts = None
+    out: Dict[str, Any] = {
+        "session_layer_grants": cleaned,
+        "cluster_auto_propose": cluster_auto,
+    }
+    if ts is not None:
+        out["session_grants_updated_at"] = ts
+    skip = frozenset({"session_layer_grants", "cluster_auto_propose", "session_grants_updated_at"})
+    for k, v in base.items():
+        if k in skip:
+            continue
+        out[k] = v
+    return out
+
+
 def _default() -> Dict[str, Any]:
-    return {"disabled_kinds": [], "telemetry_opt_out": False, "ambient": merge_ambient_defaults({})}
+    return {
+        "disabled_kinds": [],
+        "telemetry_opt_out": False,
+        "ambient": merge_ambient_defaults({}),
+        "identity": merge_identity_defaults({}),
+    }
 
 
 def _normalize(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -78,4 +122,5 @@ def _normalize(data: Dict[str, Any]) -> Dict[str, Any]:
     tot = out.get("telemetry_opt_out")
     out["telemetry_opt_out"] = bool(tot) if tot is not None else False
     out["ambient"] = merge_ambient_defaults(out.get("ambient"))
+    out["identity"] = merge_identity_defaults(out.get("identity"))
     return out

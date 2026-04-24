@@ -237,7 +237,7 @@ class MCPStdioClient:
         )
 
     def call_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Return the raw `result` dict (structuredContent + content + isError)."""
+        """Return the raw `result` dict (`content` JSON + isError; legacy structuredContent optional)."""
         resp = self._send("tools/call", {"name": name, "arguments": arguments})
         return resp.get("result") or {}
 
@@ -268,25 +268,31 @@ class MCPStdioClient:
         if after is not None:
             args["after"] = after
         result = self.call_tool("ask_minion", args)
-        structured = result.get("structuredContent")
-        # New shape: {"results": [...], optional "profile_brief": "..."}.
-        if isinstance(structured, dict) and isinstance(structured.get("results"), list):
-            return structured["results"]
-        # Legacy shape: bare list.
-        if isinstance(structured, list):
-            return structured
-        content = result.get("content") or []
-        for item in content:
-            if item.get("type") == "text":
-                try:
-                    parsed = json.loads(item.get("text") or "[]")
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(parsed, list):
-                    return parsed
-                if isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
-                    return parsed["results"]
+        structured = tool_result_payload(result)
+        rows = structured.get("results")
+        if isinstance(rows, list):
+            return rows
         return []
+
+
+def tool_result_payload(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Decode tool `result` to a dict (prefers legacy structuredContent, else parses content[0].text JSON)."""
+    sc = result.get("structuredContent")
+    if isinstance(sc, dict):
+        return sc
+    for item in result.get("content") or []:
+        if item.get("type") != "text":
+            continue
+        raw = (item.get("text") or "").strip()
+        if len(raw) < 2 or raw[0] not in "{[":
+            continue
+        try:
+            parsed = json.loads(item["text"])
+        except (json.JSONDecodeError, TypeError, KeyError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
 
 
 def run_case(

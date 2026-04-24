@@ -81,7 +81,7 @@ from pydantic import BaseModel, Field, field_validator
 from ingest import ingest_file, ingest_webhook_payload, _looks_like_chatgpt_export
 from parser_extensions import manifest_path
 from parsers import ALL_KINDS, load_user_extensions, supported_extensions, user_extension_mappings
-from settings import apply_settings, load_settings, save_settings
+from settings import apply_settings, load_settings, merge_identity_defaults, save_settings
 import analytics_remote
 import diagnostics
 import telemetry
@@ -559,6 +559,7 @@ class SettingsBody(BaseModel):
     disabled_kinds: Optional[List[str]] = None
     telemetry_opt_out: Optional[bool] = None
     ambient: Optional[Dict[str, Any]] = None
+    identity: Optional[Dict[str, Any]] = None
 
 
 class CryptoSetupBody(BaseModel):
@@ -717,6 +718,22 @@ def update_settings(body: SettingsBody) -> Dict[str, Any]:
         current["telemetry_opt_out"] = bool(body.telemetry_opt_out)
     if body.ambient is not None:
         current["ambient"] = merge_ambient_defaults(body.ambient)
+    if body.identity is not None:
+        cur_id = merge_identity_defaults(current.get("identity"))
+        patch = dict(body.identity)
+        updated_grants = "session_layer_grants" in patch
+        for k, v in patch.items():
+            if k == "session_layer_grants":
+                cur_id["session_layer_grants"] = merge_identity_defaults(
+                    {"session_layer_grants": v}
+                )["session_layer_grants"]
+            elif k == "cluster_auto_propose":
+                cur_id["cluster_auto_propose"] = bool(v)
+            else:
+                cur_id[k] = v
+        if updated_grants:
+            cur_id["session_grants_updated_at"] = time.time()
+        current["identity"] = merge_identity_defaults(cur_id)
     saved = save_settings(State.data_dir, current)
     apply_settings(saved)
     return {"settings": saved, "all_kinds": list(ALL_KINDS)}
@@ -1395,12 +1412,20 @@ def identity_clusters() -> Dict[str, Any]:
 
 @app.post("/identity/clusters/rebuild")
 def identity_clusters_rebuild(body: ClusterRebuildBody) -> Dict[str, Any]:
+    env_auto = (os.environ.get("MINION_CLUSTER_AUTO_PROPOSE") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    idents = merge_identity_defaults(load_settings(State.data_dir).get("identity"))
+    cluster_auto = env_auto or bool(idents.get("cluster_auto_propose"))
     try:
         out = run_preference_clustering(
             State.conn(),
             sample_limit=body.sample_limit,
             k=body.k,
             use_llm=body.use_llm,
+            cluster_auto_propose=cluster_auto,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{e.__class__.__name__}: {e}")

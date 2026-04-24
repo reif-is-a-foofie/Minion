@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  python-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python deps
+        run: |
+          pip install -U pip
+          pip install -r chatgpt_mcp_memory/requirements.txt -r chatgpt_mcp_memory/requirements-dev.txt
+      - name: Core tests
+        run: python scripts/minion_test.py doctor && python scripts/minion_test.py core
+
+  desktop-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: npm ci + svelte-check
+        run: python scripts/minion_test.py desktop
