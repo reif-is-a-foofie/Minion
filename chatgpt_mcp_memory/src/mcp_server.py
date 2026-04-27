@@ -944,6 +944,25 @@ def _tool_list_identity_claims(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "ok", "claims": rows, "count": len(rows)}
 
 
+def _tool_set_identity_claim_status(args: Dict[str, Any]) -> Dict[str, Any]:
+    claim_id = str(args.get("claim_id") or "").strip()
+    if not claim_id:
+        return {"status": "error", "error": "claim_id required"}
+    status = str(args.get("status") or "").strip().lower()
+    if not status:
+        return {"status": "error", "error": "status required"}
+    sb = args.get("superseded_by")
+    superseded = str(sb).strip() if sb not in (None, "") else None
+    conn = _get_conn()
+    ok, err = identity.set_claim_status(
+        conn, claim_id, status=status, superseded_by=superseded
+    )
+    if not ok:
+        return {"status": "error", "error": err or "unknown error"}
+    row = identity_claim_get(conn, claim_id)
+    return {"status": "ok", "claim": row}
+
+
 def _session_layer_grants_from_args(raw: Any) -> Set[int]:
     out: Set[int] = set()
     if not isinstance(raw, list):
@@ -1300,13 +1319,34 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "set_identity_claim_status",
+        "title": "Approve, reject, or transition an identity claim",
+        "description": (
+            "Updates claim status (e.g. proposed→active or proposed→rejected). "
+            "Only call after the user explicitly confirms in chat — especially for `active` on sensitive layers."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["claim_id", "status"],
+            "properties": {
+                "claim_id": {"type": "string"},
+                "status": {"type": "string", "enum": sorted(identity.CLAIM_STATUSES)},
+                "superseded_by": {
+                    "type": ["string", "null"],
+                    "description": "Optional claim_id when status is superseded.",
+                },
+            },
+        },
+    },
+    {
         "name": "get_identity_context",
         "title": "Identity context for agents (least privilege)",
         "description": (
             "Returns active claims for granted ISA layers only, and appends an audit row. "
-            "Layers 1,3,6 are open; 2,4,5,7 require the user to have granted those layer numbers "
-            "this session — pass them in session_layer_grants after the Minion UI unlock "
-            "(local HTTP clients may send header X-Minion-Identity-Session-Grants: 2,5,7 instead)."
+            "Layers 1,3,6 are open; 2,4,5,7 require grants. Effective grants are the union of "
+            "`session_layer_grants` in this call and layers persisted in Minion settings "
+            "(Identity screen). HTTP clients may also send header X-Minion-Identity-Session-Grants: 2,5,7."
         ),
         "inputSchema": {
             "type": "object",
@@ -1327,7 +1367,9 @@ TOOLS: List[Dict[str, Any]] = [
                 "session_layer_grants": {
                     "type": "array",
                     "items": {"type": "integer", "minimum": 1, "maximum": 7},
-                    "description": "Layers the user unlocked this session (selective + locked tiers).",
+                    "description": (
+                        "Extra layers to grant for this call only (unioned with Minion settings identity.session_layer_grants)."
+                    ),
                 },
                 "limit_per_layer": {"type": "integer", "minimum": 1, "maximum": 200, "default": 24},
             },
@@ -1470,8 +1512,9 @@ def _handle_initialize(req: Dict[str, Any]) -> Dict[str, Any]:
         "behavioral patterns, preferences, sensitive). Call `get_identity_schema` for layer titles, "
         "access tiers, and valid `field` keys. Use `propose_identity_update` with optional "
         "layer/field; layer 7 requires meta.explicit_declaration true. "
-        "`get_identity_context` returns only layers the user has unlocked for this session "
-        "(session_layer_grants) plus always-open layers. "
+        "`get_identity_context` returns only granted ISA layers (union of `session_layer_grants` in the tool call "
+        "and layers saved in Minion Identity settings) plus always-open layers. "
+        "`set_identity_claim_status` changes proposal status only after explicit user confirmation in chat. "
         "`list_identity_claims` and `get_identity_summary` surface the queue and a markdown digest."
     )
     return _jsonrpc_result(
@@ -1502,6 +1545,7 @@ _DISPATCH = {
     "index_info": _tool_index_info,
     "propose_identity_update": _tool_propose_identity_update,
     "list_identity_claims": _tool_list_identity_claims,
+    "set_identity_claim_status": _tool_set_identity_claim_status,
     "get_identity_context": _tool_get_identity_context,
     "get_identity_summary": _tool_get_identity_summary,
     "get_identity_schema": _tool_get_identity_schema,

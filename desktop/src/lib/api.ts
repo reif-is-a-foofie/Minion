@@ -544,10 +544,18 @@ export async function restartSidecar(): Promise<{ pid: number; api_port: number 
   return (await invoke("restart_sidecar")) as { pid: number; api_port: number };
 }
 
+export type IdentitySettings = {
+  session_layer_grants?: number[];
+  cluster_auto_propose?: boolean;
+  session_grants_updated_at?: number;
+};
+
 export type Settings = {
   disabled_kinds: string[];
   /** When true, do not POST anonymized telemetry to the configured collector. */
   telemetry_opt_out?: boolean;
+  /** ISA session grants for agents + cluster auto-draft option. */
+  identity?: IdentitySettings;
 };
 
 export type SettingsResponse = {

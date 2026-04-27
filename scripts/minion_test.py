@@ -9,9 +9,12 @@ Usage (from repo root, with dev deps installed — see AGENTS.md):
   python scripts/minion_test.py all           # core, then desktop
   python scripts/minion_test.py mcp-eval --derived-dir ~/path/to/derived
   python scripts/minion_test.py doctor        # quick import / binary sanity checks
+  python scripts/minion_test.py e2e          # Playwright: real sidecar + Vite (npm ci + browser)
+  python scripts/minion_test.py e2e-quick      # Playwright only (node_modules + chromium already installed)
 
-Pytest forwards: anything after ``--`` goes to pytest, e.g.
+Forwards after ``--``: pytest args for ``core`` / ``all``; Playwright args for ``e2e`` / ``e2e-quick``.
   python scripts/minion_test.py core -- -k status_ready
+  python scripts/minion_test.py e2e-quick -- --headed
 """
 from __future__ import annotations
 
@@ -112,6 +115,31 @@ def cmd_all(desktop_mode: str, pytest_forward: list[str]) -> int:
     return cmd_desktop_quick()
 
 
+def cmd_e2e(ci: bool, forward: list[str]) -> int:
+    """Playwright against Vite + Tauri stubs + real Python sidecar (see desktop/e2e/)."""
+    npm = shutil.which("npm")
+    if not npm:
+        print("npm not on PATH", file=sys.stderr)
+        return 127
+    if ci:
+        r = _run([npm, "ci"], cwd=DESKTOP_DIR)
+        if r != 0:
+            return r
+        install = [npm, "exec", "--", "playwright", "install", "chromium"]
+        if os.environ.get("CI"):
+            install.append("--with-deps")
+        r = _run(install, cwd=DESKTOP_DIR)
+        if r != 0:
+            return r
+    cmd = [npm, "run", "test:e2e", "--"]
+    cmd.extend(forward)
+    return _run(cmd, cwd=DESKTOP_DIR)
+
+
+def cmd_e2e_quick(forward: list[str]) -> int:
+    return cmd_e2e(ci=False, forward=forward)
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="Minion unified test runner")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -138,6 +166,12 @@ def main(argv: list[str]) -> int:
     p_all.add_argument("--ci", action="store_true", help="run full npm ci + check like CI")
     p_all.set_defaults(func=lambda a: cmd_all("ci" if a.ci else "quick", a.pytest_forward))
 
+    p_e2e = sub.add_parser("e2e", help="Playwright E2E (npm ci, chromium, real sidecar + Vite stubs)")
+    p_e2e.set_defaults(func=lambda a: cmd_e2e(True, a.npm_forward))
+
+    p_e2eq = sub.add_parser("e2e-quick", help="Playwright E2E without npm ci (local iteration)")
+    p_e2eq.set_defaults(func=lambda a: cmd_e2e_quick(a.npm_forward))
+
     # Parse: allow `core -- -k foo` by pre-splitting on `--`
     if "--" in argv:
         idx = argv.index("--")
@@ -149,14 +183,20 @@ def main(argv: list[str]) -> int:
     if args.cmd == "mcp-eval":
         args.forward = unknown
         args.pytest_forward = []
+        args.npm_forward = []
     elif args.cmd in ("core", "all"):
         args.pytest_forward = pytest_forward + unknown
+        args.npm_forward = []
+    elif args.cmd in ("e2e", "e2e-quick"):
+        args.npm_forward = pytest_forward + unknown
+        args.pytest_forward = []
     else:
         if unknown:
             ap.error(f"unexpected arguments: {unknown}")
         if pytest_forward:
-            ap.error("extra pytest args only apply to core / all (put them after --)")
+            ap.error("use -- for core/all (pytest) or e2e/e2e-quick (playwright args)")
         args.pytest_forward = []
+        args.npm_forward = []
 
     if args.cmd == "mcp-eval":
         args.golden = Path(args.golden).resolve() if args.golden else None

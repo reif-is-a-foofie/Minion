@@ -1,0 +1,76 @@
+# Deploys telemetry-collector/ to Cloudflare Workers + D1 (not Netlify — this stack
+# needs D1 + POST /v1/collect on the same origin as the dashboard).
+#
+# Repo secrets (Settings → Secrets → Actions):
+#   CLOUDFLARE_API_TOKEN   — Create at dash.cloudflare.com → API Tokens → Edit Cloudflare Workers
+#   CLOUDFLARE_ACCOUNT_ID  — Workers overview → right column Account ID
+#   D1_DATABASE_ID         — Workers → D1 → create "minion-telemetry-db" → copy ID
+#   DASHBOARD_TOKEN        — Long random string; use same value when opening the HTML dashboard
+#
+# After the first successful run, copy the worker URL (…workers.dev), append /v1/collect, and set
+# _BUNDLED_ANALYTICS_URL / DEFAULT_MINION_ANALYTICS_URL in the app if it still pointed elsewhere.
+
+name: Deploy telemetry collector
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - "telemetry-collector/**"
+      - ".github/workflows/deploy-telemetry-collector.yml"
+
+concurrency:
+  group: deploy-telemetry-collector
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    # Push: only when repo variable ENABLE_TELEMETRY_DEPLOY == 'true' (avoids red CI before secrets exist).
+    # Manual: Actions → Deploy telemetry collector → Run workflow (always runs this job).
+    if: github.event_name == 'workflow_dispatch' || vars.ENABLE_TELEMETRY_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: telemetry-collector
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: telemetry-collector/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Inject D1 id into wrangler.toml
+        env:
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+        run: |
+          test -n "$D1_DATABASE_ID"
+          sed -i.bak "s|00000000-0000-4000-8000-000000000001|${D1_DATABASE_ID}|g" wrangler.toml
+          rm -f wrangler.toml.bak
+
+      - name: Apply D1 migrations (remote)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler d1 migrations apply minion-telemetry-db --remote
+
+      - name: Deploy worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler deploy
+
+      - name: Set DASHBOARD_TOKEN secret on worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DASHBOARD_TOKEN: ${{ secrets.DASHBOARD_TOKEN }}
+        run: |
+          test -n "$DASHBOARD_TOKEN"
+          printf '%s' "$DASHBOARD_TOKEN" | npx wrangler secret put DASHBOARD_TOKEN

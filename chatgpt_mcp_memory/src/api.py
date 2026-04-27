@@ -1311,9 +1311,20 @@ def identity_schema() -> Dict[str, Any]:
 
 @app.post("/identity/context")
 def identity_context(request: Request, body: IdentityContextBody) -> Dict[str, Any]:
-    grants = identity_layers.parse_session_grants(
+    hdr = identity_layers.parse_session_grants(
         request.headers.get("X-Minion-Identity-Session-Grants")
     )
+    persisted: Set[int] = set()
+    for x in merge_identity_defaults(load_settings(State.data_dir).get("identity")).get(
+        "session_layer_grants"
+    ) or []:
+        try:
+            n = int(x)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= n <= 7:
+            persisted.add(n)
+    grants = hdr | persisted
     payload, err = identity.grant_identity_context(
         State.conn(),
         agent_id=body.agent_id,

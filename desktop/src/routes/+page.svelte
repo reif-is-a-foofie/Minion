@@ -101,6 +101,9 @@
   let evidencePopup = $state<{ path: string; text: string } | null>(null);
   let clusterBusy = $state(false);
   let exportBusy = $state(false);
+  /** Layers 2,4,5,7 the user allows for `get_identity_context` (unioned with per-call MCP grants). */
+  let identitySessionGrants = $state<Set<number>>(new Set());
+  let identityClusterAutoPropose = $state(false);
   /** When true, user has opted out of anonymized remote telemetry. */
   let telemetryOptOut = $state(false);
   /** From GET /capabilities — collector URL is available (not air-gapped / disabled). */
@@ -393,10 +396,50 @@
     evidencePopup = null;
   }
 
+  function applyIdentitySettingsFromResponse(s: { identity?: { session_layer_grants?: number[]; cluster_auto_propose?: boolean } }) {
+    const id = s.identity;
+    const next = new Set<number>();
+    for (const x of id?.session_layer_grants ?? []) {
+      const n = typeof x === "number" ? x : parseInt(String(x), 10);
+      if (n >= 1 && n <= 7) next.add(n);
+    }
+    identitySessionGrants = next;
+    identityClusterAutoPropose = Boolean(id?.cluster_auto_propose);
+  }
+
+  async function saveIdentityOptions() {
+    savingSettings = true;
+    try {
+      const grants = [2, 4, 5, 7].filter((L) => identitySessionGrants.has(L));
+      const res = await updateSettings({
+        identity: {
+          session_layer_grants: grants,
+          cluster_auto_propose: identityClusterAutoPropose,
+        },
+      });
+      applyIdentitySettingsFromResponse(res.settings);
+      pushFeed("identity", "Identity options saved");
+    } catch (e) {
+      pushFeed("identity", `save failed: ${(e as Error).message}`);
+    } finally {
+      savingSettings = false;
+    }
+  }
+
+  function toggleIdentitySessionLayer(layer: number) {
+    const next = new Set(identitySessionGrants);
+    if (next.has(layer)) next.delete(layer);
+    else next.add(layer);
+    identitySessionGrants = next;
+  }
+
   async function selectSettingsNav(nav: SettingsNav) {
     settingsNav = nav;
     if (nav === "library") await refreshSources();
-    if (nav === "identity") await refreshIdentity();
+    if (nav === "identity") {
+      await loadSettings();
+      await refreshIdentity();
+    }
     if (nav === "ingest" && !settingsLoaded) await loadSettings();
     if (nav === "ingest" && !extensionsInfo && !extensionsLoading) void loadExtensionsInfo();
     if (nav === "support") await loadSupportPanel();
@@ -411,7 +454,10 @@
     if (nav) settingsNav = nav;
     if (!settingsLoaded) await loadSettings();
     if (settingsNav === "library") await refreshSources();
-    if (settingsNav === "identity") await refreshIdentity();
+    if (settingsNav === "identity") {
+      await loadSettings();
+      await refreshIdentity();
+    }
     if (settingsNav === "support") await loadSupportPanel();
   }
 
@@ -620,6 +666,7 @@
       allKinds = res.all_kinds;
       disabledKinds = new Set(res.settings.disabled_kinds ?? []);
       telemetryOptOut = Boolean(res.settings.telemetry_opt_out);
+      applyIdentitySettingsFromResponse(res.settings);
       settingsLoaded = true;
     } catch (e) {
       const msg = formatHttpErrorMessage((e as Error).message);
@@ -1487,6 +1534,41 @@
             </div>
           {:else if settingsNav === "identity"}
             <div class="settings-section settings-section-flush">
+              <div class="setting-row setting-row-stack settings-spaced">
+                <div class="setting-main">
+                  <div class="setting-label">Agent access to ISA layers</div>
+                  <div class="setting-desc">
+                    Layers <span class="mono">1</span>, <span class="mono">3</span>, and <span class="mono">6</span> are always available to
+                    <span class="mono">get_identity_context</span>. Enable <span class="mono">2</span>, <span class="mono">4</span>,
+                    <span class="mono">5</span>, and/or <span class="mono">7</span> here so Claude (MCP) can read those tiers without passing grants in every tool call.
+                    Layer <span class="mono">7</span> remains user-declared for proposals; this toggle only widens read access.
+                  </div>
+                </div>
+              </div>
+              <div class="identity-layer-toggles settings-spaced">
+                {#each [{ n: 2, hint: "Values (selective)" }, { n: 4, hint: "Relationships (selective)" }, { n: 5, hint: "Patterns (selective)" }, { n: 7, hint: "Sensitive (locked)" }] as row (row.n)}
+                  <label class="identity-layer-toggle">
+                    <input
+                      type="checkbox"
+                      checked={identitySessionGrants.has(row.n)}
+                      onchange={() => toggleIdentitySessionLayer(row.n)}
+                    />
+                    <span><span class="mono">L{row.n}</span> — {row.hint}</span>
+                  </label>
+                {/each}
+              </div>
+              <label class="identity-cluster-auto setting-row-stack settings-spaced">
+                <input type="checkbox" bind:checked={identityClusterAutoPropose} />
+                <span>
+                  After <strong>Rebuild clusters</strong>, auto-draft layer-6 preference proposals from clusters (review in Proposed).
+                  You can still use env <span class="mono">MINION_CLUSTER_AUTO_PROPOSE=1</span> instead.
+                </span>
+              </label>
+              <div class="identity-options-actions settings-spaced">
+                <button type="button" class="ghost" onclick={() => void saveIdentityOptions()} disabled={savingSettings}
+                  >{savingSettings ? "Saving…" : "Save identity options"}</button
+                >
+              </div>
               <div class="chips identity-toolbar">
                 <button type="button" class:chip-active={identityTab === "proposed"} onclick={() => switchIdentityTab("proposed")}>Proposed</button>
                 <button type="button" class:chip-active={identityTab === "active"} onclick={() => switchIdentityTab("active")}>Active</button>
@@ -2645,6 +2727,32 @@
   }
   .library-sources-head {
     margin-top: 4px;
+  }
+  .identity-layer-toggles {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    margin-left: 0.15rem;
+  }
+  .identity-layer-toggle {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    font-size: 0.9rem;
+    cursor: pointer;
+  }
+  .identity-cluster-auto {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    font-size: 0.9rem;
+    cursor: pointer;
+    max-width: 44rem;
+  }
+  .identity-options-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
   }
   .identity-toolbar {
     margin-bottom: 14px;

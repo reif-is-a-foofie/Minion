@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Set
+from typing import Any, Dict, List, Set
 
 from consent import merge_ambient_defaults
 from parsers import ALL_KINDS, set_disabled_kinds

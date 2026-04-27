@@ -44,3 +44,7 @@ desktop/src-tauri/target/
 desktop/src-tauri/gen/
 # sync_sidecar.sh output; regenerated on every build
 desktop/src-tauri/resources/sidecar/
+
+telemetry-collector/node_modules/
+telemetry-collector/.wrangler/
+telemetry-collector/.dev.vars

@@ -1,0 +1,13 @@
+{
+  "name": "minion-telemetry-collector",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply minion-telemetry-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply minion-telemetry-db --remote"
+  },
+  "devDependencies": {
+    "wrangler": "^4.22.0"
+  }
+}

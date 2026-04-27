@@ -78,6 +78,7 @@ Keep these invariants when you change anything:
 - `chatgpt_mcp_memory/src/` — Python core: parsers, store, ingest, mcp server.
 - `desktop/` — Tauri app (Rust shell + SvelteKit UI).
 - `chatgpt_mcp_memory/src/telemetry.py` — the feedback-loop log.
+- `telemetry-collector/` — Cloudflare Worker + D1 for remote collect + operator dashboard; deploy via GitHub Actions workflow `Deploy telemetry collector` (see workflow file for required secrets).
 - `~/Library/Application Support/Minion/data/` — live DB, inbox, telemetry.
 
 ## Testing methodology (for every agent)
@@ -90,6 +91,8 @@ python scripts/minion_test.py core      # Python: unit + real sidecar HTTP/WS sm
 python scripts/minion_test.py desktop-quick   # Svelte check (needs desktop/node_modules)
 python scripts/minion_test.py all         # core then desktop-quick
 python scripts/minion_test.py all --ci    # like CI: core + npm ci + check
+python scripts/minion_test.py e2e       # Playwright: Chromium + Vite + real sidecar (heavy)
+python scripts/minion_test.py e2e-quick # same as e2e but skip npm ci (needs chromium installed)
 ```
 
 **Tiers**
@@ -100,6 +103,7 @@ python scripts/minion_test.py all --ci    # like CI: core + npm ci + check
 | **1** | `core` (`pytest chatgpt_mcp_memory/tests`) | Default gate for every PR. Spins a real `api.py` process per test where needed — not mocked HTTP. |
 | **2** | `mcp-eval` / `eval/test_mcp_golden.py` | Regression on retrieval against a **real indexed corpus**. Needs `MINION_DERIVED_DIR` or `--derived-dir`. Skips in CI if unset; run locally before shipping retrieval changes. |
 | **3** | `desktop` / `desktop-quick` | UI contract: `npm run check` (types + Svelte). Full `desktop` runs `npm ci` first (CI-style). |
+| **4** | `e2e` / `e2e-quick` | **Playwright** against `vite dev` with **Tauri IPC stubbed** (`desktop/e2e/stubs/`) and a **real** `api.py` sidecar from `desktop/scripts/e2e-desktop-webserver.sh`. Uses the same Python rules as **tier 1** (needs loadable SQLite extensions + deps — **not** Apple CLT Python 3.9). Set `MINION_PYTHON` to your venv interpreter when running locally. First browser install: `cd desktop && npm run test:e2e:install`. |
 
 **Setup (once per machine)**
 
@@ -114,6 +118,10 @@ Then either `export MINION_PYTHON=$PWD/../chatgpt_mcp_memory/.venv/bin/python` f
 **Pytest forwards** (only for `core` / `all`): put pytest args after `--`:
 
 `python scripts/minion_test.py core -- -k test_status_ready`
+
+**Playwright forwards** (only for `e2e` / `e2e-quick`):
+
+`python scripts/minion_test.py e2e-quick -- --headed`
 
 **Golden / MCP eval**
 

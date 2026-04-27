@@ -1,0 +1,20 @@
+# Operator analytics for Minion remote telemetry (POST /v1/collect).
+#
+# CI: GitHub Actions → "Deploy telemetry collector" (workflow_dispatch). Add repo secrets
+# listed in .github/workflows/deploy-telemetry-collector.yml. Optional: set repo variable
+# ENABLE_TELEMETRY_DEPLOY=true to auto-deploy on pushes under telemetry-collector/.
+#
+# Local: npm ci && wrangler login && wrangler d1 create minion-telemetry-db (paste id below)
+#   && npm run db:migrate:remote && printf 'secret\n' | wrangler secret put DASHBOARD_TOKEN
+#   && npm run deploy
+#
+# Dashboard: https://<worker-subdomain>.workers.dev/ — paste DASHBOARD_TOKEN.
+
+name = "minion-telemetry"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "minion-telemetry-db"
+database_id = "00000000-0000-4000-8000-000000000001"

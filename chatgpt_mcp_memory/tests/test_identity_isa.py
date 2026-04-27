@@ -15,6 +15,7 @@ pytest.importorskip("sqlite_vec")
 from store import connect, identity_claim_list  # noqa: E402
 import identity  # noqa: E402
 import identity_layers  # noqa: E402
+from settings import merge_identity_defaults  # noqa: E402
 
 
 def test_layer7_requires_explicit_declaration(tmp_path) -> None:
@@ -100,3 +101,9 @@ def test_field_validation(tmp_path) -> None:
 
 def test_parse_session_grants_header() -> None:
     assert identity_layers.parse_session_grants("2, 7, 99") == {2, 7}
+
+
+def test_merge_identity_defaults_sorts_and_filters() -> None:
+    d = merge_identity_defaults({"session_layer_grants": [7, 2, 2, 0, 99], "cluster_auto_propose": 1})
+    assert d["session_layer_grants"] == [2, 7]
+    assert d["cluster_auto_propose"] is True

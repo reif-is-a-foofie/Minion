@@ -8,7 +8,9 @@ from pathlib import Path
 _SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(_SRC))
 
+import identity
 import mcp_server as ms
+from settings import load_settings, merge_identity_defaults, save_settings
 
 
 def test_tool_result_single_json_channel():
@@ -52,6 +54,80 @@ def test_initialize_instructions_shorter_when_voice_unbuilt(monkeypatch, tmp_pat
     instr = (out.get("result") or {}).get("instructions") or ""
     assert "Voice bootstrap required" in instr
     assert len(instr) < 6500, f"initialize instructions unexpectedly large: {len(instr)} chars"
+
+
+def test_merge_tool_and_persisted_grants():
+    assert ms._merge_tool_and_persisted_grants([2], {5, 6}) == {2, 5, 6}
+    assert ms._merge_tool_and_persisted_grants(None, {7}) == {7}
+
+
+def test_set_identity_claim_status_rejects(monkeypatch, tmp_path):
+    monkeypatch.setenv("MINION_DATA_DIR", str(tmp_path))
+    ms._CONN = None
+    try:
+        conn = ms._get_conn()
+        payload, err = identity.propose_identity_update(
+            conn,
+            kind="fact",
+            text="mcp status tool test claim",
+            source_agent="pytest",
+        )
+        assert err is None and payload
+        cid = str(payload["claim_id"])
+        out = ms._tool_set_identity_claim_status({"claim_id": cid, "status": "rejected"})
+        assert out.get("status") == "ok"
+        assert (out.get("claim") or {}).get("status") == "rejected"
+    finally:
+        c = ms._CONN
+        if c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
+            ms._CONN = None
+
+
+def test_get_identity_context_uses_persisted_settings_grants(monkeypatch, tmp_path):
+    monkeypatch.setenv("MINION_DATA_DIR", str(tmp_path))
+    ms._CONN = None
+    try:
+        cur = load_settings(tmp_path)
+        cur["identity"] = merge_identity_defaults({"session_layer_grants": [5]})
+        save_settings(tmp_path, cur)
+
+        conn = ms._get_conn()
+        payload, err = identity.propose_identity_update(
+            conn,
+            kind="pattern",
+            text="pytest deep work mornings",
+            layer=5,
+            field="work_rhythm",
+            source_agent="pytest",
+        )
+        assert err is None and payload
+        cid = payload["claim_id"]
+        identity.set_claim_status(conn, cid, status="active")
+        conn.commit()
+
+        out = ms._tool_get_identity_context(
+            {
+                "purpose": "test persisted session grants",
+                "requested_layers": [5, 6],
+                "session_layer_grants": [],
+            }
+        )
+        assert out.get("status") == "ok"
+        assert 5 in (out.get("granted_layers") or [])
+        assert "5" in (out.get("claims") or {})
+        assert len((out.get("claims") or {}).get("5") or []) >= 1
+    finally:
+        c = ms._CONN
+        if c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
+            ms._CONN = None
 
 
 def test_get_identity_schema_returns_seven_layers():
