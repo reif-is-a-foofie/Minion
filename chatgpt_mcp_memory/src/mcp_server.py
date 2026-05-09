@@ -126,6 +126,25 @@ def _data_dir() -> Path:
     return exe.parent.parent / "data" / "derived"
 
 
+def _consent_filter_hits_for_mcp(hits: List[Any]) -> List[Any]:
+    try:
+        from consent_policy import filter_hits_for_mcp
+
+        return filter_hits_for_mcp(hits, _data_dir())
+    except Exception:
+        log.exception("MCP consent filter failed; using unfiltered hits")
+        return hits
+
+
+def _screen_context_tools_allowed() -> bool:
+    try:
+        from consent_policy import screen_tools_allowed_for_mcp
+
+        return screen_tools_allowed_for_mcp(_data_dir())
+    except Exception:
+        return True
+
+
 def _inbox_dir() -> Path:
     env = _env_first("MINION_INBOX")
     if env:
@@ -518,6 +537,8 @@ def _tool_ask_minion(arguments: Dict[str, Any]) -> List[Dict[str, Any]]:
         _SESSION_STATE["_last_rerank"] = rerank_used
         _SESSION_STATE["_last_candidates"] = len(relevance_hits)
 
+    hits = _consent_filter_hits_for_mcp(hits)
+
     if mode in ("relevance", "keyword") and hits:
         hits, bias_meta = apply_identity_rerank(conn, hits)
         _SESSION_STATE["_bias_meta"] = bias_meta
@@ -884,6 +905,11 @@ def _tool_get_identity_summary(_: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _tool_what_am_i_working_on(_: Dict[str, Any]) -> Dict[str, Any]:
+    if not _screen_context_tools_allowed():
+        return {
+            "status": "blocked",
+            "hint": "Disabled via consent_policy.json → readers.mcp.allow_screen_context_tools=false.",
+        }
     row = screen_context_store.current_record(_data_dir())
     if row is None:
         return {
@@ -905,6 +931,11 @@ def _tool_what_am_i_working_on(_: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _tool_search_screen_memory(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    if not _screen_context_tools_allowed():
+        return {
+            "status": "error",
+            "error": "screen context MCP tools disabled in consent_policy.json",
+        }
     query = str(arguments.get("query") or "").strip()
     lim = int(arguments.get("limit") or 30)
     lim = max(1, min(lim, 200))
@@ -915,6 +946,15 @@ def _tool_search_screen_memory(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _tool_summarize_recent_activity(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    if not _screen_context_tools_allowed():
+        return {
+            "status": "blocked",
+            "summary": (
+                "Screen-context MCP tools are disabled via consent_policy.json "
+                "(readers.mcp.allow_screen_context_tools=false)."
+            ),
+            "events_used": 0,
+        }
     lim = int(arguments.get("event_limit") or arguments.get("limit") or 60)
     return screen_context_store.summarize_recent_heuristic(_data_dir(), event_limit=lim)
 

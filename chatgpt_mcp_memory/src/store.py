@@ -193,6 +193,48 @@ END;
 """
 
 
+def _apply_schema_upgrades(conn: sqlite3.Connection) -> None:
+    """Idempotent migrations layered onto `_SCHEMA_SQL` for older installs."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ambient_events (
+            event_id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            captured_at REAL NOT NULL,
+            sensitivity TEXT NOT NULL DEFAULT 'vault_local',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            storage_tier TEXT NOT NULL DEFAULT 'hot',
+            ttl_expires_at REAL,
+            dedupe_key TEXT UNIQUE
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ambient_events_captured ON ambient_events(captured_at DESC)"
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS identity_audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            action TEXT NOT NULL,
+            claim_id TEXT,
+            detail_json TEXT NOT NULL DEFAULT '{}'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_identity_audit_ts ON identity_audit_log(ts DESC)"
+    )
+
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+    if cols and "storage_tier" not in cols:
+        conn.execute(
+            "ALTER TABLE chunks ADD COLUMN storage_tier TEXT NOT NULL DEFAULT 'hot'"
+        )
+
+
 def _ensure_vec_table(conn: sqlite3.Connection, dim: int) -> None:
     """Create the sqlite-vec virtual table if missing. Dim is baked into the DDL."""
     row = conn.execute(
@@ -328,6 +370,7 @@ def _bootstrap_schema(conn: sqlite3.Connection, embed_dim: int) -> None:
     conn.executescript(_SCHEMA_SQL)
     _ensure_vec_table(conn, embed_dim)
     _ensure_fts_table(conn)
+    _apply_schema_upgrades(conn)
 
     existing = conn.execute("SELECT value FROM meta WHERE key='embed_dim'").fetchone()
     if existing is None:
@@ -1361,6 +1404,99 @@ def preference_clusters_list(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
             }
         )
     return out
+
+
+def identity_audit_log_append(
+    conn: sqlite3.Connection,
+    *,
+    action: str,
+    claim_id: Optional[str] = None,
+    detail: Optional[Dict[str, Any]] = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO identity_audit_log(ts, action, claim_id, detail_json) VALUES (?,?,?,?)",
+        (
+            time.time(),
+            action.strip()[:128],
+            claim_id,
+            json.dumps(detail or {}, ensure_ascii=False),
+        ),
+    )
+
+
+def identity_claim_mirror_history(
+    conn: sqlite3.Connection, *, limit: int = 50
+) -> List[Dict[str, Any]]:
+    """Claims no longer active/proposed-only narrative — superseded or rejected."""
+    lim = int(max(1, min(limit, 500)))
+    rows = conn.execute(
+        "SELECT claim_id, kind, text, status, confidence, source_agent, "
+        "created_at, updated_at, superseded_by, meta_json FROM identity_claims "
+        "WHERE status IN ('superseded', 'rejected') "
+        "ORDER BY updated_at DESC LIMIT ?",
+        (lim,),
+    ).fetchall()
+    return [_row_identity_claim(r) for r in rows]
+
+
+def ambient_events_recent(
+    conn: sqlite3.Connection, *, limit: int = 80
+) -> List[Dict[str, Any]]:
+    lim = int(max(1, min(limit, 2000)))
+    rows = conn.execute(
+        "SELECT event_id, event_type, captured_at, sensitivity, payload_json, storage_tier, dedupe_key "
+        "FROM ambient_events ORDER BY captured_at DESC LIMIT ?",
+        (lim,),
+    ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "event_id": r["event_id"],
+                "event_type": r["event_type"],
+                "captured_at": float(r["captured_at"]),
+                "sensitivity": r["sensitivity"],
+                "payload": json.loads(r["payload_json"] or "{}"),
+                "storage_tier": r["storage_tier"],
+                "dedupe_key": r["dedupe_key"],
+            }
+        )
+    return out
+
+
+def ambient_event_insert_ignore(
+    conn: sqlite3.Connection,
+    *,
+    event_type: str,
+    captured_at: float,
+    dedupe_key: str,
+    payload: Dict[str, Any],
+    sensitivity: str = "vault_local",
+    storage_tier: str = "hot",
+) -> bool:
+    """Returns True if a row was inserted (dedupe_key unseen)."""
+    event_id = "amb-" + hashlib.sha256(dedupe_key.encode("utf-8")).hexdigest()[:24]
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO ambient_events(event_id, event_type, captured_at, sensitivity, "
+        "payload_json, storage_tier, dedupe_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            event_id,
+            event_type.strip()[:64],
+            float(captured_at),
+            sensitivity.strip()[:64],
+            json.dumps(payload, ensure_ascii=False),
+            storage_tier.strip()[:32],
+            dedupe_key[:2048],
+        ),
+    )
+    return cur.rowcount == 1
+
+
+def chunk_storage_tier_counts(conn: sqlite3.Connection) -> Dict[str, int]:
+    rows = conn.execute(
+        "SELECT COALESCE(storage_tier, 'hot') AS t, COUNT(*) AS n FROM chunks GROUP BY t"
+    ).fetchall()
+    return {str(r["t"]): int(r["n"]) for r in rows}
 
 
 def iter_chunk_embedding_rows(

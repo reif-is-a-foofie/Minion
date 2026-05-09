@@ -61,7 +61,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -74,7 +74,9 @@ from settings import apply_settings, load_settings, save_settings
 import analytics_remote
 import diagnostics
 import telemetry
+import consent_policy
 import identity
+from ambient_pipeline import ingest_screen_context_jsonl
 from version import __version__
 from export_bundle import write_identity_export_zip
 from preference_cluster import run_preference_clustering
@@ -91,7 +93,11 @@ from store import (
     get_chunk,
     get_source,
     identity_claim_get,
+    identity_claim_mirror_history,
+    identity_audit_log_append,
     identity_edges_for_claim,
+    ambient_events_recent,
+    chunk_storage_tier_counts,
     keyword_search as store_keyword_search,
     list_sources,
     preference_clusters_list,
@@ -553,6 +559,7 @@ class IdentityPatchBody(BaseModel):
     superseded_by: Optional[str] = None
     text: Optional[str] = None
     meta: Optional[Dict[str, Any]] = None
+    revision_source: Optional[str] = None
 
     @model_validator(mode="after")
     def _patch_one_field(self) -> "IdentityPatchBody":
@@ -561,9 +568,10 @@ class IdentityPatchBody(BaseModel):
             and self.superseded_by is None
             and self.text is None
             and self.meta is None
+            and self.revision_source is None
         ):
             raise ValueError(
-                "provide at least one of: status, superseded_by, text, meta"
+                "provide at least one of: status, superseded_by, text, meta, revision_source"
             )
         return self
 
@@ -689,6 +697,25 @@ def update_settings(body: SettingsBody) -> Dict[str, Any]:
     return {"settings": saved, "all_kinds": list(ALL_KINDS)}
 
 
+@app.get("/settings/consent")
+def get_consent_settings() -> Dict[str, Any]:
+    """Effective MCP/data-sharing consent policy persisted under consent_policy.json."""
+    return consent_policy.load_policy(State.data_dir)
+
+
+@app.put("/settings/consent")
+def put_consent_settings(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    consent_policy.save_policy(State.data_dir, body)
+    conn = State.conn()
+    identity_audit_log_append(
+        conn,
+        action="consent_policy_put",
+        detail={"schema_version": body.get("schema_version")},
+    )
+    conn.commit()
+    return {"ok": True, "policy": consent_policy.load_policy(State.data_dir)}
+
+
 @app.post("/reconcile")
 def reconcile_endpoint(body: ReconcileBody) -> Dict[str, Any]:
     """Full inbox scan → DB (and optional force re-embed). Runs in the background."""
@@ -759,6 +786,13 @@ def capabilities() -> Dict[str, Any]:
         "retrieval": {
             "identity_bias": True,
             "rrf_fusion": True,
+            "mcp_consent": {
+                "policy_file": "consent_policy.json",
+                "note": (
+                    "Desktop HTTP search stays full vault; MCP ask_minion drops chunks matching "
+                    "readers.mcp.deny_chunk_source_kinds / deny_path_substrings."
+                ),
+            },
         },
         "analytics": {
             "url_configured": bool(analytics_remote.effective_analytics_url().strip()),
@@ -780,9 +814,15 @@ def capabilities() -> Dict[str, Any]:
             "reconcile": "POST /reconcile",
             "events_ws": "WS /events",
             "identity_claims": "GET /identity/claims",
+            "identity_mirror": "GET /identity/mirror",
             "identity_propose": "POST /identity/claims/propose",
             "identity_export": "POST /identity/export",
             "clusters_rebuild": "POST /identity/clusters/rebuild",
+            "settings_consent_get": "GET /settings/consent",
+            "settings_consent_put": "PUT /settings/consent",
+            "ambient_sync": "POST /ambient/sync",
+            "ambient_events": "GET /ambient/events",
+            "storage_report": "POST /maintenance/storage-report",
             "diagnostics_about": "GET /diagnostics/about",
             "diagnostics_log": "GET /diagnostics/log",
             "diagnostics_log_text": "GET /diagnostics/log/text",
@@ -1178,24 +1218,51 @@ def identity_propose(body: IdentityProposeBody) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=err)
     assert payload is not None
     telemetry.log_event("identity_propose", claim_id=payload.get("claim_id"))
+    conn = State.conn()
+    identity_audit_log_append(
+        conn,
+        action="identity_propose",
+        claim_id=payload.get("claim_id"),
+        detail={"kind": body.kind, "source_agent": body.source_agent},
+    )
+    conn.commit()
     return payload
 
 
 @app.patch("/identity/claims/{claim_id}")
 def identity_patch_claim(claim_id: str, body: IdentityPatchBody) -> Dict[str, Any]:
     conn = State.conn()
+    meta_merge: Optional[Dict[str, Any]] = None
+    if body.meta is not None or body.revision_source is not None:
+        meta_merge = dict(body.meta or {})
+        if body.revision_source:
+            rs = body.revision_source.strip()[:64]
+            if rs:
+                meta_merge["revision_source"] = rs
+        if not meta_merge:
+            meta_merge = None
     row, err = identity.patch_claim(
         conn,
         claim_id,
         status=body.status,
         superseded_by=body.superseded_by,
         text=body.text,
-        meta_merge=body.meta,
+        meta_merge=meta_merge,
     )
     if err:
         raise HTTPException(status_code=404 if "not found" in (err or "") else 400, detail=err)
     if row is None:
         raise HTTPException(status_code=404, detail="claim not found")
+    identity_audit_log_append(
+        conn,
+        action="identity_patch",
+        claim_id=claim_id,
+        detail={
+            "status": body.status,
+            "superseded_by": body.superseded_by,
+            "revision_source": (meta_merge or {}).get("revision_source"),
+        },
+    )
     conn.commit()
     telemetry.log_event(
         "identity_patch",
@@ -1208,6 +1275,16 @@ def identity_patch_claim(claim_id: str, body: IdentityPatchBody) -> Dict[str, An
 @app.get("/identity/summary")
 def identity_summary() -> Dict[str, Any]:
     return {"markdown": identity.build_identity_summary(State.conn())}
+
+
+@app.get("/identity/mirror")
+def identity_mirror(limit_history: int = 60) -> Dict[str, Any]:
+    """Time-aware mirror: digest markdown plus superseded/rejected claim history."""
+    conn = State.conn()
+    lim = int(max(1, min(limit_history, 500)))
+    hist = identity_claim_mirror_history(conn, limit=lim)
+    md = identity.build_identity_summary(conn, history_tail=min(12, lim))
+    return {"markdown": md, "history": hist, "history_count": len(hist)}
 
 
 @app.get("/identity/clusters")
@@ -1229,6 +1306,33 @@ def identity_clusters_rebuild(body: ClusterRebuildBody) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"{e.__class__.__name__}: {e}")
     State.conn().commit()
     return out
+
+
+@app.post("/ambient/sync")
+def ambient_sync_endpoint() -> Dict[str, Any]:
+    """Ingest tail of screen_context/stream.jsonl into `ambient_events` (deduped)."""
+    conn = State.conn()
+    out = ingest_screen_context_jsonl(data_dir=State.data_dir, conn=conn, max_lines=3000)
+    conn.commit()
+    return out
+
+
+@app.get("/ambient/events")
+def ambient_events_list(limit: int = 80) -> Dict[str, Any]:
+    rows = ambient_events_recent(State.conn(), limit=limit)
+    return {"events": rows, "count": len(rows)}
+
+
+@app.post("/maintenance/storage-report")
+def maintenance_storage_report() -> Dict[str, Any]:
+    conn = State.conn()
+    row = conn.execute("SELECT COUNT(*) AS n FROM ambient_events").fetchone()
+    amb_count = int(row["n"]) if row else 0
+    return {
+        "chunk_storage_tiers": chunk_storage_tier_counts(conn),
+        "ambient_event_count": amb_count,
+        "note": "Compaction tiers are metadata-first; cold offload hooks land behind policy.",
+    }
 
 
 @app.post("/identity/export")

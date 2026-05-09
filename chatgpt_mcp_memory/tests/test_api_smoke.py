@@ -323,8 +323,16 @@ def test_identity_patch_text(sidecar) -> None:
     assert "Updated boundary" in patched.json()["claim"]["text"]
 
 
+def test_identity_mirror(sidecar) -> None:
+    r = sidecar.get("/identity/mirror", params={"limit_history": 10})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "markdown" in body and isinstance(body["markdown"], str)
+    assert "history" in body and isinstance(body["history"], list)
+
+
 # ---------------------------------------------------------------------------
-# 9. Bulk DELETE /sources by kind
+# 10. Bulk DELETE /sources by kind
 # ---------------------------------------------------------------------------
 
 
@@ -349,7 +357,7 @@ def test_delete_sources_by_kind_bulk(sidecar, staged_note: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 10. Webhook ingest + extensions reload
+# 11. Webhook ingest + extensions reload
 # ---------------------------------------------------------------------------
 
 

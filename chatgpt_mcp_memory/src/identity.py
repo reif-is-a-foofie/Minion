@@ -14,6 +14,7 @@ from store import (
     identity_claim_get,
     identity_claim_insert,
     identity_claim_list,
+    identity_claim_mirror_history,
     identity_claim_patch_fields,
     identity_claim_set_status,
     identity_edge_insert,
@@ -197,6 +198,7 @@ def build_identity_summary(
     *,
     max_claims: int = 40,
     max_clusters: int = 8,
+    history_tail: int = 0,
 ) -> str:
     active = identity_claim_list(conn, status="active", limit=max_claims)
     proposed = identity_claim_list(conn, status="proposed", limit=min(20, max_claims))
@@ -242,6 +244,21 @@ def build_identity_summary(
             if cl["run_at"] != seen_run:
                 break
             lines.append(f"- **{cl['label']}**: {cl['summary']}")
+
+    ht = int(max(0, min(history_tail, 500)))
+    if ht > 0:
+        hist = identity_claim_mirror_history(conn, limit=ht)
+        if hist:
+            lines.append("### Recent revisions (superseded / rejected)")
+            for c in hist:
+                meta = c.get("meta") or {}
+                rs = meta.get("revision_source") or "unknown"
+                who = f" — _source: {rs}_"
+                sup = f" → `{c['superseded_by']}`" if c.get("superseded_by") else ""
+                excerpt = c["text"][:280] + ("…" if len(c["text"]) > 280 else "")
+                lines.append(
+                    f"- **{c['kind']}** ({c['status']}){who}{sup}: {excerpt}"
+                )
 
     return "\n".join(lines) + "\n"
 

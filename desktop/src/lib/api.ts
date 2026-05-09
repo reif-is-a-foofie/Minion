@@ -298,6 +298,7 @@ export async function patchIdentityClaim(
     superseded_by?: string;
     text?: string;
     meta?: Record<string, unknown>;
+    revision_source?: string;
   },
 ): Promise<{ claim: IdentityClaim | null }> {
   return apiFetch(`/identity/claims/${encodeURIComponent(claimId)}`, {
@@ -348,6 +349,30 @@ export async function rebuildPreferenceClusters(body: {
     method: "POST",
     body: JSON.stringify(body),
   });
+}
+
+export type IdentityMirrorResponse = {
+  markdown: string;
+  history: IdentityClaim[];
+  history_count: number;
+};
+
+/** Time-aware mirror digest + superseded/rejected claims (desktop Identity → Mirror). */
+export async function fetchIdentityMirror(params: { limit_history?: number } = {}): Promise<IdentityMirrorResponse> {
+  const q = new URLSearchParams();
+  if (params.limit_history != null) q.set("limit_history", String(params.limit_history));
+  const qs = q.toString();
+  return apiFetch(`/identity/mirror${qs ? `?${qs}` : ""}`);
+}
+
+/** Pull tail of `screen_context/stream.jsonl` into `ambient_events` (vault-local). */
+export async function syncAmbientFromScreenContext(): Promise<{
+  ingested?: number;
+  scanned_lines?: number;
+  skipped_no_file?: boolean;
+  error?: string;
+}> {
+  return apiFetch("/ambient/sync", { method: "POST", body: "{}" });
 }
 
 /** Full inbox scan → DB. Use `force: true` to re-embed even when sha unchanged (slow). */

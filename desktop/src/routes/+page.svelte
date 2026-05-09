@@ -20,6 +20,7 @@
     fetchDiagnosticsLogTextAtBase,
     fetchDiagnosticsPeers,
     fetchCapabilities,
+    fetchIdentityMirror,
     fetchStatus,
     getConfig,
     ingestPath,
@@ -32,6 +33,7 @@
     restartSidecar,
     revealInFinder,
     search,
+    syncAmbientFromScreenContext,
     updateSettings,
     waitForHealthySidecar,
     isNotFoundError,
@@ -96,7 +98,11 @@
 
   let identityClaims = $state<IdentityClaim[]>([]);
   let identityLoading = $state(false);
-  let identityTab = $state<"proposed" | "active">("proposed");
+  let identityTab = $state<"proposed" | "active" | "mirror">("proposed");
+  let identityMirrorMd = $state("");
+  let identityMirrorHistory = $state<IdentityClaim[]>([]);
+  let identityMirrorLoading = $state(false);
+  let ambientSyncBusy = $state(false);
   let evidencePopup = $state<{ path: string; text: string } | null>(null);
   let clusterBusy = $state(false);
   let exportBusy = $state(false);
@@ -284,7 +290,38 @@
     }
   }
 
+  async function refreshMirror() {
+    identityMirrorLoading = true;
+    try {
+      const r = await fetchIdentityMirror({ limit_history: 80 });
+      identityMirrorMd = r.markdown;
+      identityMirrorHistory = r.history;
+    } catch (e) {
+      pushFeed("identity", `mirror load failed: ${(e as Error).message}`);
+    } finally {
+      identityMirrorLoading = false;
+    }
+  }
+
+  async function runAmbientSync() {
+    ambientSyncBusy = true;
+    try {
+      const r = await syncAmbientFromScreenContext();
+      const n = typeof r.ingested === "number" ? r.ingested : 0;
+      pushFeed("identity", `ambient sync: +${n} row(s)`);
+      await refreshMirror();
+    } catch (e) {
+      pushFeed("identity", `ambient sync failed: ${(e as Error).message}`);
+    } finally {
+      ambientSyncBusy = false;
+    }
+  }
+
   async function refreshIdentity() {
+    if (identityTab === "mirror") {
+      await refreshMirror();
+      return;
+    }
     identityLoading = true;
     try {
       const st = identityTab === "proposed" ? "proposed" : "active";
@@ -322,14 +359,14 @@
     if (settingsNav === "support") await loadSupportPanel();
   }
 
-  function switchIdentityTab(tab: "proposed" | "active") {
+  function switchIdentityTab(tab: "proposed" | "active" | "mirror") {
     identityTab = tab;
     void refreshIdentity();
   }
 
   async function approveClaim(id: string) {
     try {
-      await patchIdentityClaim(id, { status: "active" });
+      await patchIdentityClaim(id, { status: "active", revision_source: "user" });
       pushFeed("identity", "claim approved");
       await refreshIdentity();
     } catch (e) {
@@ -339,7 +376,7 @@
 
   async function rejectClaim(id: string) {
     try {
-      await patchIdentityClaim(id, { status: "rejected" });
+      await patchIdentityClaim(id, { status: "rejected", revision_source: "user" });
       pushFeed("identity", "claim rejected");
       await refreshIdentity();
     } catch (e) {
@@ -1440,11 +1477,43 @@
               <div class="chips identity-toolbar">
                 <button type="button" class:chip-active={identityTab === "proposed"} onclick={() => switchIdentityTab("proposed")}>Proposed</button>
                 <button type="button" class:chip-active={identityTab === "active"} onclick={() => switchIdentityTab("active")}>Active</button>
-                <button type="button" class="ghost" onclick={() => refreshIdentity()} disabled={identityLoading}>{identityLoading ? "…" : "Refresh"}</button>
+                <button type="button" class:chip-active={identityTab === "mirror"} onclick={() => switchIdentityTab("mirror")}>Mirror</button>
+                <button type="button" class="ghost" onclick={() => refreshIdentity()} disabled={identityLoading || identityMirrorLoading}>{identityLoading || identityMirrorLoading ? "…" : "Refresh"}</button>
+                <button type="button" class="ghost" onclick={() => void runAmbientSync()} disabled={ambientSyncBusy}>{ambientSyncBusy ? "…" : "Sync ambient"}</button>
                 <button type="button" class="ghost" onclick={runClusterRebuild} disabled={clusterBusy}>{clusterBusy ? "Clustering…" : "Rebuild clusters"}</button>
                 <button type="button" class="ghost" onclick={runIdentityExport} disabled={exportBusy}>{exportBusy ? "Export…" : "Export zip"}</button>
               </div>
-              {#if identityClaims.length === 0}
+              {#if identityTab === "mirror"}
+                <div class="settings-spaced">
+                  <div class="section-title small">Mirror — current stance & history</div>
+                  <p class="setting-desc">Markdown digest plus superseded / rejected claims. Use Sync ambient to pull macOS focus events into the vault-local ambient table.</p>
+                  {#if identityMirrorLoading}
+                    <div class="empty">Loading mirror…</div>
+                  {:else if !identityMirrorMd.trim()}
+                    <div class="empty">Nothing to show yet.</div>
+                  {:else}
+                    <pre class="mirror-pre">{identityMirrorMd}</pre>
+                  {/if}
+                  {#if identityMirrorHistory.length}
+                    <div class="section-title small settings-spaced">Revision history</div>
+                    <ul class="source-list identity-claim-list">
+                      {#each identityMirrorHistory as c}
+                        <li>
+                          <div class="file-main">
+                            <span class="kind">{c.kind}</span>
+                            <span class="meta">{c.status}</span>
+                            <span class="path mono" title={c.claim_id}>{c.claim_id}</span>
+                          </div>
+                          <p class="claim-text">{c.text}</p>
+                          {#if c.superseded_by}
+                            <p class="meta">superseded_by {c.superseded_by}</p>
+                          {/if}
+                        </li>
+                      {/each}
+                    </ul>
+                  {/if}
+                </div>
+              {:else if identityClaims.length === 0}
                 <div class="empty">
                   {identityTab === "proposed"
                     ? "No proposed claims. Agents can add them via MCP (`propose_identity_update`)."
@@ -2843,6 +2912,19 @@
     font-family: var(--mono-font);
     font-size: 11px;
     line-height: 1.4;
+    background: var(--panel-2);
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    white-space: pre-wrap;
+  }
+  .mirror-pre {
+    margin: 8px 0;
+    padding: 12px;
+    max-height: min(55vh, 420px);
+    overflow: auto;
+    font-family: var(--mono-font);
+    font-size: 12px;
+    line-height: 1.45;
     background: var(--panel-2);
     border-radius: 6px;
     border: 1px solid var(--border);

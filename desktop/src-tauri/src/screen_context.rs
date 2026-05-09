@@ -76,9 +76,9 @@ mod imp {
         match std::env::var("MINION_SCREEN_CAPTURE") {
             Ok(s) => {
                 let t = s.trim().to_ascii_lowercase();
-                !(t.is_empty() || t == "0" || t == "false" || t == "no" || t == "off")
+                t == "1" || t == "true" || t == "yes" || t == "on"
             }
-            Err(_) => true,
+            Err(_) => false,
         }
     }
 
