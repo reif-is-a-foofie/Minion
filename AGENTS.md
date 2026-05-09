@@ -3,6 +3,8 @@
 Short notes for any agent (me, future-me, another model) working on this repo.
 Stay surgical, ship working diffs, keep the feedback loop intact.
 
+**Delivery loop (mandatory):** follow root **`PROCESS.md`** — intake → slice → implement → **run verification commands** → ship narrative. Cursor rule **`.cursor/rules/shipping-process.mdc`** enforces this; don’t ask the user to substitute for tests when you can run them.
+
 ## The feedback loop — read this before changing retrieval
 
 Every search and every ingest writes one JSONL line to:

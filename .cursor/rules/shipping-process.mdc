@@ -1,0 +1,18 @@
+---
+description: Mandatory delivery loop — intake, slice, implement, verify, ship narrative (see PROCESS.md)
+alwaysApply: true
+---
+
+# Shipping process (execute, don’t negotiate)
+
+Follow **`PROCESS.md`** end-to-end for any non-trivial change (multi-file feature, behavior change, MCP/tool surface, retrieval, desktop shell).
+
+## Agent obligations
+
+1. **Do not skip verification.** After edits, run every applicable command from **PROCESS.md § Verify** (pytest, `cargo test`, `npm run check`, `npm run test:unit`). If the environment cannot run a step, state the blocker explicitly and what passes locally instead.
+2. **Do not ask the user** to “remember to run tests” as a substitute for running them when the sandbox allows.
+3. **Deploy / signing**: do not claim released binaries exist unless build/sign steps actually ran. Prefer documenting exact commands and CI; secrets stay with humans or GitHub Actions.
+4. **Product framing**: start from **PROCESS.md § Intake** mentally — if the ask is ambiguous, narrow scope in one reply before coding.
+5. **Quality bar**: prose and commits stay professional (complete sentences in descriptions); code stays surgical per `AGENTS.md`.
+
+This rule does not replace `AGENTS.md`; it operationalizes how work gets finished.
