@@ -43,6 +43,7 @@ import telemetry
 import identity
 from version import __version__
 from retrieval_bias import apply_identity_rerank, rrf_fuse
+import screen_context_store
 from build_voice import (
     AUTO_DRAFT_SENTINEL,
     USER_EDITS_SENTINEL,
@@ -59,7 +60,7 @@ TOP_K_CAP = 12
 DEFAULT_TOP_K = 8
 DEFAULT_MAX_CHARS = 900
 DEFAULT_MAX_CHARS_FULL = 2000
-PROTOCOL_VERSION = "2025-11-25"
+PROTOCOL_VERSION = "2026-05-06"
 DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 _INSTRUCTIONS_FALLBACK = (
@@ -882,6 +883,42 @@ def _tool_get_identity_summary(_: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "ok", "markdown": md}
 
 
+def _tool_what_am_i_working_on(_: Dict[str, Any]) -> Dict[str, Any]:
+    row = screen_context_store.current_record(_data_dir())
+    if row is None:
+        return {
+            "status": "empty",
+            "hint": (
+                "Open the Minion desktop app on macOS. Grant Accessibility + Screen Recording. "
+                "Focused-window events append to <data_dir>/screen_context/stream.jsonl."
+            ),
+        }
+    return {
+        "status": "ok",
+        "app_name": row.get("app_name"),
+        "window_title": row.get("window_title"),
+        "process_path": row.get("process_path"),
+        "ts": row.get("ts"),
+        "screenshot_inbox_rel": row.get("screenshot_inbox_rel"),
+        "record": row,
+    }
+
+
+def _tool_search_screen_memory(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    query = str(arguments.get("query") or "").strip()
+    lim = int(arguments.get("limit") or 30)
+    lim = max(1, min(lim, 200))
+    if not query:
+        return {"status": "error", "error": "query is required"}
+    hits = screen_context_store.search_substring(_data_dir(), query, limit=lim)
+    return {"status": "ok", "matches": hits, "count": len(hits), "query": query}
+
+
+def _tool_summarize_recent_activity(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    lim = int(arguments.get("event_limit") or arguments.get("limit") or 60)
+    return screen_context_store.summarize_recent_heuristic(_data_dir(), event_limit=lim)
+
+
 TOOLS: List[Dict[str, Any]] = [
     {
         "name": "ask_minion",
@@ -1117,6 +1154,56 @@ TOOLS: List[Dict[str, Any]] = [
                 "path_glob": {"type": ["string", "null"]},
                 "since": {"type": ["number", "null"]},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100},
+            },
+        },
+    },
+    {
+        "name": "what_am_i_working_on",
+        "title": "Current focused window (live screen context)",
+        "description": (
+            "Return the latest focused-window snapshot from the Minion desktop app on macOS "
+            "(app name, window title, process path, timestamp). May include `ax_text_sample`: "
+            "a bounded Accessibility-tree text scrape under the focused window (needs Accessibility permission). "
+            "Optional screenshots land in `inbox/screen-memory/` for OCR — search visible text with `ask_minion` "
+            "using `path_glob='**/screen-memory/**'` once indexed."
+        ),
+        "inputSchema": {"type": "object", "additionalProperties": False},
+    },
+    {
+        "name": "search_screen_memory",
+        "title": "Search recent window-focus timeline",
+        "description": (
+            "Substring search over recent screen-context events (app/title/path and `ax_text_sample`). "
+            "Does not run semantic search; pair with `ask_minion` for OCR'd screen content."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["query"],
+            "properties": {
+                "query": {"type": "string", "description": "Case-insensitive substring."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 30},
+            },
+        },
+    },
+    {
+        "name": "summarize_recent_activity",
+        "title": "Summarize recent screen context (heuristic)",
+        "description": (
+            "Compact digest of recent window-focus events (counts + last titles). "
+            "No LLM call — fast grounding before deeper `ask_minion` retrieval."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "event_limit": {
+                    "type": "integer",
+                    "minimum": 5,
+                    "maximum": 300,
+                    "default": 60,
+                    "description": "How many recent events to consider.",
+                },
             },
         },
     },
@@ -1381,6 +1468,17 @@ def _handle_initialize(req: Dict[str, Any]) -> Dict[str, Any]:
             "`structuredContent.profile_brief`. Treat it as priors, not binding rules."
         )
     instructions += (
+        "\n\n## Live screen context (macOS Minion desktop)\n\n"
+        "When the Minion desktop app runs on macOS it logs focused-window metadata to "
+        "`<MINION_DATA_DIR>/screen_context/stream.jsonl` and may capture PNGs under "
+        "`inbox/screen-memory/` for OCR ingestion.\n\n"
+        "- **`what_am_i_working_on`** — latest app/window title (+ optional Accessibility text sample).\n"
+        "- **`search_screen_memory`** — substring search over recent events (includes AX sample text).\n"
+        "- **`summarize_recent_activity`** — compact heuristic digest (no LLM).\n"
+        "After screenshots index, search readable text with **`ask_minion`** "
+        "(`path_glob='**/screen-memory/**'` or keyword mode).\n"
+    )
+    instructions += (
         "\n\n## Digital identity graph\n\n"
         "Structured claims (preferences, values, relationships, goals, boundaries, facts) "
         "can be stored with evidence from `ask_minion` chunk_ids. Use `propose_identity_update`; "
@@ -1416,6 +1514,9 @@ _DISPATCH = {
     "propose_identity_update": _tool_propose_identity_update,
     "list_identity_claims": _tool_list_identity_claims,
     "get_identity_summary": _tool_get_identity_summary,
+    "what_am_i_working_on": _tool_what_am_i_working_on,
+    "search_screen_memory": _tool_search_screen_memory,
+    "summarize_recent_activity": _tool_summarize_recent_activity,
 }
 
 

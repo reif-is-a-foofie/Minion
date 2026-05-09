@@ -52,3 +52,8 @@ desktop/blob-report/
 # Cloudflare Worker dev deps (npm install inside telemetry-collector/)
 telemetry-collector/node_modules/
 telemetry-collector/.wrangler/
+
+# Megaminion desktop shell (Tauri)
+megaminion-desktop/node_modules/
+megaminion-netlify/node_modules/
+megaminion-desktop/src-tauri/target/

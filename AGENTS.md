@@ -65,6 +65,18 @@ Keep these invariants when you change anything:
   decide *whether* to search. Edit with care, diff in a separate commit so
   a regression in Claude's invocation rate is traceable.
 
+## Testing harness
+
+| Layer | Command |
+| ----- | ------- |
+| Python core | `cd chatgpt_mcp_memory && PYTHONPATH=src .venv/bin/python -m pytest tests/ -q` |
+| Rust shell | `cd desktop/src-tauri && cargo test` |
+| Svelte/TS (types) | `cd desktop && npm run check` |
+| TS unit (Vitest) | `cd desktop && npm run test:unit` |
+| Browser E2E | `cd desktop && npm run test:e2e` (Playwright + `scripts/run-e2e-stack.sh`) |
+
+CI entrypoint: `.github/workflows/ci.yml`.
+
 ## Code hygiene
 
 - Minimum tokens out. Minimum surface area on edits.
@@ -80,3 +92,10 @@ Keep these invariants when you change anything:
 - `chatgpt_mcp_memory/src/telemetry.py` — the feedback-loop log.
 - `~/Library/Application Support/Minion/data/` — live DB, inbox, telemetry.
 - `third_party/awesome-cursor-skills/` — curated Cursor **skills** index (submodule); agents should skim `README.md` before multi-step work (see `.cursor/rules/consult-awesome-skills.mdc`).
+
+## First‑party screen & audio capture
+
+Minion ships **its own** macOS capture path (focused window metadata, optional Accessibility-tree text sample, optional window screenshots → inbox OCR). Extend here deliberately — retrieval stays in `chatgpt_mcp_memory`; capture stays in `desktop/src-tauri/`.
+
+Planned / roadmap deltas vs heavier commercial tools: audio transcription (local Whisper), multi-monitor selection, richer event triggers. Do **not** vendor external capture apps into this repo unless there is a narrow library dependency with a clear license.
+

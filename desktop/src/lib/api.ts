@@ -103,6 +103,20 @@ export async function getConfig(): Promise<AppConfig> {
   return (await invoke("app_config")) as AppConfig;
 }
 
+export type ScreenContextStatus = {
+  platform: string;
+  /** macOS-only background watcher; false on Windows/Linux. */
+  watcher_supported: boolean;
+  stream_path: string;
+  /** Latest JSON line from stream.jsonl, or null if missing/empty. */
+  last_event: unknown;
+};
+
+/** Focused-window logger status + last snapshot path (macOS). */
+export async function screenContextStatus(): Promise<ScreenContextStatus> {
+  return (await invoke("screen_context_status")) as ScreenContextStatus;
+}
+
 async function assertSidecarHasNukeRoute(apiBase: string): Promise<void> {
   const maxAttempts = 18;
   const delayMs = 300;

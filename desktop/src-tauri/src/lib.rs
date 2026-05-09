@@ -28,6 +28,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
+mod ax_sample;
+mod screen_context;
+
 // ---------------------------------------------------------------------------
 // Debug NDJSON instrumentation (active until post-release verification).
 // Writes one JSON line per significant event to the session logfile defined
@@ -1201,6 +1204,34 @@ fn app_config(state: tauri::State<AppState>) -> serde_json::Value {
     })
 }
 
+#[tauri::command]
+fn screen_context_status(state: tauri::State<AppState>) -> serde_json::Value {
+    let path = state.data_dir.join("screen_context").join("stream.jsonl");
+    #[cfg(target_os = "macos")]
+    let platform = "macos";
+    #[cfg(target_os = "windows")]
+    let platform = "windows";
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let platform = "linux";
+
+    let mut last_event = serde_json::Value::Null;
+    if path.is_file() {
+        if let Ok(s) = fs::read_to_string(&path) {
+            if let Some(line) = s.lines().filter(|l| !l.trim().is_empty()).last() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    last_event = v;
+                }
+            }
+        }
+    }
+    serde_json::json!({
+        "platform": platform,
+        "watcher_supported": cfg!(target_os = "macos"),
+        "stream_path": path.to_string_lossy(),
+        "last_event": last_event,
+    })
+}
+
 /// Strip a trailing ` (N)` suffix from a file stem, e.g. `foo (3)` -> `foo`.
 /// Used to match inbox copies that we uniquified back to their original name.
 fn strip_dup_suffix(stem: &str) -> &str {
@@ -1807,6 +1838,7 @@ pub fn run() {
             let inbox_bg = inbox.clone();
             let port_bg = api_port;
             thread::spawn(move || {
+                screen_context::spawn_watcher(handle.clone(), data_dir_bg.clone(), inbox_bg.clone());
                 let state = match handle.try_state::<AppState>() {
                     Some(s) => s,
                     None => {
@@ -2013,6 +2045,7 @@ pub fn run() {
             restart_sidecar,
             vision_status,
             ensure_vision_model,
+            screen_context_status,
         ])
         .on_window_event(|window, event| {
             if matches!(event, WindowEvent::Destroyed) {
@@ -2034,4 +2067,20 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running minion desktop");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_dup_suffix;
+
+    #[test]
+    fn strip_dup_suffix_numeric_copy() {
+        assert_eq!(strip_dup_suffix("report (2)"), "report");
+        assert_eq!(strip_dup_suffix("notes"), "notes");
+    }
+
+    #[test]
+    fn strip_dup_suffix_non_numeric_preserved() {
+        assert_eq!(strip_dup_suffix("foo (bar)"), "foo (bar)");
+    }
 }
